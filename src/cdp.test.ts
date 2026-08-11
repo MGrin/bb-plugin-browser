@@ -1,0 +1,28 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { openCdp } from "./cdp.js";
+import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
+
+let server: FakeCdp;
+afterEach(async () => { await server?.close(); });
+
+describe("openCdp", () => {
+  it("round-trips a command and its result", async () => {
+    server = await fakeCdp();
+    const session = await openCdp(server.url);
+    const result = await session.send<{ targetInfos: unknown[] }>("Target.getTargets");
+    expect(result.targetInfos).toEqual([]);
+    expect(server.received[0].method).toBe("Target.getTargets");
+    session.close();
+  });
+
+  it("delivers events to subscribers", async () => {
+    server = await fakeCdp();
+    const session = await openCdp(server.url);
+    const seen: unknown[] = [];
+    session.on("Page.screencastFrame", (params) => seen.push(params));
+    server.emit("Page.screencastFrame", { data: "AAA", sessionId: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(seen).toEqual([{ data: "AAA", sessionId: 1 }]);
+    session.close();
+  });
+});
