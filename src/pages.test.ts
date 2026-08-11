@@ -122,6 +122,26 @@ describe("pages", () => {
     expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(1);
   });
 
+  it("existingPageInfo reports the page's current document url without creating one", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url);
+    const created = await pages.pageUrlFor("thr_a", "main");
+    server.targets[0]!.url = "https://example.com/";
+
+    const info = await pages.existingPageInfo("thr_a");
+    expect(info).toEqual({ cdpUrl: created, url: "https://example.com/" });
+    // The panel calls this on every mount to fill its address bar. Doing so
+    // must never be the reason a page exists.
+    expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(1);
+  });
+
+  it("existingPageInfo returns null when nothing is bound", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url);
+    expect(await pages.existingPageInfo("thr_never_opened")).toBeNull();
+    expect(server.received.some((m) => m.method === "Target.createTarget")).toBe(false);
+  });
+
   it("closePage clears the binding even when Target.closeTarget errors", async () => {
     server = await fakeCdp();
     const { pages } = pagesFor(server.url);

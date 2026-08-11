@@ -9,9 +9,6 @@ function screencastFor(url: string) {
   return createScreencast({
     pages: {
       pageUrlFor: async () => url,
-      existingPageUrl: async () => null,
-      closePage: async () => {},
-      forget: async () => {},
     },
     quality: 60,
     maxWidth: 1280,
@@ -41,6 +38,32 @@ const CLICK = {
 describe("screencast", () => {
   it("starts casting on the first subscriber", async () => {
     server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    expect(server.received.some((m) => m.method === "Page.startScreencast")).toBe(true);
+  });
+
+  it("brings the page to the front, because a background tab renders nothing", async () => {
+    // Measured against the real browser: with the thread's tab in the
+    // background, `Page.startScreencast` returns 200 and then delivers zero
+    // frames forever — Chrome does not composite a tab nobody is looking at.
+    // The panel's whole job is that first frame, so a cast asks for the tab
+    // to be shown before it asks for pixels.
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    const methods = server.received.map((m) => m.method);
+    expect(methods).toContain("Page.bringToFront");
+    expect(methods.indexOf("Page.bringToFront")).toBeLessThan(
+      methods.indexOf("Page.startScreencast"),
+    );
+  });
+
+  it("still casts when the browser refuses to bring the page to the front", async () => {
+    // Best-effort: a page that cannot be activated may still repaint (and a
+    // stale last frame beats an error), so this must never fail a subscribe.
+    server = await fakeCdp();
+    server.failOn("Page.bringToFront", "not allowed");
     const screencast = screencastFor(server.url);
     await screencast.subscribe("thr_a", "main", () => {});
     expect(server.received.some((m) => m.method === "Page.startScreencast")).toBe(true);
@@ -227,9 +250,6 @@ describe("screencast", () => {
     const screencast = createScreencast({
       pages: {
         pageUrlFor: async () => gate.promise,
-        existingPageUrl: async () => null,
-        closePage: async () => {},
-        forget: async () => {},
       },
       quality: 60,
       maxWidth: 1280,
@@ -256,9 +276,6 @@ describe("screencast", () => {
           pageUrlForCalls += 1;
           return pageUrlForCalls === 1 ? gate.promise : server.url;
         },
-        existingPageUrl: async () => null,
-        closePage: async () => {},
-        forget: async () => {},
       },
       quality: 60,
       maxWidth: 1280,
@@ -326,9 +343,6 @@ describe("screencast", () => {
           if (pageUrlForCalls === 2) return gateB.promise;
           return server.url;
         },
-        existingPageUrl: async () => null,
-        closePage: async () => {},
-        forget: async () => {},
       },
       quality: 60,
       maxWidth: 1280,
@@ -387,6 +401,92 @@ describe("screencast", () => {
     await expect(screencast.subscribe("thr_a", "main", () => {})).rejects.toThrow("boom");
     await tick();
     expect(server.connectionCount).toBe(0);
+  });
+
+  // The panel maps its own pixels into page pixels, so it needs the page's
+  // coordinate space. Frame metadata carries it for free — every frame
+  // reports the CSS viewport it was captured from — which beats a second CDP
+  // round trip, and beats assuming the decoded frame size is the viewport
+  // (`maxWidth` downscales, so on a wide or retina page they differ, and a
+  // click would land proportionally off).
+
+  it("reports the page viewport carried by the latest frame's metadata", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    server.emit("Page.screencastFrame", {
+      data: "FRAME",
+      sessionId: 1,
+      metadata: { deviceWidth: 1440, deviceHeight: 900 },
+    });
+    await tick();
+    expect(screencast.viewportOf("thr_a")).toEqual({ width: 1440, height: 900 });
+  });
+
+  it("reports the viewport of the newest frame after a resize", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    server.emit("Page.screencastFrame", {
+      data: "A",
+      sessionId: 1,
+      metadata: { deviceWidth: 1440, deviceHeight: 900 },
+    });
+    await tick();
+    server.emit("Page.screencastFrame", {
+      data: "B",
+      sessionId: 2,
+      metadata: { deviceWidth: 800, deviceHeight: 600 },
+    });
+    await tick();
+    expect(screencast.viewportOf("thr_a")).toEqual({ width: 800, height: 600 });
+  });
+
+  it("reports no viewport for a session nothing is casting", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    expect(screencast.viewportOf("thr_a")).toBeNull();
+  });
+
+  it("reports no viewport before the first frame arrives", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    expect(screencast.viewportOf("thr_a")).toBeNull();
+  });
+
+  it("ignores frame metadata with no usable dimensions", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    await screencast.subscribe("thr_a", "main", () => {});
+    // A zero-sized viewport would divide a click by zero downstream; a frame
+    // missing metadata entirely is likewise not a viewport report.
+    server.emit("Page.screencastFrame", {
+      data: "A",
+      sessionId: 1,
+      metadata: { deviceWidth: 0, deviceHeight: 0 },
+    });
+    await tick();
+    server.emit("Page.screencastFrame", { data: "B", sessionId: 2 });
+    await tick();
+    expect(screencast.viewportOf("thr_a")).toBeNull();
+  });
+
+  it("forgets a viewport once the cast stops", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor(server.url);
+    const unsubscribe = await screencast.subscribe("thr_a", "main", () => {});
+    server.emit("Page.screencastFrame", {
+      data: "A",
+      sessionId: 1,
+      metadata: { deviceWidth: 1440, deviceHeight: 900 },
+    });
+    await tick();
+    unsubscribe();
+    await tick();
+    // A stale viewport would outlive the page it described, and the panel
+    // reads "nothing is casting" from exactly this null.
+    expect(screencast.viewportOf("thr_a")).toBeNull();
   });
 
   it("dispatches a mouse click as a CDP input event", async () => {

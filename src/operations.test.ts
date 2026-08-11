@@ -26,6 +26,7 @@ function opsWith(run: Runner | string = "ok") {
   const pages = {
     pageUrlFor: async () => "ws://127.0.0.1:1/devtools/page/p1",
     existingPageUrl: async () => null,
+    existingPageInfo: async () => null,
     closePage: async (sessionKey: string) => {
       closed.push(sessionKey);
     },

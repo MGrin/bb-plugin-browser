@@ -22,8 +22,17 @@ export type InputEvent =
   | { kind: "key"; type: "keyDown" | "keyUp" | "char"; text?: string; key?: string }
   | { kind: "scroll"; x: number; y: number; deltaY: number };
 
+/** The page's own coordinate space, in CSS pixels. */
+export interface Viewport {
+  width: number;
+  height: number;
+}
+
 export interface ScreencastDeps {
-  pages: Pages;
+  // Only `pageUrlFor` is ever called here. Narrowed so this module's real
+  // dependency is legible, and so growing the `Pages` interface for other
+  // callers cannot silently widen what a screencast may do to a page.
+  pages: Pick<Pages, "pageUrlFor">;
   quality: number;
   maxWidth: number;
 }
@@ -35,12 +44,26 @@ export interface Screencast {
     onFrame: (jpegBase64: string) => void,
   ): Promise<() => void>;
   dispatchInput(sessionKey: string, profile: string, event: InputEvent): Promise<void>;
+  /**
+   * The CSS viewport the latest frame of this session's cast was captured
+   * from, or null when nothing is casting (or no frame has arrived yet).
+   *
+   * The panel needs it to turn a click in its own pixels into a page
+   * coordinate: `maxWidth` downscales frames, so on a wide or high-DPI page
+   * the decoded frame is smaller than the viewport and a click computed
+   * against the frame lands proportionally off. Null doubles as "no live
+   * view for this session", which is what makes it safe to drop input
+   * instead of letting `dispatchInput` open a page nobody asked for.
+   */
+  viewportOf(sessionKey: string): Viewport | null;
   stopAll(): void;
 }
 
 interface Cast {
   session: CdpSession;
   subscribers: Set<(frame: string) => void>;
+  /** Last frame's reported viewport; null until the first frame arrives. */
+  viewport: Viewport | null;
 }
 
 export function createScreencast(deps: ScreencastDeps): Screencast {
@@ -61,9 +84,24 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     const url = await deps.pages.pageUrlFor(sessionKey, profile);
     const session = await openCdp(url);
     try {
-      const cast: Cast = { session, subscribers: new Set() };
+      const cast: Cast = { session, subscribers: new Set(), viewport: null };
       session.on("Page.screencastFrame", (params) => {
-        const frame = params as { data: string; sessionId: number };
+        const frame = params as {
+          data: string;
+          sessionId: number;
+          // Chrome's ScreencastFrameMetadata. deviceWidth/deviceHeight are
+          // the page's CSS-pixel viewport, independent of how far the frame
+          // itself was scaled down to fit `maxWidth`.
+          metadata?: { deviceWidth?: number; deviceHeight?: number };
+        };
+        const width = frame.metadata?.deviceWidth;
+        const height = frame.metadata?.deviceHeight;
+        // A zero or absent dimension is not a viewport report: it would
+        // divide a click by zero downstream, so leave the last good one (or
+        // null) in place rather than record it.
+        if (typeof width === "number" && typeof height === "number" && width > 0 && height > 0) {
+          cast.viewport = { width, height };
+        }
         // Chrome won't send the next frame until this one is acked, so the
         // ack must go out regardless of who is or isn't listening. It's
         // fire-and-forget: a rejected ack (socket already on its way down)
@@ -81,6 +119,23 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
           }
         }
       });
+      // Chrome does not composite a background tab, and every thread's page
+      // is a tab in one shared browser — so without this, a cast on any tab
+      // but the active one delivers zero frames forever while still looking
+      // healthy (HTTP 200, no error, no pixels). Measured on the real
+      // browser during Task 9's live verification.
+      //
+      // Sent, never awaited. A CDP command that never answers only rejects
+      // after cdp.ts's 30s timeout, and awaiting this one would put that
+      // wait between the viewer and their first frame — the panel's <img>
+      // hanging with no response at all, which is indistinguishable from a
+      // broken route. Writes are ordered on the socket, so the browser
+      // still sees it before startScreencast; a refusal is ignored, because
+      // a page can still repaint on its own.
+      //
+      // The cost is that two viewers on two threads take turns being the
+      // front tab — strictly better than neither of them seeing anything.
+      void session.send("Page.bringToFront").catch(() => {});
       await session.send("Page.startScreencast", {
         format: "jpeg",
         quality: deps.quality,
@@ -162,6 +217,12 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
         cast.subscribers.delete(onFrame);
         if (cast.subscribers.size === 0) stopCast(sessionKey, cast);
       };
+    },
+
+    // Reads the cast on record, so a stopped or superseded cast reports
+    // null exactly like one that never existed.
+    viewportOf(sessionKey) {
+      return casts.get(sessionKey)?.viewport ?? null;
     },
 
     async dispatchInput(sessionKey, profile, event) {

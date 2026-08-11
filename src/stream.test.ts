@@ -6,6 +6,7 @@ import { mjpegResponse, registerStreamRoute, STREAM_PATH } from "./stream.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
+const BOUNDARY_MARKER = "--bbbrowserframe";
 
 describe("mjpegResponse", () => {
   it("declares a multipart replace stream", async () => {
@@ -27,6 +28,29 @@ describe("mjpegResponse", () => {
     const text = Buffer.from(chunk.value!).toString("binary");
     expect(text).toContain("Content-Type: image/jpeg");
     expect(text).toContain("Content-Length: 4");
+    await reader.cancel();
+  });
+
+  // An <img> is the only client this route has, and a browser's multipart
+  // parser paints a part when the NEXT boundary arrives, not when the part's
+  // Content-Length bytes do. A page that renders once and then holds still
+  // produces exactly one frame — so a writer that only prefixes each frame
+  // with a boundary leaves that frame undecoded forever, and the panel stays
+  // blank while the stream looks perfectly healthy. Measured in the real bb
+  // app: naturalWidth stayed 0 through a complete, well-formed single frame.
+  it("closes each frame's part with the next boundary, so one frame is enough to paint", async () => {
+    let push: (frame: string) => void = () => {};
+    const response = await mjpegResponse(async (onFrame) => {
+      push = onFrame;
+      return () => {};
+    });
+    const reader = response.body!.getReader();
+    push(jpeg);
+    const text = Buffer.from((await reader.read()).value!).toString("binary");
+    const body = Buffer.from(jpeg, "base64").toString("binary");
+    const bodyIndex = text.indexOf(body);
+    expect(bodyIndex).toBeGreaterThan(-1);
+    expect(text.indexOf(BOUNDARY_MARKER, bodyIndex)).toBeGreaterThan(bodyIndex);
     await reader.cancel();
   });
 
@@ -61,15 +85,12 @@ describe("mjpegResponse", () => {
 
     for (let index = 0; index < 500; index++) push(bigFrame);
 
-    // Exactly the first frame's three parts should have made it into the
-    // stream's internal queue — drain them.
-    for (let index = 0; index < 3; index++) {
-      const { value } = await reader.read();
-      expect(value).toBeDefined();
-    }
+    // Exactly the first frame — one enqueue — should have made it into the
+    // stream's internal queue; drain it.
+    expect((await reader.read()).value).toBeDefined();
 
-    // A fourth read must NOT resolve promptly. If backpressure were not
-    // honored, all 500 frames (1500 chunks) would already be sitting in the
+    // A second read must NOT resolve promptly. If backpressure were not
+    // honored, all 500 frames would already be sitting in the
     // queue and this would return immediately instead of timing out.
     const outcome = await Promise.race([
       reader.read().then(() => "resolved" as const),
@@ -180,6 +201,7 @@ function fakeScreencast(subscribe: Screencast["subscribe"] = vi.fn(async () => (
   return {
     subscribe,
     dispatchInput: vi.fn(async () => {}),
+    viewportOf: () => null,
     stopAll: vi.fn(),
   };
 }

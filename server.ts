@@ -8,6 +8,7 @@ import { createEngine } from "./src/engine.js";
 import { defaultProfile } from "./src/identity.js";
 import { createOperations } from "./src/operations.js";
 import { createPages } from "./src/pages.js";
+import { registerPanelRpc } from "./src/panel-rpc.js";
 import { createScreencast } from "./src/screencast.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
 import { registerStreamRoute } from "./src/stream.js";
@@ -57,6 +58,17 @@ export default async function plugin(bb: BbPluginApi) {
   // Same single profile as operations above — one cookie jar, one browser,
   // for now.
   registerStreamRoute(bb, screencast, pages, resolveSessionKey, async () => defaultProfile);
+
+  // The panel tab's data plane. Same single profile again, and the same rule
+  // as the stream route: it takes a thread id and resolves the session key
+  // itself.
+  registerPanelRpc(bb, {
+    resolveSessionKey,
+    operations,
+    pages,
+    screencast,
+    profileFor: async () => defaultProfile,
+  });
 
   registerTools(bb, operations, resolveSessionKey);
   registerCli(bb, operations, resolveSessionKey);

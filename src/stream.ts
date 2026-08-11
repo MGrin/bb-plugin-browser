@@ -45,6 +45,13 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
   let stopped = false;
   let unsub: () => void = () => {};
 
+  // The opening boundary rides along with the first frame rather than being
+  // enqueued when the stream starts: an enqueue before anyone has read
+  // consumes the default one-chunk high-water mark, and the desiredSize
+  // guard below would then drop the very first frame — which on a static
+  // page is the only frame there will ever be.
+  let firstFrame = true;
+
   function stop(): void {
     if (stopped) return;
     stopped = true;
@@ -70,18 +77,30 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
 
       const frame = Buffer.from(jpegBase64, "base64");
       try {
-        // All three enqueues happen in one synchronous turn under one
-        // desiredSize check, so a frame is either written whole or not at
-        // all — nothing here can leave a dangling header with no body on
-        // the wire.
+        // One enqueue per frame: header, body, and the boundary that CLOSES
+        // this part, all written together so a frame is either on the wire
+        // whole or not at all — nothing here can leave a dangling header
+        // with no body.
+        //
+        // The trailing boundary is what makes a single frame visible. A
+        // browser's multipart parser paints a part when it sees the next
+        // boundary, not when Content-Length bytes arrive, and a page that
+        // renders once and then holds still produces exactly one frame — so
+        // writing the boundary only ahead of the *next* frame leaves an
+        // <img> blank forever on a static page while the stream looks
+        // healthy. Writing it after each frame instead costs 18 bytes.
+        const opening = firstFrame ? `--${BOUNDARY}\r\n` : "";
+        firstFrame = false;
         controller.enqueue(
-          Buffer.from(
-            `--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
-            "binary",
-          ),
+          Buffer.concat([
+            Buffer.from(
+              `${opening}Content-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
+              "binary",
+            ),
+            frame,
+            Buffer.from(`\r\n--${BOUNDARY}\r\n`, "binary"),
+          ]),
         );
-        controller.enqueue(frame);
-        controller.enqueue(Buffer.from("\r\n", "binary"));
       } catch {
         // enqueue throws once the client is gone and the controller has
         // been errored/closed out from under us by something other than

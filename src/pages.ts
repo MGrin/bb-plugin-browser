@@ -55,6 +55,14 @@ export interface Pages {
    * for `pageUrlFor` to reconcile on the next real use.
    */
   existingPageUrl(sessionKey: string): Promise<string | null>;
+  /**
+   * The same read-only lookup as `existingPageUrl`, plus the document URL the
+   * page is currently on — what the panel's address bar shows. It comes from
+   * the target list this lookup already fetches, so asking costs nothing
+   * extra and, like `existingPageUrl`, never creates a page: the panel must
+   * be able to say "nothing open here yet" without opening anything.
+   */
+  existingPageInfo(sessionKey: string): Promise<{ cdpUrl: string; url: string } | null>;
   closePage(sessionKey: string): Promise<void>;
   forget(sessionKey: string): Promise<void>;
 }
@@ -164,20 +172,28 @@ export function createPages(deps: PagesDeps): Pages {
     return settling;
   }
 
+  async function existingPageInfo(
+    sessionKey: string,
+  ): Promise<{ cdpUrl: string; url: string } | null> {
+    const bound = await deps.kv.get<Binding>(key(sessionKey));
+    // No origin covers both "never bound" and "bound before this field
+    // existed" — either way, there is nothing to probe, so this must
+    // report "no page" rather than fall back to a launch-capable lookup.
+    if (!bound?.origin) return null;
+    const browserUrl = await probeBrowserUrl(bound.origin);
+    if (!browserUrl) return null;
+    const open = await targets(browserUrl);
+    const target = open.find((candidate) => candidate.targetId === bound.targetId);
+    if (!target) return null;
+    return { cdpUrl: pageUrl(browserUrl, bound.targetId), url: target.url };
+  }
+
   return {
     pageUrlFor,
+    existingPageInfo,
 
     async existingPageUrl(sessionKey) {
-      const bound = await deps.kv.get<Binding>(key(sessionKey));
-      // No origin covers both "never bound" and "bound before this field
-      // existed" — either way, there is nothing to probe, so this must
-      // report "no page" rather than fall back to a launch-capable lookup.
-      if (!bound?.origin) return null;
-      const browserUrl = await probeBrowserUrl(bound.origin);
-      if (!browserUrl) return null;
-      const open = await targets(browserUrl);
-      if (!open.some((target) => target.targetId === bound.targetId)) return null;
-      return pageUrl(browserUrl, bound.targetId);
+      return (await existingPageInfo(sessionKey))?.cdpUrl ?? null;
     },
 
     async closePage(sessionKey) {
