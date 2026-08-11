@@ -17,6 +17,7 @@
 //              select it by ref, and a label is the one ref that fails loudly
 //              instead of silently resolving to somebody else's tab.
 import { randomUUID } from "node:crypto";
+import type { CdpOptions } from "./cdp.js";
 import type { Engine } from "./engine.js";
 import {
   browserIdOf,
@@ -43,6 +44,15 @@ export interface PagesDeps {
     list(prefix?: string): Promise<string[]>;
   };
   log: (message: string) => void;
+  /**
+   * CDP client tuning, in practice only ever the connect timeout, and in
+   * practice only ever set by a test: production takes the defaults. It is
+   * here because the composed consequence of a connect that hangs — an
+   * `inflight` entry that never settles, so every later call for that
+   * session joins a dead promise — cannot be tested at all without a way to
+   * make a connect give up in less than the production timeout.
+   */
+  cdp?: CdpOptions;
 }
 
 interface Binding {
@@ -226,7 +236,7 @@ export function createPages(deps: PagesDeps): Pages {
       ]),
     });
 
-    const open = await listPageTargets(browserWsUrl);
+    const open = await listPageTargets(browserWsUrl, deps.cdp);
     const created = open.find((target) => target.url === marker);
     if (!created) {
       throw new Error(
@@ -263,7 +273,7 @@ export function createPages(deps: PagesDeps): Pages {
   ): Promise<PageBinding> {
     const browserWsUrl = await deps.engine.browserCdpUrl(profile);
     const bound = await deps.kv.get<Binding>(key(sessionKey));
-    const open = await listPageTargets(browserWsUrl);
+    const open = await listPageTargets(browserWsUrl, deps.cdp);
     const stillOpen = bound && open.some((target) => target.targetId === bound.targetId);
 
     // A binding with no `tab` predates Task 9b: its tab carries no label in
@@ -276,7 +286,7 @@ export function createPages(deps: PagesDeps): Pages {
       // Don't leave the page we're walking away from open forever. A
       // failure here is logged, never swallowed: it means a labelled tab may
       // still be alive, which createPage's reconcile step then has to clear.
-      await closeTarget(browserWsUrl, bound.targetId).catch((error: Error) => {
+      await closeTarget(browserWsUrl, bound.targetId, deps.cdp).catch((error: Error) => {
         deps.log(`could not close ${bound.targetId} for ${sessionKey}: ${error.message}`);
       });
     }
@@ -335,7 +345,7 @@ export function createPages(deps: PagesDeps): Pages {
     if (!bound?.origin) return null;
     const browserUrl = await probeBrowserUrl(bound.origin);
     if (!browserUrl) return null;
-    const open = await listPageTargets(browserUrl);
+    const open = await listPageTargets(browserUrl, deps.cdp);
     const target = open.find((candidate) => candidate.targetId === bound.targetId);
     if (!target) return null;
     // The marker fragment is an implementation detail of how this page was
@@ -411,7 +421,7 @@ export function createPages(deps: PagesDeps): Pages {
       const browserUrl = await reachableBrowser();
       if (!browserUrl) return [];
       const owner = new Map(bindings.map(({ sessionKey, binding }) => [binding.targetId, sessionKey]));
-      return (await listPageTargets(browserUrl)).map((target) => ({
+      return (await listPageTargets(browserUrl, deps.cdp)).map((target) => ({
         targetId: target.targetId,
         // Same hidden marker as existingPageInfo: what gets logged when a
         // page is reaped should be where the page is, not how it was found.
@@ -432,7 +442,7 @@ export function createPages(deps: PagesDeps): Pages {
       const browserUrl = await reachableBrowser();
       // No browser, no page: there is nothing to close and nothing to report.
       if (!browserUrl) return;
-      await closeTarget(browserUrl, targetId);
+      await closeTarget(browserUrl, targetId, deps.cdp);
     },
 
     async pageUrlFor(sessionKey, profile) {
@@ -490,7 +500,7 @@ export function createPages(deps: PagesDeps): Pages {
       // Real Chrome errors closing a targetId it no longer has (the panel's
       // close button, a crash, the reaper). The page is gone either way, so
       // that is confirmation, not a reason to strand the binding.
-      await closeTarget(browserUrl, bound.targetId).catch((error: Error) => {
+      await closeTarget(browserUrl, bound.targetId, deps.cdp).catch((error: Error) => {
         deps.log(`closePage: ${bound.targetId} already gone (${error.message})`);
       });
       await deps.kv.delete(key(sessionKey));

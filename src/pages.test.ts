@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPages, TAB_LABEL } from "./pages.js";
+import { createReaper, runSweeps } from "./reaper.js";
 import { fakeBrowser } from "./test-support/fake-browser.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
 import { memoryKv } from "./test-support/memory-kv.js";
@@ -14,7 +15,10 @@ afterEach(async () => { await server?.close(); });
  * is the bug being fixed. Asserting a call *count* is the only way to prove
  * a call didn't happen, as opposed to merely not asserting on it.
  */
-function pagesFor(url: string, options: { afterRun?: () => void } = {}) {
+function pagesFor(
+  url: string,
+  options: { afterRun?: () => void; cdp?: { connectTimeoutMs?: number } } = {},
+) {
   const browserCdpUrl = vi.fn(async () => url);
   // A page is created BY the session that will drive it, because only
   // `tab new --label` assigns the label the command path selects by. The
@@ -38,7 +42,7 @@ function pagesFor(url: string, options: { afterRun?: () => void } = {}) {
     },
   };
   const kv = memoryKv();
-  const pages = createPages({ engine, kv, log: () => {} });
+  const pages = createPages({ engine, kv, log: () => {}, cdp: options.cdp });
   return { pages, browserCdpUrl, kv, browser, shutdown, shutdownAll };
 }
 
@@ -559,4 +563,107 @@ describe("pages", () => {
       expect(tabsOpened(browser)).toHaveLength(1);
     });
   });
+});
+
+/**
+ * A CDP endpoint that accepts the TCP connection and never completes the
+ * websocket handshake — measured on this branch as still-pending at 3s.
+ *
+ * The reason this has its own block, composed rather than unit, is that
+ * `openCdp` hanging is not the interesting failure: a stuck caller is bad,
+ * but a hang that never settles poisons things that outlive the call. These
+ * are those things.
+ */
+describe("a CDP connect that never completes", () => {
+  async function until(predicate: () => boolean, what: string, timeoutMs = 3_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("rejects the call instead of leaving it pending", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    server.holdConnections();
+    await expect(pages.pageUrlFor("thr_a", "main")).rejects.toThrow(/connect timed out/);
+  }, 5_000);
+
+  // The composed consequence, and the reason this was a Critical rather
+  // than an annoyance: `inflight` entries are deleted in a `finally`, so a
+  // promise that never settles is never removed — and `bindingFor` hands
+  // that same dead promise to every later caller for the session, forever.
+  // One thread's unlucky moment becomes its permanent state.
+  it("does not leave the session's coalescing entry dead for every later call", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+
+    server.holdConnections();
+    await expect(pages.pageUrlFor("thr_a", "main")).rejects.toThrow();
+
+    server.allowConnections();
+    // The whole point: the same session, immediately afterwards, on a
+    // browser that is now answering.
+    await expect(pages.pageUrlFor("thr_a", "main")).resolves.toMatch(
+      /\/devtools\/page\/tab-1$/,
+    );
+  }, 5_000);
+
+  it("rejects every caller coalesced onto the hung resolution, not just the first", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    server.holdConnections();
+    const settled = await Promise.allSettled([
+      pages.pageUrlFor("thr_a", "main"),
+      pages.pageUrlFor("thr_a", "main"),
+    ]);
+    expect(settled.map((outcome) => outcome.status)).toEqual(["rejected", "rejected"]);
+  }, 5_000);
+
+  // The other composed consequence: `runSweeps` awaits `sweep()`, which
+  // awaits `listOpenPages`. A hang there stops the reaper for the plugin's
+  // lifetime, and stops it SILENTLY — a hang is not a throw, so neither
+  // sweep()'s catch nor runSweeps' catch ever fires, and the only symptom
+  // is tabs quietly accumulating forever.
+  it("does not stop the reaper's sweep loop for the life of the plugin", async () => {
+    server = await fakeCdp();
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    await pages.pageUrlFor("thr_a", "main");
+
+    const listed: string[] = [];
+    const warnings: string[] = [];
+    const reaper = createReaper({
+      idleMs: async () => 60_000,
+      graceMs: 60_000,
+      headed: async () => false,
+      closePage: async () => {},
+      listOpenPages: async () => {
+        const open = await pages.listOpenPages();
+        listed.push("ok");
+        return open;
+      },
+      closeUnboundPage: async () => {},
+      log: () => {},
+      warn: (message) => warnings.push(message),
+    });
+
+    server.holdConnections();
+    const controller = new AbortController();
+    const loop = runSweeps(controller.signal, reaper, {
+      intervalMs: 10,
+      warn: (message) => warnings.push(message),
+    });
+    try {
+      await until(() => warnings.length > 0, "the hung sweep to be reported");
+      expect(listed).toEqual([]);
+
+      // A browser that comes back — a relaunch, a machine that woke up.
+      server.allowConnections();
+      await until(() => listed.length > 0, "a later sweep to succeed");
+    } finally {
+      controller.abort();
+      await loop;
+    }
+  }, 10_000);
 });

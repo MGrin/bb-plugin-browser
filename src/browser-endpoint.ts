@@ -3,7 +3,7 @@
 // Split out of pages.ts, which now has enough to say about binding a thread
 // to a tab that the endpoint plumbing was crowding it out. Nothing in here
 // knows what a session or a binding is.
-import { openCdp } from "./cdp.js";
+import { openCdp, type CdpOptions } from "./cdp.js";
 
 export interface TargetInfo {
   targetId: string;
@@ -68,10 +68,16 @@ export async function probeBrowserUrl(origin: string): Promise<string | null> {
 }
 
 // Every caller of openCdp wraps its use in try/finally so a throw mid-way (a
-// bad send, a JSON parse failure, whatever) still closes the socket.
+// bad send, a JSON parse failure, whatever) still closes the socket. The
+// `cdp` argument exists so a test can shorten the connect timeout: waiting
+// out the production one to prove a hang is answered would put ten seconds
+// into the suite, and a suite people wait for is a suite people skip.
 /** Every open page in a browser. */
-export async function listPageTargets(browserUrl: string): Promise<TargetInfo[]> {
-  const session = await openCdp(browserUrl);
+export async function listPageTargets(
+  browserUrl: string,
+  cdp: CdpOptions = {},
+): Promise<TargetInfo[]> {
+  const session = await openCdp(browserUrl, cdp);
   try {
     const result = await session.send<{ targetInfos: TargetInfo[] }>("Target.getTargets");
     return result.targetInfos.filter((target) => target.type === "page");
@@ -81,8 +87,12 @@ export async function listPageTargets(browserUrl: string): Promise<TargetInfo[]>
 }
 
 /** Close one page. Errors are the caller's to interpret. */
-export async function closeTarget(browserUrl: string, targetId: string): Promise<void> {
-  const session = await openCdp(browserUrl);
+export async function closeTarget(
+  browserUrl: string,
+  targetId: string,
+  cdp: CdpOptions = {},
+): Promise<void> {
+  const session = await openCdp(browserUrl, cdp);
   try {
     await session.send("Target.closeTarget", { targetId });
   } finally {

@@ -13,6 +13,31 @@ export interface FakeCdp {
    * happened on the wire, not just that `CdpSession.close()` was called.
    */
   readonly connectionCount: number;
+  /**
+   * Resolves when exactly `count` sockets are connected — the real signal a
+   * test needs, instead of sleeping for a fixed budget and hoping.
+   *
+   * A websocket teardown is three hops (client close frame, server close
+   * frame, socket close event), and a fixed `setTimeout(20)` gives all three
+   * a 20ms budget on a machine that owes nothing to anyone: it failed 5 runs
+   * in 34 in isolation and 0 in 5 inside the full suite, and that inversion
+   * is the proof it was never load. Rejects on timeout, so a fix that
+   * genuinely leaks a socket still fails the test rather than hanging it.
+   */
+  whenConnections(count: number, timeoutMs?: number): Promise<void>;
+  /**
+   * Queue every websocket upgrade from now on instead of completing it, so
+   * a test can pin the exact moment a client's `openCdp` resolves — or make
+   * it never resolve at all, which is the hang the connect timeout exists
+   * for. Plain HTTP (`/json/version`) is unaffected: a browser whose
+   * DevTools HTTP endpoint answers while its websocket never upgrades is
+   * precisely the failure being reproduced.
+   */
+  holdConnections(): void;
+  /** Stop queueing NEW upgrades; anything already queued stays queued. */
+  allowConnections(): void;
+  /** Complete `count` queued upgrades (default: all of them). */
+  releaseHeld(count?: number): void;
   /** Push an event to every connected client. */
   emit(method: string, params: unknown): void;
   /** Push a raw, possibly-malformed frame to every connected client. */
@@ -43,16 +68,67 @@ export async function fakeCdp(): Promise<FakeCdp> {
     res.writeHead(404);
     res.end();
   });
-  const server = new WebSocketServer({ server: httpServer });
+  // `noServer`, so the upgrade is this fake's own to complete or to hold.
+  // With `{ server }` the ws library completes every upgrade the instant it
+  // arrives, and there is then no way to stand in for a browser that
+  // accepts the TCP connection and never speaks websocket.
+  const server = new WebSocketServer({ noServer: true });
   const clients = new Set<WebSocket>();
   const silenced = new Set<string>();
   const failing = new Map<string, string>();
+  let holding = false;
+  const held: { complete: () => void; abandon: () => void }[] = [];
+  const connectionWatchers = new Set<() => void>();
+
+  httpServer.on("upgrade", (request, socket, head) => {
+    // A client that gives up on a held handshake (which is what a connect
+    // timeout does) drops the raw socket; without a listener that surfaces
+    // as an uncaught ECONNRESET.
+    socket.on("error", () => {});
+    const complete = () => {
+      server.handleUpgrade(request, socket, head, (ws) => {
+        server.emit("connection", ws, request);
+      });
+    };
+    if (holding) held.push({ complete, abandon: () => socket.destroy() });
+    else complete();
+  });
+
   const state: FakeCdp = {
     url: "",
     received: [],
     targets: [],
     get connectionCount() {
       return clients.size;
+    },
+    whenConnections(count, timeoutMs = 2_000) {
+      if (clients.size === count) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          connectionWatchers.delete(check);
+          reject(
+            new Error(
+              `still ${clients.size} connection(s) after ${timeoutMs}ms, expected ${count}`,
+            ),
+          );
+        }, timeoutMs);
+        function check() {
+          if (clients.size !== count) return;
+          clearTimeout(timer);
+          connectionWatchers.delete(check);
+          resolve();
+        }
+        connectionWatchers.add(check);
+      });
+    },
+    holdConnections() {
+      holding = true;
+    },
+    allowConnections() {
+      holding = false;
+    },
+    releaseHeld(count = Number.POSITIVE_INFINITY) {
+      for (let index = 0; index < count && held.length > 0; index++) held.shift()!.complete();
     },
     emit(method, params) {
       for (const client of clients) client.send(JSON.stringify({ method, params }));
@@ -68,6 +144,10 @@ export async function fakeCdp(): Promise<FakeCdp> {
       else failing.set(method, message);
     },
     async close() {
+      // Anything still queued would otherwise hold its TCP socket — and the
+      // http server's `close` — open past the end of the test.
+      holding = false;
+      while (held.length > 0) held.shift()!.abandon();
       for (const client of clients) client.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // `WebSocketServer` attached to an external server (the `{ server }`
@@ -83,9 +163,17 @@ export async function fakeCdp(): Promise<FakeCdp> {
   // just freed up instead of proving a *new* target was made.
   let created = 0;
 
+  const notify = () => {
+    for (const watcher of [...connectionWatchers]) watcher();
+  };
+
   server.on("connection", (socket) => {
     clients.add(socket);
-    socket.on("close", () => clients.delete(socket));
+    notify();
+    socket.on("close", () => {
+      clients.delete(socket);
+      notify();
+    });
     socket.on("message", (raw) => {
       const message = JSON.parse(String(raw)) as {
         id: number;

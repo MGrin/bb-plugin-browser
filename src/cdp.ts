@@ -18,19 +18,73 @@ export interface CdpOptions {
    * timeout test doesn't itself take 30s to run.
    */
   timeoutMs?: number;
+  /**
+   * How long the websocket handshake may take before this rejects.
+   *
+   * Without it, a socket that accepts TCP and never upgrades leaves the
+   * caller pending forever, and forever composes badly: a hang inside
+   * `resolveBinding` never settles pages.ts's coalescing entry, which is
+   * only deleted in a `finally`, so every later call for that session joins
+   * the same dead promise; and the reaper awaits `listOpenPages` on every
+   * sweep, so one hang stops it for the plugin's lifetime — silently,
+   * because a hang is not a throw and no `catch` ever fires.
+   *
+   * A rejection has none of those consequences: coalescing maps drop the
+   * entry, and the sweep loop logs and carries on.
+   */
+  connectTimeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * Everything this connects to is a browser on loopback that either answers
+ * at once or is not there, so this is a generous outer bound rather than a
+ * tuning knob — the point is that it exists at all. (browser-endpoint.ts's
+ * HTTP probe of the same browsers uses 750ms.)
+ */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+
 export async function openCdp(url: string, options: CdpOptions = {}): Promise<CdpSession> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   const socket = new WebSocket(url);
   await new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
+    // One AbortController for all three listeners, so whichever outcome
+    // arrives first takes the other two off the socket instead of leaving
+    // them to fire into an already-settled promise.
+    const listeners = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const settle = (finish: () => void) => {
+      clearTimeout(timer);
+      listeners.abort();
+      finish();
+    };
+    timer = setTimeout(() => {
+      settle(() => {
+        // Abandon the handshake rather than leaving a half-open socket
+        // attached to a process that may never answer.
+        try {
+          socket.close();
+        } catch {
+          // A socket that refuses to close is still one nobody holds.
+        }
+        reject(new Error(`cdp connect timed out after ${connectTimeoutMs}ms: ${url}`));
+      });
+    }, connectTimeoutMs);
+    socket.addEventListener("open", () => settle(resolve), { signal: listeners.signal });
     socket.addEventListener(
       "error",
-      () => reject(new Error(`cdp connect failed: ${url}`)),
-      { once: true },
+      () => settle(() => reject(new Error(`cdp connect failed: ${url}`))),
+      { signal: listeners.signal },
+    );
+    // A close before the upgrade completes is a failed connect, not a
+    // closed session: without this the caller waits out the whole connect
+    // timeout for something already known to be over.
+    socket.addEventListener(
+      "close",
+      () => settle(() => reject(new Error(`cdp connect closed before opening: ${url}`))),
+      { signal: listeners.signal },
     );
   });
 
@@ -40,21 +94,31 @@ export async function openCdp(url: string, options: CdpOptions = {}): Promise<Cd
   let closed = false;
 
   socket.addEventListener("message", (event) => {
-    let message: {
-      id?: number;
-      method?: string;
-      params?: unknown;
-      result?: unknown;
-      error?: { message: string };
-    };
+    let parsed: unknown;
     try {
-      message = JSON.parse(String(event.data));
+      parsed = JSON.parse(String(event.data));
     } catch {
       // A frame that isn't valid JSON is not a protocol violation worth
       // taking the plugin host down for — drop it and keep the session
       // alive for whatever comes next.
       return;
     }
+    // Valid JSON is not the same as a CDP message: `JSON.parse("null")`
+    // succeeds and yields null, as do "42" and '"hi"', and reading `.id`
+    // off any of them throws a TypeError *inside this listener* — which is
+    // an uncaught exception in the plugin host, not a failed call. This
+    // codebase's own threat model already assumes a foreign process can be
+    // holding the port (browser-endpoint.ts's identity check exists for
+    // exactly that), so a frame that is not an object is dropped like one
+    // that is not JSON.
+    if (typeof parsed !== "object" || parsed === null) return;
+    const message = parsed as {
+      id?: number;
+      method?: string;
+      params?: unknown;
+      result?: unknown;
+      error?: { message: string };
+    };
     if (typeof message.id === "number") {
       const waiter = pending.get(message.id);
       if (!waiter) return;
