@@ -48,6 +48,7 @@ async function stack(land: Landing = landOnNewest) {
   const reaper = createReaper({
     idleMs: async () => idle.ms,
     graceMs: 500,
+    headed: async () => false,
     closePage: (sessionKey) => pages.closePage(sessionKey),
     listOpenPages: () => pages.listOpenPages(),
     closeUnboundPage: (targetId) => pages.closeUnboundPage(targetId),

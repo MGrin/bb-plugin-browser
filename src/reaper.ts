@@ -50,6 +50,32 @@ export interface ReaperDeps {
    * minute of a dead tab.
    */
   graceMs: number;
+  /**
+   * Whether this profile's browser is showing a window, resolved per sweep
+   * like `idleMs`.
+   *
+   * It gates the UNBOUND pass, and only that pass. Headed mode exists for
+   * exactly one reason: a human has to use this browser themselves, to log
+   * into the sites the agent then works in. A tab they open is a tab no
+   * binding names, which is indistinguishable — to this module, and to the
+   * browser — from a tab Chromium restored on relaunch. So while the window
+   * is up, the unbound pass would close the human's own tab out from under
+   * them in one or two sweeps, i.e. inside 60-120 seconds, mid-login.
+   *
+   * The alternatives were considered and rejected. "Only reap targets the
+   * plugin created" cannot work: Chrome mints fresh target ids when it
+   * restores tabs, so the restored debris this pass exists to clear is
+   * precisely what it could never recognise. A longer grace period only
+   * moves the deadline — the requirement is that a human can open a tab,
+   * walk away, and still find it there, and no finite grace satisfies that.
+   *
+   * Skipping the pass costs debris accumulating while headed, which is
+   * bounded (headed is opt-in and deliberate), visible (there is a window
+   * on screen), and self-clearing: switching back to headless closes the
+   * browser outright. The idle pass keeps running throughout, so pages this
+   * plugin does own are still reaped either way.
+   */
+  headed(): Promise<boolean>;
   /** Closes the tab and drops the binding. Rejects if the tab survived. */
   closePage(sessionKey: string): Promise<void>;
   /** Every open page in the shared browser. Must never launch one. */
@@ -95,6 +121,9 @@ export function createReaper(deps: ReaperDeps): Reaper {
   // point of the grace period is that WE have watched it be unowned, not
   // that it is old.
   const unboundSince = new Map<string, number>();
+  // Only so the "not reaping, the window is yours" note is logged when the
+  // answer changes rather than once a minute forever.
+  let lastHeaded: boolean | null = null;
 
   async function idlePass(now: number): Promise<void> {
     const idleMs = await deps.idleMs();
@@ -193,6 +222,26 @@ export function createReaper(deps: ReaperDeps): Reaper {
       }
 
       await idlePass(now);
+
+      // The human's browser is on screen and their tabs are, by
+      // construction, unbound — so the unbound pass is off entirely while
+      // headed. Their grace periods are dropped rather than paused: coming
+      // back to headless closes the browser anyway, and a tab that outlives
+      // that has earned a fresh clock.
+      const headed = await deps.headed();
+      if (headed !== lastHeaded) {
+        lastHeaded = headed;
+        deps.log(
+          headed
+            ? "browser is headed — leaving tabs nobody is bound to alone, they may be yours"
+            : "browser is headless — resuming closing tabs nobody is bound to",
+        );
+      }
+      if (headed) {
+        unboundSince.clear();
+        return;
+      }
+
       // After the idle pass, so a page it just closed is already gone from
       // the browser rather than looking briefly like an orphan.
       if (pages) await unboundPass(pages, now);

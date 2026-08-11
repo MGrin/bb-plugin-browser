@@ -72,6 +72,10 @@ export default async function plugin(bb: BbPluginApi) {
     // Read per sweep, so editing the setting takes effect within a minute
     // rather than on the next plugin reload.
     idleMs: async () => idleMsFrom((await settings.get()).idleMinutes),
+    // Read per sweep for the same reason, and load-bearing: while the
+    // window is up the human is using this browser themselves, and the tabs
+    // they open are bound to nobody. See ReaperDeps.headed.
+    headed: async () => (await settings.get()).headed,
     // One whole sweep interval of being unowned before a page is closed:
     // pages.ts opens a tab and only then writes its binding, and a sweep
     // landing inside that window must not close a page a thread is about to

@@ -20,6 +20,7 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
   const reaper = createReaper({
     idleMs: async () => 1000,
     graceMs: 500,
+    headed: async () => false,
     closePage: async (sessionKey: string) => {
       closed.push(sessionKey);
     },
@@ -297,6 +298,65 @@ describe("reaper: pages nobody is bound to", () => {
     await reaper.sweep(0);
     await reaper.sweep(60_000);
     expect(closedTargets).toEqual([]);
+  });
+});
+
+// Headed mode exists so a HUMAN can use this browser — that is the whole
+// point of a visible window: logging into the sites the agent then works in.
+// A tab they open is bound to nobody, which is exactly what the unbound pass
+// closes, so composed with headed mode the reaper closed the human's tab out
+// from under them in 60-120 seconds, mid-login.
+describe("reaper: the human's own tabs, while the browser is headed", () => {
+  it("leaves a tab nobody is bound to alone while the window is up", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("the-humans-login-tab")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual([]);
+  });
+
+  // Not merely "for another grace period": open a tab, walk away, come
+  // back. Anything time-based only moves the moment it is taken away.
+  it("still leaves it alone an hour later", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("the-humans-login-tab")];
+    for (const now of [0, 600, 60_000, 3_600_000]) await reaper.sweep(now);
+    expect(closedTargets).toEqual([]);
+  });
+
+  it("still closes a page its own session left idle, because that page is ours", async () => {
+    const { closed, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("t1", "thr_a")];
+    reaper.touch("thr_a", 0);
+    await reaper.sweep(5000);
+    expect(closed).toEqual(["thr_a"]);
+  });
+
+  it("resumes closing unbound tabs once the window is gone", async () => {
+    let headed = true;
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => headed });
+    state.pages = [page("orphan-1")];
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual([]);
+
+    headed = false;
+    // A fresh grace period, not a resumed one: the sweeps above were not
+    // watching this tab go unowned, they were declining to.
+    await reaper.sweep(1200);
+    expect(closedTargets).toEqual([]);
+    await reaper.sweep(1800);
+    expect(closedTargets).toEqual(["orphan-1"]);
+  });
+
+  it("says so in the log, once, rather than once a minute", async () => {
+    const { logs, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("orphan-1")];
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    await reaper.sweep(1200);
+    expect(logs.filter((line) => line.includes("may be yours"))).toHaveLength(1);
   });
 });
 
