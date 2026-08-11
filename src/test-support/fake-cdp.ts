@@ -6,6 +6,12 @@ export interface FakeCdp {
   received: { method: string; params: unknown }[];
   /** Targets reported by Target.getTargets. */
   targets: { targetId: string; type: string; url: string }[];
+  /**
+   * Sockets currently connected. Screencast leans on refcounting to close
+   * sessions nobody needs — this is how tests prove a close actually
+   * happened on the wire, not just that `CdpSession.close()` was called.
+   */
+  readonly connectionCount: number;
   /** Push an event to every connected client. */
   emit(method: string, params: unknown): void;
   /** Push a raw, possibly-malformed frame to every connected client. */
@@ -26,6 +32,9 @@ export async function fakeCdp(): Promise<FakeCdp> {
     url: "",
     received: [],
     targets: [],
+    get connectionCount() {
+      return clients.size;
+    },
     emit(method, params) {
       for (const client of clients) client.send(JSON.stringify({ method, params }));
     },
