@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { runCli } from "./cli.js";
 
@@ -30,9 +33,18 @@ describe("runCli", () => {
 
   it("writes a screenshot to the requested path", async () => {
     const operations = fakeOperations();
-    const result = await runCli(operations, "thr_a", ["screenshot", "/tmp/shot-test.png"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("/tmp/shot-test.png");
+    // A path under a freshly made os.tmpdir() directory, not a hardcoded
+    // /tmp literal: a sandboxed test runner may not have write access to
+    // /tmp directly, only to $TMPDIR (which os.tmpdir() resolves to).
+    const dir = await mkdtemp(join(tmpdir(), "bb-browser-cli-test-"));
+    const path = join(dir, "shot-test.png");
+    try {
+      const result = await runCli(operations, "thr_a", ["screenshot", path]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain(path);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("reports an unknown subcommand without throwing", async () => {

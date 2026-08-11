@@ -53,6 +53,16 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
   // shaped race.
   const starting = new Map<string, Promise<Cast>>();
 
+  // Bumped by stopAll so a start already in flight at shutdown time can
+  // tell, once it finishes, that it lost the race. Without this, a start
+  // that began just before stopAll either (a) finishes after stopAll and
+  // sits there encoding frames for an audience of zero — exactly what the
+  // header comment forbids — or worse, (b) finishes after a *fresh* cast
+  // for the same session key was already started post-shutdown, and its
+  // late `casts.set` silently clobbers that fresh cast's map entry, orphaning
+  // its session where stopCast's identity guard can never reach it again.
+  let epoch = 0;
+
   async function startCast(sessionKey: string, profile: string): Promise<Cast> {
     const url = await deps.pages.pageUrlFor(sessionKey, profile);
     const session = await openCdp(url);
@@ -65,7 +75,17 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
         // fire-and-forget: a rejected ack (socket already on its way down)
         // is not this handler's problem to surface.
         session.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => {});
-        for (const subscriber of cast.subscribers) subscriber(frame.data);
+        for (const subscriber of cast.subscribers) {
+          try {
+            subscriber(frame.data);
+          } catch {
+            // A subscriber throwing (an HTTP write after the viewer's
+            // socket already closed, say) must not take out every other
+            // subscriber sharing this cast, and must not become an
+            // uncaught exception at the CDP message-handler level, which
+            // is process-wide in the plugin host.
+          }
+        }
       });
       await session.send("Page.startScreencast", {
         format: "jpeg",
@@ -87,8 +107,17 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     const inflight = starting.get(sessionKey);
     if (inflight) return inflight;
 
-    const promise = startCast(sessionKey, profile)
+    const startEpoch = epoch;
+    const promise: Promise<Cast> = startCast(sessionKey, profile)
       .then((cast) => {
+        if (epoch !== startEpoch) {
+          // stopAll ran while this was connecting. There is no caller left
+          // waiting on this specific cast as "the" cast for this key —
+          // close it rather than let it run unwatched, or clobber whatever
+          // a later, faster start already installed after the stop.
+          cast.session.send("Page.stopScreencast").catch(() => {}).finally(() => cast.session.close());
+          throw new Error(`screencast: start for ${sessionKey} superseded by stopAll`);
+        }
         casts.set(sessionKey, cast);
         return cast;
       })
@@ -162,6 +191,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     },
 
     stopAll() {
+      epoch += 1;
       for (const cast of casts.values()) cast.session.close();
       casts.clear();
       starting.clear();
