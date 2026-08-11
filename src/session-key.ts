@@ -31,6 +31,7 @@ export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
       try {
         thread = await bb.sdk.threads.get({ threadId: current });
       } catch {
+        seen.pop(); // A failed fetch must not be cached — it may be transient.
         break; // An unreadable thread means root stays at the last node we could read.
       }
       root = current; // This node was successfully read, so it's a valid stopping point.
