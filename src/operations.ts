@@ -57,7 +57,9 @@ export const ALLOWED_SCHEMES = ["http:", "https:"] as const;
  *
  * Page text reaches the model verbatim, and a hostile or merely enormous page
  * would otherwise flow in up to execFile's 32MB buffer and blow a context
- * window. 40k chars is roughly 10k tokens — a few percent of a 200k context,
+ * window. This covers every command whose output the PAGE writes — which
+ * includes `open`, because what it returns is the page's own <title>, and a
+ * title is as attacker-controlled as a body. 40k chars is roughly 10k tokens — a few percent of a 200k context,
  * comfortably above the few thousand characters a normal article's rendered
  * text runs to, and far below the ceiling. agent-browser truncates with a
  * visible "[truncated: showing N of M chars]" marker, so the model is told
@@ -227,12 +229,18 @@ export function createOperations(deps: OperationsDeps): Operations {
     // async, so a refused scheme arrives as a rejected promise like every
     // other failure rather than as a synchronous throw the callers of an
     // async interface would not think to catch.
+    //
+    // Capped like a read: `open` returns the page's title, which the page
+    // writes. Uncapped, a title megabytes long went straight to the model
+    // through execFile's 32MB buffer — the same hole the cap was added to
+    // close, on the one command that is always the FIRST thing a hostile
+    // page gets to answer.
     async open(sessionKey, url) {
       assertOpenableUrl(url);
-      return command(sessionKey, ["open", url]);
+      return capped(sessionKey, ["open", url]);
     },
 
-    // read, snapshot and eval are the three that return page-controlled text.
+    // read, snapshot and eval return page-controlled text too.
     read: (sessionKey) => capped(sessionKey, ["read"]),
     snapshot: (sessionKey, interactive) =>
       capped(sessionKey, interactive ? ["snapshot", "-i"] : ["snapshot"]),

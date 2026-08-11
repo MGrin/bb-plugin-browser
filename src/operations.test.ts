@@ -315,10 +315,26 @@ describe("operations", () => {
     await expect(ops.operations.screenshot("thr_a")).rejects.toThrow(/over the .*-byte limit/);
   });
 
+  // `open` returns the page's <title>, which the page writes — so it is
+  // page-controlled text like `read` is, and it was the one such command
+  // left uncapped: a hostile title reached the model through execFile's
+  // 32MB buffer. It is also the FIRST thing a hostile page ever gets to
+  // answer, which is what makes it the wrong one to have missed.
+  it("caps the title an opened page returns", async () => {
+    const ops = opsWith();
+    await ops.operations.open("thr_a", "https://example.com/");
+    expect(ops.calls[0]).toEqual(["open", "https://example.com/"]);
+    expect(ops.runs[0]!.maxOutput).toBe(MAX_OUTPUT_CHARS);
+  });
+
   it("does not cap commands whose output the page does not control", async () => {
     const ops = opsWith();
     await ops.operations.click("thr_a", "#go");
     expect(ops.calls[0]).toEqual(["click", "#go"]);
+    // Asserted, not merely unasserted: the exemption is a real decision,
+    // and a test that only checks the argv passes whether or not the cap
+    // is applied.
+    expect(ops.runs[0]!.maxOutput).toBeUndefined();
   });
 
   it("says so, naming the reason, when it cannot reach this thread's page at all", async () => {
