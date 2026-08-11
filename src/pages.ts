@@ -57,28 +57,52 @@ export function createPages(deps: PagesDeps): Pages {
     }
   }
 
+  async function resolvePageUrl(sessionKey: string, profile: string): Promise<string> {
+    const browserUrl = await deps.engine.browserCdpUrl(profile);
+    const bound = await deps.kv.get<Binding>(key(sessionKey));
+    const open = await targets(browserUrl);
+
+    if (bound && open.some((target) => target.targetId === bound.targetId)) {
+      return pageUrl(browserUrl, bound.targetId);
+    }
+
+    const session = await openCdp(browserUrl);
+    try {
+      const created = await session.send<{ targetId: string }>("Target.createTarget", {
+        url: "about:blank",
+      });
+      await deps.kv.set(key(sessionKey), { profile, targetId: created.targetId });
+      deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
+      return pageUrl(browserUrl, created.targetId);
+    } finally {
+      session.close();
+    }
+  }
+
+  // A coordinator and its subagents share one session key by design (see
+  // session-key.ts), so concurrent pageUrlFor calls for the same key are
+  // the normal fleet case, not an edge case. Without coalescing, two
+  // concurrent calls both see no binding, both create a page, and only the
+  // last kv.set wins — orphaning the other tab forever and handing the
+  // first caller a page id closePage will never know about. One in-flight
+  // promise per session key means every concurrent caller gets the same
+  // resolution (or the same rejection); the entry is removed once settled
+  // so a failure doesn't poison later, unrelated calls.
+  const inflight = new Map<string, Promise<string>>();
+
+  function pageUrlFor(sessionKey: string, profile: string): Promise<string> {
+    const existing = inflight.get(sessionKey);
+    if (existing) return existing;
+
+    const settling = resolvePageUrl(sessionKey, profile).finally(() => {
+      inflight.delete(sessionKey);
+    });
+    inflight.set(sessionKey, settling);
+    return settling;
+  }
+
   return {
-    async pageUrlFor(sessionKey, profile) {
-      const browserUrl = await deps.engine.browserCdpUrl(profile);
-      const bound = await deps.kv.get<Binding>(key(sessionKey));
-      const open = await targets(browserUrl);
-
-      if (bound && open.some((target) => target.targetId === bound.targetId)) {
-        return pageUrl(browserUrl, bound.targetId);
-      }
-
-      const session = await openCdp(browserUrl);
-      try {
-        const created = await session.send<{ targetId: string }>("Target.createTarget", {
-          url: "about:blank",
-        });
-        await deps.kv.set(key(sessionKey), { profile, targetId: created.targetId });
-        deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
-        return pageUrl(browserUrl, created.targetId);
-      } finally {
-        session.close();
-      }
-    },
+    pageUrlFor,
 
     async closePage(sessionKey) {
       const bound = await deps.kv.get<Binding>(key(sessionKey));
@@ -87,6 +111,15 @@ export function createPages(deps: PagesDeps): Pages {
       const session = await openCdp(browserUrl);
       try {
         await session.send("Target.closeTarget", { targetId: bound.targetId });
+      } catch (error) {
+        // Real Chrome errors closing a targetId it no longer has — the
+        // panel's close button, a crash, the idle reaper could all have
+        // gotten there first. That's not a reason to strand the binding:
+        // the page is gone either way, so treat the error as confirmation
+        // rather than a failure.
+        deps.log(
+          `closePage: ${bound.targetId} already gone (${(error as Error).message})`,
+        );
       } finally {
         session.close();
       }

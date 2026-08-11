@@ -67,4 +67,35 @@ describe("pages", () => {
     expect(server.received.some((m) => m.method === "Target.closeTarget")).toBe(true);
     expect(server.targets).toHaveLength(0);
   });
+
+  it("coalesces concurrent pageUrlFor calls for the same session key into one page", async () => {
+    server = await fakeCdp();
+    const pages = pagesFor(server.url);
+    const [a, b] = await Promise.all([
+      pages.pageUrlFor("thr_a", "main"),
+      pages.pageUrlFor("thr_a", "main"),
+    ]);
+    expect(a).toBe(b);
+    expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(1);
+    // The binding must point at the one page both callers were handed —
+    // otherwise a later closePage would close a page nobody was told about.
+    await pages.closePage("thr_a");
+    expect(server.targets).toHaveLength(0);
+  });
+
+  it("closePage clears the binding even when Target.closeTarget errors", async () => {
+    server = await fakeCdp();
+    const pages = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    // Simulate the page having already vanished by the time we try to close it.
+    server.targets = [];
+    await pages.closePage("thr_a");
+    // A second close must be a no-op, not an error — proving the binding was cleared.
+    await expect(pages.closePage("thr_a")).resolves.toBeUndefined();
+    // And calling pageUrlFor again must create a fresh page rather than
+    // reusing a stale, already-cleared binding forever.
+    const revived = await pages.pageUrlFor("thr_a", "main");
+    expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(2);
+    expect(revived).toBeTruthy();
+  });
 });

@@ -8,18 +8,35 @@ export interface FakeCdp {
   targets: { targetId: string; type: string; url: string }[];
   /** Push an event to every connected client. */
   emit(method: string, params: unknown): void;
+  /** Push a raw, possibly-malformed frame to every connected client. */
+  sendRaw(data: string): void;
+  /** Never answer a call for this method — proves request timeouts. */
+  silence(method: string): void;
+  /** Answer a call for this method with a CDP protocol error instead of a result. */
+  failOn(method: string, message: string): void;
   close(): Promise<void>;
 }
 
 export async function fakeCdp(): Promise<FakeCdp> {
   const server = new WebSocketServer({ port: 0 });
   const clients = new Set<WebSocket>();
+  const silenced = new Set<string>();
+  const failing = new Map<string, string>();
   const state: FakeCdp = {
     url: "",
     received: [],
     targets: [],
     emit(method, params) {
       for (const client of clients) client.send(JSON.stringify({ method, params }));
+    },
+    sendRaw(data) {
+      for (const client of clients) client.send(data);
+    },
+    silence(method) {
+      silenced.add(method);
+    },
+    failOn(method, message) {
+      failing.set(method, message);
     },
     async close() {
       for (const client of clients) client.close();
@@ -43,22 +60,36 @@ export async function fakeCdp(): Promise<FakeCdp> {
         params?: unknown;
       };
       state.received.push({ method: message.method, params: message.params });
+
+      // A method under `silence()` never gets a reply — the caller is left
+      // hanging exactly as an unresponsive real browser would.
+      if (silenced.has(message.method)) return;
+
       let result: unknown = {};
-      if (message.method === "Target.getTargets") {
+      let error: { message: string } | undefined;
+
+      if (failing.has(message.method)) {
+        error = { message: failing.get(message.method)! };
+      } else if (message.method === "Target.getTargets") {
         result = { targetInfos: state.targets };
-      }
-      if (message.method === "Target.createTarget") {
+      } else if (message.method === "Target.createTarget") {
         created += 1;
         const targetId = `page-${created}`;
         state.targets.push({ targetId, type: "page", url: "about:blank" });
         result = { targetId };
-      }
-      if (message.method === "Target.closeTarget") {
+      } else if (message.method === "Target.closeTarget") {
         const closing = (message.params as { targetId: string }).targetId;
-        state.targets = state.targets.filter((t) => t.targetId !== closing);
-        result = { success: true };
+        const exists = state.targets.some((t) => t.targetId === closing);
+        if (exists) {
+          state.targets = state.targets.filter((t) => t.targetId !== closing);
+          result = { success: true };
+        } else {
+          // Real Chrome errors closing a targetId it no longer knows about.
+          error = { message: `No target with given id found: ${closing}` };
+        }
       }
-      socket.send(JSON.stringify({ id: message.id, result }));
+
+      socket.send(JSON.stringify(error ? { id: message.id, error } : { id: message.id, result }));
     });
   });
 
