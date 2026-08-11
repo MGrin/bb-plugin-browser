@@ -284,6 +284,90 @@ describe("screencast", () => {
     expect(server.connectionCount).toBe(0);
   });
 
+  it("a stale start's cleanup does not evict a fresh start's bookkeeping, so a third subscriber still coalesces instead of leaking an orphan", async () => {
+    // Reproduces the exact interleaving a re-review found still leaked
+    // after an epoch-only fix: A in flight, stopAll, B in flight, A
+    // resolves and (in the buggy version) deletes B's `starting` entry,
+    // so a third caller C no longer coalesces onto B and starts an
+    // independent cast, which B's own late `casts.set` then clobbers —
+    // leaving one of the two live sockets unreachable by `stopCast`
+    // forever. A global "has stopAll run since I started" counter can't
+    // prevent this: B and any C that starts independently share the same
+    // post-stopAll generation, so a generation compare alone can't tell
+    // "B, the entry still on record" apart from "a start that has since
+    // replaced it". Only comparing this promise's own identity against
+    // what `starting` currently holds works in every ordering — which is
+    // why A's resolution (below) has to happen, and be fully processed,
+    // *before* C's subscribe call, and B has to still be in flight (not
+    // yet resolved) when C's coalescing decision is made.
+    server = await fakeCdp();
+    const gateA = deferred<string>();
+    const gateB = deferred<string>();
+    let pageUrlForCalls = 0;
+    const screencast = createScreencast({
+      pages: {
+        // 1st call is A's, stuck until gateA resolves. 2nd is B's, stuck
+        // until gateB resolves. 3rd (C's, if it starts independently) and
+        // anything after resolves immediately.
+        pageUrlFor: async () => {
+          pageUrlForCalls += 1;
+          if (pageUrlForCalls === 1) return gateA.promise;
+          if (pageUrlForCalls === 2) return gateB.promise;
+          return server.url;
+        },
+        closePage: async () => {},
+        forget: async () => {},
+      },
+      quality: 60,
+      maxWidth: 1280,
+    });
+
+    const subscribingA = screencast.subscribe("thr_a", "main", () => {}); // A: stuck on gateA
+    screencast.stopAll(); // A is now stale before it ever connected
+
+    const seenB: string[] = [];
+    const subscribingB = screencast.subscribe("thr_a", "main", (frame) => seenB.push(frame)); // B: stuck on gateB
+
+    // Let A finish connecting and discover it lost the race. Awaiting its
+    // rejection guarantees A's cleanup has fully run — including whatever
+    // it does to `starting` — before C ever calls subscribe, while B
+    // (still on gateB) has not resolved yet either.
+    gateA.resolve(server.url);
+    await expect(subscribingA).rejects.toThrow();
+
+    // C arrives now, with B still in flight — it must coalesce onto B's
+    // still-live `starting` entry rather than miss it because A's cleanup
+    // (just above) wrongly evicted that entry.
+    const seenC: string[] = [];
+    const subscribingC = screencast.subscribe("thr_a", "main", (frame) => seenC.push(frame));
+
+    gateB.resolve(server.url); // let B (and, if it coalesced, C) finish connecting
+    const [unsubscribeB, unsubscribeC] = await Promise.all([subscribingB, subscribingC]);
+
+    // Exactly two starts happened: A (superseded, closed on arrival) and
+    // B (the one C coalesced onto). Three would mean C missed the
+    // coalesce and started its own, independent cast.
+    expect(server.received.filter((m) => m.method === "Page.startScreencast")).toHaveLength(2);
+
+    server.emit("Page.screencastFrame", { data: "FRAME", sessionId: 1 });
+    await tick();
+    // Both B and C received it — proof they share the same cast, not two
+    // separate ones.
+    expect(seenB).toEqual(["FRAME"]);
+    expect(seenC).toEqual(["FRAME"]);
+
+    unsubscribeB();
+    unsubscribeC();
+    await tick();
+    expect(server.connectionCount).toBe(0);
+
+    // A later stopAll must find nothing left to clean up. The leak this
+    // reproduces survives exactly because stopAll only walks `casts`, and
+    // a wrongly-orphaned cast is no longer reachable there.
+    screencast.stopAll();
+    expect(server.connectionCount).toBe(0);
+  });
+
   it("closes the CDP session if starting the cast fails partway through", async () => {
     server = await fakeCdp();
     server.failOn("Page.startScreencast", "boom");

@@ -53,15 +53,9 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
   // shaped race.
   const starting = new Map<string, Promise<Cast>>();
 
-  // Bumped by stopAll so a start already in flight at shutdown time can
-  // tell, once it finishes, that it lost the race. Without this, a start
-  // that began just before stopAll either (a) finishes after stopAll and
-  // sits there encoding frames for an audience of zero — exactly what the
-  // header comment forbids — or worse, (b) finishes after a *fresh* cast
-  // for the same session key was already started post-shutdown, and its
-  // late `casts.set` silently clobbers that fresh cast's map entry, orphaning
-  // its session where stopCast's identity guard can never reach it again.
-  let epoch = 0;
+  function closeCast(cast: Cast): void {
+    cast.session.send("Page.stopScreencast").catch(() => {}).finally(() => cast.session.close());
+  }
 
   async function startCast(sessionKey: string, profile: string): Promise<Cast> {
     const url = await deps.pages.pageUrlFor(sessionKey, profile);
@@ -107,21 +101,38 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     const inflight = starting.get(sessionKey);
     if (inflight) return inflight;
 
-    const startEpoch = epoch;
-    const promise: Promise<Cast> = startCast(sessionKey, profile)
-      .then((cast) => {
-        if (epoch !== startEpoch) {
-          // stopAll ran while this was connecting. There is no caller left
-          // waiting on this specific cast as "the" cast for this key —
-          // close it rather than let it run unwatched, or clobber whatever
-          // a later, faster start already installed after the stop.
-          cast.session.send("Page.stopScreencast").catch(() => {}).finally(() => cast.session.close());
-          throw new Error(`screencast: start for ${sessionKey} superseded by stopAll`);
+    // Whether this start may write anywhere is decided per entry, by
+    // object identity, not by a "has stopAll run since I started" flag: a
+    // global marker cannot tell apart two starts that began in the same
+    // window (e.g. a fresh start B, and a second start C that should
+    // coalesce onto B) — only "am I still the promise currently on record
+    // for this key" can, in every ordering, including the one where some
+    // *other* stale start's cleanup would otherwise have evicted this
+    // entry out from under it.
+    const promise: Promise<Cast> = startCast(sessionKey, profile).then(
+      (cast) => {
+        if (starting.get(sessionKey) !== promise) {
+          // Something else now owns this key — a stopAll cleared this
+          // entry (and nothing since put it back), or another caller's
+          // start became the recorded one instead. Either way, this cast
+          // has no subscribers of its own and must not install itself or
+          // touch anyone else's bookkeeping.
+          closeCast(cast);
+          throw new Error(`screencast: start for ${sessionKey} superseded`);
         }
+        starting.delete(sessionKey);
         casts.set(sessionKey, cast);
         return cast;
-      })
-      .finally(() => starting.delete(sessionKey));
+      },
+      (error) => {
+        // startCast itself failed before reaching the identity check
+        // above — clean up this entry, but only if it's still ours; a
+        // later start may already have replaced it (e.g. after a stopAll
+        // that raced this failure).
+        if (starting.get(sessionKey) === promise) starting.delete(sessionKey);
+        throw error;
+      },
+    );
     starting.set(sessionKey, promise);
     return promise;
   }
@@ -133,7 +144,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     // on record.
     if (casts.get(sessionKey) !== cast) return;
     casts.delete(sessionKey);
-    cast.session.send("Page.stopScreencast").catch(() => {}).finally(() => cast.session.close());
+    closeCast(cast);
   }
 
   return {
@@ -191,7 +202,11 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     },
 
     stopAll() {
-      epoch += 1;
+      // Closing every live cast is straightforward — this is the only
+      // owner of those sessions. Clearing `starting` (rather than leaving
+      // in-flight entries in place) is what makes each one's own identity
+      // check above come back mismatched once it resolves: nothing here
+      // currently equals a promise that was cleared out from under it.
       for (const cast of casts.values()) cast.session.close();
       casts.clear();
       starting.clear();
