@@ -147,13 +147,23 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
 // This mirrors that.
 export const STREAM_PATH = "/stream";
 
-export function registerStreamRoute(
-  bb: BbPluginApi,
-  screencast: Screencast,
-  pages: Pick<Pages, "existingPageUrl">,
-  resolveSessionKey: SessionKeyResolver,
-  profileFor: (sessionKey: string) => Promise<string>,
-): void {
+export interface StreamRouteDeps {
+  screencast: Pick<Screencast, "subscribe">;
+  pages: Pick<Pages, "existingPageUrl">;
+  resolveSessionKey: SessionKeyResolver;
+  profileFor: (sessionKey: string) => Promise<string>;
+  /**
+   * A viewer counts as using the page. Someone watching the panel is using
+   * it even when no command has run for an hour, so the idle reaper must not
+   * close it under them — this is the refcount that says so, and it is a
+   * required dependency because a route that quietly forgot to take it would
+   * blank a live viewer's screen with nothing to point at.
+   */
+  viewers: { watch(sessionKey: string): void; unwatch(sessionKey: string): void };
+}
+
+export function registerStreamRoute(bb: BbPluginApi, deps: StreamRouteDeps): void {
+  const { screencast, pages, resolveSessionKey, profileFor, viewers } = deps;
   bb.http.route(
     "GET",
     STREAM_PATH,
@@ -177,7 +187,22 @@ export function registerStreamRoute(
       }
 
       const profile = await profileFor(sessionKey);
-      return mjpegResponse((onFrame) => screencast.subscribe(sessionKey, profile, onFrame));
+      return mjpegResponse(async (onFrame) => {
+        const unsubscribe = await screencast.subscribe(sessionKey, profile, onFrame);
+        // Counted only once the subscribe has actually succeeded, so a
+        // failed one cannot leave a phantom viewer holding a page open for
+        // the life of the plugin. Released exactly once: mjpegResponse can
+        // reach its teardown from either a client cancel or a write failure,
+        // and both may observe the same dead connection.
+        viewers.watch(sessionKey);
+        let released = false;
+        return () => {
+          unsubscribe();
+          if (released) return;
+          released = true;
+          viewers.unwatch(sessionKey);
+        };
+      });
     },
     { auth: "token" },
   );

@@ -9,6 +9,14 @@ import { defaultProfile } from "./src/identity.js";
 import { createOperations } from "./src/operations.js";
 import { createPages } from "./src/pages.js";
 import { registerPanelRpc } from "./src/panel-rpc.js";
+import {
+  createReaper,
+  createThreadTeardown,
+  DEFAULT_IDLE_MINUTES,
+  idleMsFrom,
+  runSweeps,
+  SWEEP_INTERVAL_MS,
+} from "./src/reaper.js";
 import { createScreencast } from "./src/screencast.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
 import { registerStreamRoute } from "./src/stream.js";
@@ -21,8 +29,18 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Show the browser window",
       description:
-        "Some sites render blank headless. Relaunches the browser; logins survive.",
+        "Some sites render blank headless. Changing this closes the browser; the next command starts it again in the new mode. The profile directory is untouched, so logins survive.",
       default: false,
+    },
+    idleMinutes: {
+      // A string, because bb's setting descriptors are string, boolean,
+      // select and project — there is no number. `idleMsFrom` parses it and
+      // falls back to the default for anything unusable.
+      type: "string",
+      label: "Close idle pages after (minutes)",
+      description:
+        "A page no thread has used for this long is closed, so the shared browser does not accumulate tabs forever. A page you have open in the Browser panel is never closed, however idle it looks.",
+      default: String(DEFAULT_IDLE_MINUTES),
     },
   });
 
@@ -46,18 +64,50 @@ export default async function plugin(bb: BbPluginApi) {
 
   const resolveSessionKey = createSessionKeyResolver(bb);
 
+  // Closing pages nobody is using is not hygiene here: the shared profile
+  // restores its tabs when Chromium relaunches, so without a reaper this
+  // browser accumulates tabs permanently, across restarts (measured — 21 of
+  // them came back after one plugin reload).
+  const reaper = createReaper({
+    // Read per sweep, so editing the setting takes effect within a minute
+    // rather than on the next plugin reload.
+    idleMs: async () => idleMsFrom((await settings.get()).idleMinutes),
+    // One whole sweep interval of being unowned before a page is closed:
+    // pages.ts opens a tab and only then writes its binding, and a sweep
+    // landing inside that window must not close a page a thread is about to
+    // be handed.
+    graceMs: SWEEP_INTERVAL_MS,
+    closePage: (sessionKey) => pages.closePage(sessionKey),
+    listOpenPages: () => pages.listOpenPages(),
+    closeUnboundPage: (targetId) => pages.closeUnboundPage(targetId),
+    log: (message) => bb.log.info(message),
+    // A failed close means a tab is still open that nothing may reference
+    // again — that belongs at warn, not info.
+    warn: (message) => bb.log.warn(message),
+  });
+
   const operations = createOperations({
     engine,
     pages,
     // One profile for now, so every thread shares one cookie jar and one
     // browser. Per-project profiles are a later task's decision.
     profileFor: async () => defaultProfile,
+    // The reaper hears about every command, from the tools, the CLI and the
+    // panel alike, because they all funnel through Operations.
+    activity: reaper,
   });
 
   const screencast = createScreencast({ pages, quality: 60, maxWidth: 1280 });
   // Same single profile as operations above — one cookie jar, one browser,
   // for now.
-  registerStreamRoute(bb, screencast, pages, resolveSessionKey, async () => defaultProfile);
+  registerStreamRoute(bb, {
+    screencast,
+    pages,
+    resolveSessionKey,
+    profileFor: async () => defaultProfile,
+    // A viewer is a user of the page: watching it must keep it alive.
+    viewers: reaper,
+  });
 
   // The panel tab's data plane. Same single profile again, and the same rule
   // as the stream route: it takes a thread id and resolves the session key
@@ -72,6 +122,48 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerTools(bb, operations, resolveSessionKey);
   registerCli(bb, operations, resolveSessionKey);
+
+  bb.background.service("reaper", {
+    start: (signal) => runSweeps(signal, reaper, { warn: (message) => bb.log.warn(message) }),
+  });
+
+  // A thread that is gone should not leave a tab behind. The same handler for
+  // both events: it is idempotent, and a thread is routinely archived and
+  // then deleted.
+  const teardown = createThreadTeardown({
+    resolveSessionKey,
+    closePage: (sessionKey) => pages.closePage(sessionKey),
+    forget: (sessionKey) => reaper.forget(sessionKey),
+    warn: (message) => bb.log.warn(message),
+  });
+  bb.events.on("thread.archived", teardown);
+  bb.events.on("thread.deleted", teardown);
+
+  // Changing `headed` has to actually do something. The engine reads the
+  // setting at every LAUNCH, but a browser that is already running was
+  // launched under the old answer and will keep its window (or its absence)
+  // forever — so close it here and let the next command start it again. The
+  // profile directory is not touched by any of this, which is why logins
+  // survive the switch.
+  settings.onChange((next, previous) => {
+    if (next.headed === previous.headed) return;
+    void (async () => {
+      try {
+        bb.log.info(
+          `headed is now ${next.headed}; closing the browser so the next command relaunches it`,
+        );
+        // The casts point at pages that are about to stop existing.
+        screencast.stopAll();
+        await engine.shutdown(defaultProfile);
+      } catch (error) {
+        bb.log.warn(
+          `could not relaunch the browser after the headed change: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    })();
+  });
 
   // Registering a tool only makes it exist; `configure` is what puts it in a
   // session's tool set. A `configure()` return is accepted or rejected as a

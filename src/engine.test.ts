@@ -177,6 +177,19 @@ describe("engine.shutdown", () => {
     expect(closeCall).toContain(controlSessionFor("main"));
   });
 
+  // The case that makes `headed` take effect at all: a plugin reload leaves
+  // the browser running but resets every bit of in-process state, so a
+  // shutdown that only fires for profiles this process has already talked to
+  // would silently do nothing exactly when the user has just changed the
+  // setting and is waiting for a window to appear.
+  it("closes a profile this process has never run a command for", async () => {
+    const { binary, engine } = engineWith();
+    await engine.shutdown("main");
+    const closeCall = binary.calls().at(-1) ?? [];
+    expect(closeCall).toContain("close");
+    expect(closeCall).toContain(controlSessionFor("main"));
+  });
+
   it("leaves another profile's browser alone", async () => {
     const { binary, engine } = engineWith();
     await engine.run({ profile: "main", session: "thr_a", argv: ["get", "url"] });

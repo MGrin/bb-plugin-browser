@@ -64,15 +64,22 @@ function opsWith(
     },
     existingPageUrl: async () => null,
     existingPageInfo: async () => null,
+    listOpenPages: async () => [],
+    closeUnboundPage: async () => {},
     closePage: async (sessionKey: string) => {
       closed.push(sessionKey);
     },
     forget: async () => {},
   };
+  // Every call the reaper is told about, in order — "watch thr_a", "touch
+  // thr_a" and so on. Order is the whole point: a hold taken after the
+  // command has already run would not protect it.
+  const activity: string[] = [];
   return {
     runs,
     closed,
     rebinds,
+    activity,
     /** The batch steps of every invocation. */
     get batches() {
       return runs.map((args) => JSON.parse(args.stdin ?? "[]") as string[][]);
@@ -85,6 +92,12 @@ function opsWith(
       engine,
       pages,
       profileFor: async () => "main",
+      activity: {
+        touch: (sessionKey: string) => activity.push(`touch ${sessionKey}`),
+        watch: (sessionKey: string) => activity.push(`watch ${sessionKey}`),
+        unwatch: (sessionKey: string) => activity.push(`unwatch ${sessionKey}`),
+        forget: (sessionKey: string) => activity.push(`forget ${sessionKey}`),
+      },
     }),
   };
 }
@@ -311,5 +324,53 @@ describe("operations", () => {
     await expect(ops.operations.read("thr_a")).rejects.toThrow(
       /could not put this thread on its own page.*No tab with label/s,
     );
+  });
+});
+
+// The reaper closes pages nobody has used lately. "Lately" has to mean real
+// command activity, not just panel traffic — otherwise an agent working a
+// long task through the tools is invisible to it, and its page gets closed
+// mid-work.
+describe("operations tell the reaper the page is in use", () => {
+  it("holds the page for the whole of a command, then restarts its idle clock", async () => {
+    const ops = opsWith();
+    await ops.operations.read("thr_a");
+    expect(ops.activity).toEqual(["watch thr_a", "touch thr_a", "unwatch thr_a"]);
+  });
+
+  // The discriminating part: a touch on its own only moves a timestamp, and
+  // a command that runs longer than the idle timeout would still be reaped
+  // half way through. The hold has to be open while the invocation runs.
+  it("keeps the hold open for as long as the command is running", async () => {
+    let heldDuringRun: string[] = [];
+    const ops = opsWith(async () => {
+      heldDuringRun = [...ops.activity];
+      return { stdout: "ok", stderr: "", code: 0 };
+    });
+    await ops.operations.read("thr_a");
+    expect(heldDuringRun).toEqual(["watch thr_a"]);
+  });
+
+  it("releases the hold when the command fails", async () => {
+    const ops = opsWith("ok", { neverBinds: true });
+    await expect(ops.operations.read("thr_a")).rejects.toThrow();
+    expect(ops.activity).toEqual(["watch thr_a", "touch thr_a", "unwatch thr_a"]);
+  });
+
+  it("holds the page across a rebind and its retry, not just the first attempt", async () => {
+    const ops = opsWith("ok", { forgetLabel: true });
+    await ops.operations.read("thr_a");
+    expect(ops.rebinds).toEqual(["thr_a"]);
+    expect(ops.activity).toEqual(["watch thr_a", "touch thr_a", "unwatch thr_a"]);
+  });
+
+  // Closing on purpose is the one case where there is nothing left to reap:
+  // leaving the session tracked would have the next sweep try to close a
+  // page that is already gone, once a minute, forever.
+  it("stops tracking a session whose page was closed on purpose", async () => {
+    const ops = opsWith();
+    await ops.operations.close("thr_a");
+    expect(ops.closed).toEqual(["thr_a"]);
+    expect(ops.activity).toEqual(["forget thr_a"]);
   });
 });

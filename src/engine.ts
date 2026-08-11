@@ -191,7 +191,14 @@ export function createEngine(options: EngineOptions): Engine {
     browserCdpUrl,
 
     async shutdown(profile) {
-      if (!live.has(profile)) return;
+      // Deliberately not gated on `live`. `live` is in-process bookkeeping
+      // that resets on every plugin reload while the agent-browser daemon and
+      // its Chromium keep running, so a shutdown gated on it does nothing at
+      // all in the most ordinary case there is: toggling the `headed` setting
+      // on a freshly reloaded plugin, where the browser is running but this
+      // process has not yet spoken to it. Measured (0.33.2): `close` against
+      // a profile with no browser running prints "✓ Browser closed", exits 0,
+      // and launches nothing — so asking is cheap and never counterproductive.
       await execRaw({ profile, session: controlSessionFor(profile), argv: ["close"] });
       live.delete(profile);
       ensured.delete(profile);

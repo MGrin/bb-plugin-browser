@@ -2,19 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPages, TAB_LABEL } from "./pages.js";
 import { fakeBrowser } from "./test-support/fake-browser.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
+import { memoryKv } from "./test-support/memory-kv.js";
 
 let server: FakeCdp;
 afterEach(async () => { await server?.close(); });
-
-function memoryKv() {
-  const store = new Map<string, unknown>();
-  return {
-    store,
-    get: async <T,>(key: string) => store.get(key) as T | undefined,
-    set: async (key: string, value: unknown) => { store.set(key, value); },
-    delete: async (key: string) => { store.delete(key); },
-  };
-}
 
 /**
  * `browserCdpUrl` as a spy, not a plain function: several tests below prove
@@ -319,6 +310,102 @@ describe("pages", () => {
     const revived = await pages.pageUrlFor("thr_a", "main");
     expect(tabsOpened(browser)).toHaveLength(2);
     expect(revived).toBeTruthy();
+  });
+
+  // What the reaper reads and acts on. The shared profile restores its tabs
+  // when Chromium relaunches (measured, Task 9b: 21 came back), and every
+  // restored tab carries a fresh target id no binding names — so "which pages
+  // does nobody own" is a question this module has to be able to answer, and
+  // to answer without ever launching a browser to find out.
+  describe("pages nobody is bound to", () => {
+    it("lists every open page and says which session owns each", async () => {
+      server = await fakeCdp();
+      const { pages } = pagesFor(server.url);
+      server.targets.push({ targetId: "restored", type: "page", url: "https://leftover.example/" });
+      await pages.pageUrlFor("thr_a", "main");
+
+      const open = await pages.listOpenPages();
+      expect(open).toEqual([
+        { targetId: "restored", url: "https://leftover.example/", sessionKey: null },
+        { targetId: "tab-1", url: "about:blank", sessionKey: "thr_a" },
+      ]);
+    });
+
+    it("lists nothing, and never launches a browser, when none is reachable", async () => {
+      server = await fakeCdp();
+      const { pages, browserCdpUrl } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+      await server.close();
+
+      expect(await pages.listOpenPages()).toEqual([]);
+      // The sweep runs every minute forever. If it could launch a browser,
+      // this plugin would hold a Chromium open on an idle machine for good.
+      expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+    });
+
+    // The live case this exists for: bb restarted, every binding is gone, and
+    // the browser is still holding 21 tabs from before. With only the
+    // bindings to go on there would be no origin left to probe and the debris
+    // would be unreachable forever.
+    it("still finds the browser when no bindings are left at all", async () => {
+      server = await fakeCdp();
+      const { pages, kv, browserCdpUrl } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      for (const key of [...kv.store.keys()]) {
+        if (key.startsWith("page:")) kv.store.delete(key);
+      }
+
+      const open = await pages.listOpenPages();
+      expect(open).toEqual([{ targetId: "tab-1", url: "about:blank", sessionKey: null }]);
+      expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+    });
+
+    it("closes a page nobody is bound to", async () => {
+      server = await fakeCdp();
+      const { pages } = pagesFor(server.url);
+      server.targets.push({ targetId: "restored", type: "page", url: "https://leftover.example/" });
+      await pages.pageUrlFor("thr_a", "main");
+
+      await pages.closeUnboundPage("restored");
+      expect(server.targets.map((target) => target.targetId)).toEqual(["tab-1"]);
+    });
+
+    it("refuses to close a page a binding names", async () => {
+      server = await fakeCdp();
+      const { pages } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+
+      // The window this closes: a binding written between the sweep's list
+      // and its close. Closing here would take a live thread's page away and
+      // leave a binding pointing at nothing.
+      await expect(pages.closeUnboundPage("tab-1")).rejects.toThrow(/thr_a/);
+      expect(server.targets).toHaveLength(1);
+    });
+
+    // Reaping must be able to fail visibly: a close that quietly resolves
+    // while the tab is still open is how a tab ends up surviving forever with
+    // nothing referencing it.
+    it("surfaces a failed close instead of swallowing it", async () => {
+      server = await fakeCdp();
+      const { pages } = pagesFor(server.url);
+      server.targets.push({ targetId: "restored", type: "page", url: "https://leftover.example/" });
+      await pages.pageUrlFor("thr_a", "main");
+      server.failOn("Target.closeTarget", "boom");
+
+      await expect(pages.closeUnboundPage("restored")).rejects.toThrow(/boom/);
+      expect(server.targets).toHaveLength(2);
+    });
+
+    it("closing an unbound page never launches a browser either", async () => {
+      server = await fakeCdp();
+      const { pages, browserCdpUrl } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      await server.close();
+
+      await expect(pages.closeUnboundPage("restored")).resolves.toBeUndefined();
+      expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+    });
   });
 
   // The bug this whole block regression-tests: a viewer must never be able

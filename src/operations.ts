@@ -24,10 +24,29 @@ import { join } from "node:path";
 import type { Engine } from "./engine.js";
 import type { Pages } from "./pages.js";
 
+/**
+ * What the reaper is told about a session's page being used.
+ *
+ * It sits here, on the one funnel every command passes through, rather than
+ * on the panel or the tool layer: an agent grinding through a long task via
+ * the tools is exactly the caller whose page must not be closed under it, and
+ * the panel is only one of four ways in (tools, CLI, panel RPC, screencast).
+ */
+export interface Activity {
+  /** This session just used its page: restart its idle clock. */
+  touch(sessionKey: string): void;
+  /** Hold the page: it is in use until the matching `unwatch`. */
+  watch(sessionKey: string): void;
+  unwatch(sessionKey: string): void;
+  /** There is no page here any more; stop tracking it. */
+  forget(sessionKey: string): void;
+}
+
 export interface OperationsDeps {
   engine: Pick<Engine, "run" | "browserCdpUrl" | "shutdown" | "shutdownAll">;
   pages: Pages;
   profileFor(sessionKey: string): Promise<string>;
+  activity: Activity;
 }
 
 /** The only schemes a page may be opened with. */
@@ -155,6 +174,23 @@ export function createOperations(deps: OperationsDeps): Operations {
   }
 
   async function command(sessionKey: string, argv: string[], maxOutput?: number): Promise<string> {
+    // A hold for the duration, not just a timestamp afterwards: a command
+    // slower than the idle timeout — a long navigation, a rebind and retry,
+    // a fleet's queued work — would otherwise have its page closed half way
+    // through by a sweep that saw only when it last FINISHED something.
+    deps.activity.watch(sessionKey);
+    try {
+      return await run(sessionKey, argv, maxOutput);
+    } finally {
+      // Touch before releasing, so the idle clock starts at the end of the
+      // work rather than at its beginning, and so the page is never briefly
+      // both unheld and stale.
+      deps.activity.touch(sessionKey);
+      deps.activity.unwatch(sessionKey);
+    }
+  }
+
+  async function run(sessionKey: string, argv: string[], maxOutput?: number): Promise<string> {
     const profile = await deps.profileFor(sessionKey);
     let result = await attempt(
       sessionKey,
@@ -231,6 +267,9 @@ export function createOperations(deps: OperationsDeps): Operations {
     },
 
     async close(sessionKey) {
+      // Forgotten first: a session still tracked after its page is gone has
+      // the sweep try to close it again, once a minute, forever.
+      deps.activity.forget(sessionKey);
       // Closes the page, not the browser: every other thread shares that
       // browser and its cookie jar.
       await deps.pages.closePage(sessionKey);

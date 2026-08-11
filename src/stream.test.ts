@@ -5,6 +5,7 @@ import type { Screencast } from "./screencast.js";
 import { mjpegResponse, registerStreamRoute, STREAM_PATH } from "./stream.js";
 import { fakeBrowser } from "./test-support/fake-browser.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
+import { memoryKv } from "./test-support/memory-kv.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
 const BOUNDARY_MARKER = "--bbbrowserframe";
@@ -198,6 +199,26 @@ function fakeContext(query: Record<string, string | undefined>): Parameters<Plug
 let server: FakeCdp;
 afterEach(async () => { await server?.close(); });
 
+/** The reaper's viewer refcount, as a ledger of who is watching what. */
+function countingViewers() {
+  const held = new Map<string, number>();
+  const calls: string[] = [];
+  return {
+    held,
+    calls,
+    viewers: {
+      watch: (sessionKey: string) => {
+        calls.push(`watch ${sessionKey}`);
+        held.set(sessionKey, (held.get(sessionKey) ?? 0) + 1);
+      },
+      unwatch: (sessionKey: string) => {
+        calls.push(`unwatch ${sessionKey}`);
+        held.set(sessionKey, (held.get(sessionKey) ?? 0) - 1);
+      },
+    },
+  };
+}
+
 function fakeScreencast(subscribe: Screencast["subscribe"] = vi.fn(async () => () => {})): Screencast {
   return {
     subscribe,
@@ -210,13 +231,13 @@ function fakeScreencast(subscribe: Screencast["subscribe"] = vi.fn(async () => (
 describe("registerStreamRoute", () => {
   it("registers a static GET path with token auth", () => {
     const { bb, routes } = fakeBbHttp();
-    registerStreamRoute(
-      bb,
-      fakeScreencast(),
-      { existingPageUrl: async () => null },
-      async () => "scratch",
-      async () => "main",
-    );
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(),
+      pages: { existingPageUrl: async () => null },
+      resolveSessionKey: async () => "scratch",
+      profileFor: async () => "main",
+      viewers: countingViewers().viewers,
+    });
     expect(routes).toHaveLength(1);
     expect(routes[0].method).toBe("GET");
     expect(routes[0].path).toBe(STREAM_PATH);
@@ -233,7 +254,13 @@ describe("registerStreamRoute", () => {
     const resolveSessionKey = vi.fn(async () => "key");
     const existingPageUrl = vi.fn(async () => "ws://x");
     const subscribe = vi.fn(async () => () => {});
-    registerStreamRoute(bb, fakeScreencast(subscribe), { existingPageUrl }, resolveSessionKey, async () => "main");
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(subscribe),
+      pages: { existingPageUrl },
+      resolveSessionKey,
+      profileFor: async () => "main",
+      viewers: countingViewers().viewers,
+    });
 
     const response = await routes[0].handler(fakeContext({}));
     expect(response.status).toBe(400);
@@ -247,7 +274,13 @@ describe("registerStreamRoute", () => {
     const resolveSessionKey = vi.fn(async (threadId: string | undefined) => `key-for-${threadId}`);
     const existingPageUrl = vi.fn(async () => null);
     const subscribe = vi.fn(async () => () => {});
-    registerStreamRoute(bb, fakeScreencast(subscribe), { existingPageUrl }, resolveSessionKey, async () => "main");
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(subscribe),
+      pages: { existingPageUrl },
+      resolveSessionKey,
+      profileFor: async () => "main",
+      viewers: countingViewers().viewers,
+    });
 
     const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
     expect(response.status).toBe(404);
@@ -272,7 +305,13 @@ describe("registerStreamRoute", () => {
       push = onFrame;
       return () => {};
     });
-    registerStreamRoute(bb, fakeScreencast(subscribe), { existingPageUrl }, resolveSessionKey, async () => "main");
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(subscribe),
+      pages: { existingPageUrl },
+      resolveSessionKey,
+      profileFor: async () => "main",
+      viewers: countingViewers().viewers,
+    });
 
     const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
     expect(response.status).toBe(200);
@@ -284,6 +323,56 @@ describe("registerStreamRoute", () => {
     const chunk = await reader.read();
     expect(Buffer.from(chunk.value!).toString("binary")).toContain("Content-Type: image/jpeg");
     await reader.cancel();
+  });
+
+  // Someone with the panel open is USING the page, even though no command
+  // has run for an hour. Without this the idle reaper closes it under them
+  // and the panel goes blank for no reason they can see.
+  it("holds the page against the reaper for as long as a viewer is connected", async () => {
+    const { bb, routes } = fakeBbHttp();
+    const viewers = countingViewers();
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(),
+      pages: { existingPageUrl: async () => "ws://x" },
+      resolveSessionKey: async (threadId) => `key-for-${threadId}`,
+      profileFor: async () => "main",
+      viewers: viewers.viewers,
+    });
+
+    const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
+    const reader = response.body!.getReader();
+    expect(viewers.held.get("key-for-thr_a")).toBe(1);
+
+    await reader.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Balanced, not merely released: an unwatch too many would let the next
+    // viewer's page be reaped while they are still looking at it.
+    expect(viewers.calls).toEqual(["watch key-for-thr_a", "unwatch key-for-thr_a"]);
+    expect(viewers.held.get("key-for-thr_a")).toBe(0);
+  });
+
+  it("never counts a viewer for a request that never streamed", async () => {
+    const { bb, routes } = fakeBbHttp();
+    const viewers = countingViewers();
+    registerStreamRoute(bb, {
+      // A page that vanished between the route's existence check and the
+      // subscribe — a phantom viewer here would hold the reaper off a
+      // session nobody is actually watching, for the life of the plugin.
+      screencast: fakeScreencast(async () => {
+        throw new Error("page went away");
+      }),
+      pages: { existingPageUrl: async () => "ws://x" },
+      resolveSessionKey: async () => "key-for-thr_a",
+      profileFor: async () => "main",
+      viewers: viewers.viewers,
+    });
+
+    const missingThread = await routes[0].handler(fakeContext({}));
+    expect(missingThread.status).toBe(400);
+
+    const failed = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
+    expect(failed.status).toBe(502);
+    expect(viewers.calls).toEqual([]);
   });
 });
 
@@ -300,14 +389,7 @@ describe("registerStreamRoute with the real Pages", () => {
       // page has to be created by the session that will drive it — only
       // `tab new --label` assigns the label the command path selects by.
       engine: { browserCdpUrl, run: fakeBrowser(server).run },
-      kv: (() => {
-        const store = new Map<string, unknown>();
-        return {
-          get: async <T,>(k: string) => store.get(k) as T | undefined,
-          set: async (k: string, v: unknown) => { store.set(k, v); },
-          delete: async (k: string) => { store.delete(k); },
-        };
-      })(),
+      kv: memoryKv(),
       log: () => {},
     });
 
@@ -321,13 +403,13 @@ describe("registerStreamRoute with the real Pages", () => {
     await server.close();
 
     const { bb, routes } = fakeBbHttp();
-    registerStreamRoute(
-      bb,
-      fakeScreencast(),
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(),
       pages,
-      async (threadId) => `key-for-${threadId}`,
-      async () => "main",
-    );
+      resolveSessionKey: async (threadId) => `key-for-${threadId}`,
+      profileFor: async () => "main",
+      viewers: countingViewers().viewers,
+    });
 
     const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
     expect(response.status).toBe(404);

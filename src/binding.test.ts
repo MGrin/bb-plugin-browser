@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createOperations } from "./operations.js";
 import { createPages, type Pages } from "./pages.js";
+import { createReaper } from "./reaper.js";
 import {
   fakeBrowser,
   landOnNewest,
@@ -16,25 +17,12 @@ import {
   type Landing,
 } from "./test-support/fake-browser.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
+import { memoryKv } from "./test-support/memory-kv.js";
 
 let server: FakeCdp;
 afterEach(async () => {
   await server?.close();
 });
-
-function memoryKv() {
-  const store = new Map<string, unknown>();
-  return {
-    store,
-    get: async <T,>(key: string) => store.get(key) as T | undefined,
-    set: async (key: string, value: unknown) => {
-      store.set(key, value);
-    },
-    delete: async (key: string) => {
-      store.delete(key);
-    },
-  };
-}
 
 async function stack(land: Landing = landOnNewest) {
   server = await fakeCdp();
@@ -53,8 +41,27 @@ async function stack(land: Landing = landOnNewest) {
   };
   const kv = memoryKv();
   const pages: Pages = createPages({ engine, kv, log: () => {} });
-  const operations = createOperations({ engine, pages, profileFor: async () => "main" });
-  return { browser, kv, pages, operations };
+  // The real reaper over the real Pages, not a stand-in: whether a sweep
+  // actually removes a tab from the browser is the only question worth
+  // asking about it, and a stubbed closePage cannot answer it.
+  const idle = { ms: 1000 };
+  const reaper = createReaper({
+    idleMs: async () => idle.ms,
+    graceMs: 500,
+    closePage: (sessionKey) => pages.closePage(sessionKey),
+    listOpenPages: () => pages.listOpenPages(),
+    closeUnboundPage: (targetId) => pages.closeUnboundPage(targetId),
+    log: () => {},
+    warn: (message) => warnings.push(message),
+  });
+  const warnings: string[] = [];
+  const operations = createOperations({
+    engine,
+    pages,
+    profileFor: async () => "main",
+    activity: reaper,
+  });
+  return { browser, kv, pages, operations, reaper, idle, warnings };
 }
 
 const boundTarget = (kv: { store: Map<string, unknown> }, sessionKey: string) =>
@@ -214,5 +221,82 @@ describe("the fake agrees with the measured binary", () => {
     server.targets = [];
     expect(browser.labelsOf("s")).toEqual([]);
     expect((await run(["tab", "new", "--label", "bbpage", "about:blank#bb-3"])).code).toBe(0);
+  });
+});
+
+// The reaper over the real Pages and the real fake browser — the level at
+// which "a page was reaped" means a tab actually left the browser, rather
+// than a stub having been called.
+describe("the reaper, end to end", () => {
+  it("closes an idle thread's tab and its binding, and the thread just gets a new page", async () => {
+    const { operations, pages, reaper, kv } = await stack();
+    await operations.open("thr_a", "https://a.example/");
+    const first = boundTarget(kv, "thr_a");
+    expect(urlOf(first)).toBe("https://a.example/");
+
+    // Far enough past the timeout that the touch `open` just recorded is
+    // stale, and past the grace period the decoy is now serving.
+    await reaper.sweep(Date.now() + 10_000);
+
+    expect(server.targets.some((target) => target.targetId === first)).toBe(false);
+    expect(kv.store.has("page:thr_a")).toBe(false);
+
+    // ...and the thread is not wedged: it binds again, on a page of its own.
+    await operations.open("thr_a", "https://a2.example/");
+    expect(urlOf(boundTarget(kv, "thr_a"))).toBe("https://a2.example/");
+  });
+
+  it("never reaps a page while it is being watched, however idle it looks", async () => {
+    const { operations, reaper, kv } = await stack();
+    await operations.open("thr_a", "https://a.example/");
+    const target = boundTarget(kv, "thr_a");
+
+    reaper.watch("thr_a");
+    await reaper.sweep(Date.now() + 10_000);
+    expect(urlOf(target)).toBe("https://a.example/");
+
+    reaper.unwatch("thr_a");
+    await reaper.sweep(Date.now() + 20_000);
+    expect(server.targets.some((candidate) => candidate.targetId === target)).toBe(false);
+  });
+
+  // The live defect this task exists for: a relaunched profile restores its
+  // tabs, every one of them with a fresh target id no binding names. The
+  // decoy stands in for exactly that.
+  it("closes tabs nobody owns while leaving every bound page alone", async () => {
+    const { operations, reaper, kv } = await stack();
+    await operations.open("thr_a", "https://a.example/");
+    await operations.open("thr_b", "https://b.example/");
+    // Two more restored tabs, so this cannot pass by closing "the oldest" or
+    // "the newest" alone.
+    server.targets.push({ targetId: "restored-1", type: "page", url: "https://old1.example/" });
+    server.targets.push({ targetId: "restored-2", type: "page", url: "https://old2.example/" });
+
+    const now = Date.now();
+    // Held by a viewer, so the idle pass cannot be what removes them and the
+    // unbound pass is the only thing under test.
+    reaper.watch("thr_a");
+    reaper.watch("thr_b");
+    await reaper.sweep(now);
+    expect(server.targets).toHaveLength(5);
+
+    await reaper.sweep(now + 600);
+    expect(server.targets.map((target) => target.targetId).sort()).toEqual(
+      [boundTarget(kv, "thr_a"), boundTarget(kv, "thr_b")].sort(),
+    );
+  });
+
+  it("leaves a page alone that gains a binding during its grace period", async () => {
+    const { operations, reaper, kv } = await stack();
+    const now = Date.now();
+    // First sight of the decoy AND of the page thr_a is about to be given —
+    // except thr_a has not opened it yet, which is the point: this is the
+    // window between `tab new` and the binding being written.
+    await reaper.sweep(now);
+    await operations.open("thr_a", "https://a.example/");
+    reaper.watch("thr_a");
+
+    await reaper.sweep(now + 600);
+    expect(urlOf(boundTarget(kv, "thr_a"))).toBe("https://a.example/");
   });
 });

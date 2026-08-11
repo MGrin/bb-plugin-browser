@@ -38,6 +38,8 @@ export interface PagesDeps {
     get<T>(key: string): Promise<T | undefined>;
     set(key: string, value: unknown): Promise<void>;
     delete(key: string): Promise<void>;
+    /** Every stored key, for the reaper's "who owns which tab" question. */
+    list(prefix?: string): Promise<string[]>;
   };
   log: (message: string) => void;
 }
@@ -61,6 +63,15 @@ interface Binding {
    * cannot be pointed at — such a page is closed and replaced on first use.
    */
   tab?: string;
+}
+
+/** One open page in the shared browser, and who (if anyone) owns it. */
+export interface OpenPage {
+  targetId: string;
+  /** The document url, with the internal creation marker hidden. */
+  url: string;
+  /** The session key whose binding names this target, or null for nobody's. */
+  sessionKey: string | null;
 }
 
 /** What a session needs to put itself on this thread's page. */
@@ -101,11 +112,46 @@ export interface Pages {
    * already fetches, so it costs nothing extra and creates nothing either.
    */
   existingPageInfo(sessionKey: string): Promise<{ cdpUrl: string; url: string } | null>;
+  /**
+   * Every open page in the shared browser, each carrying the session key
+   * bound to it. What the reaper sweeps: a page with no session key is one
+   * nobody owns — a tab Chromium restored on relaunch, or one left behind by
+   * a create that died before its binding was written.
+   *
+   * Read-only and never launch-capable: an empty list means "no browser is
+   * reachable", never "start one and look again". The sweep runs every
+   * minute forever, so a launch here would hold a Chromium open on an idle
+   * machine for good.
+   */
+  listOpenPages(): Promise<OpenPage[]>;
+  /**
+   * Close one page by target id, for pages no binding names. Refuses if a
+   * binding turns out to name it after all — that is the window between a
+   * sweep's listing and its close, and closing there would take a live
+   * thread's page away. Rejects when the close itself fails, so a tab that
+   * survived is visible rather than assumed gone.
+   */
+  closeUnboundPage(targetId: string): Promise<void>;
   closePage(sessionKey: string): Promise<void>;
   forget(sessionKey: string): Promise<void>;
 }
 
 const key = (sessionKey: string) => `page:${sessionKey}`;
+/**
+ * Where a profile's browser was last reachable, remembered independently of
+ * any one binding. Without it, a browser holding nothing but leftover tabs —
+ * every binding gone with the restart that left them — could not be found at
+ * all, and the debris would be unreachable forever.
+ */
+const originKey = (profile: string) => `origin:${profile}`;
+
+/**
+ * bb's `kv.list` returns full keys; this tolerates either form so a host that
+ * ever returned them stripped could not silently turn every binding lookup
+ * into a miss (which would read as "nobody owns any tab" — and reap them all).
+ */
+const withoutPrefix = (prefix: string, storedKey: string) =>
+  storedKey.startsWith(prefix) ? storedKey.slice(prefix.length) : storedKey;
 
 /**
  * The label every thread's page is created under. One constant, not a
@@ -173,6 +219,11 @@ export function createPages(deps: PagesDeps): Pages {
       tab: TAB_LABEL,
     };
     await deps.kv.set(key(sessionKey), binding);
+    // Remembered per profile as well as per binding: the reaper has to be
+    // able to find this browser after every binding for it is gone, which is
+    // exactly the state a restart leaves behind together with the tabs it
+    // restored.
+    await deps.kv.set(originKey(profile), binding.origin);
     deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
     return { cdpUrl: pageUrl(browserWsUrl, created.targetId), browserWsUrl, tab: TAB_LABEL };
   }
@@ -266,10 +317,76 @@ export function createPages(deps: PagesDeps): Pages {
     return { cdpUrl: pageUrl(browserUrl, bound.targetId), url };
   }
 
+  /** Every binding on disk, with the session key that owns it. */
+  async function allBindings(): Promise<{ sessionKey: string; binding: Binding }[]> {
+    const stored = await deps.kv.list("page:");
+    const bindings: { sessionKey: string; binding: Binding }[] = [];
+    for (const storedKey of stored) {
+      const sessionKey = withoutPrefix("page:", storedKey);
+      const binding = await deps.kv.get<Binding>(key(sessionKey));
+      // A row under some other prefix (a host whose `list` ignores it) reads
+      // back as undefined here and is simply not a binding.
+      if (binding?.targetId) bindings.push({ sessionKey, binding });
+    }
+    return bindings;
+  }
+
+  /**
+   * A live browser's CDP websocket, found by probing origins we have already
+   * seen — never by `engine.browserCdpUrl`, which is launch mode. `null`
+   * means "no browser is reachable", which is a complete answer.
+   */
+  async function reachableBrowser(
+    bindings: { binding: Binding }[],
+  ): Promise<string | null> {
+    const origins: string[] = [];
+    for (const storedKey of await deps.kv.list("origin:")) {
+      const profile = withoutPrefix("origin:", storedKey);
+      const origin = await deps.kv.get<string>(originKey(profile));
+      if (typeof origin === "string") origins.push(origin);
+    }
+    for (const { binding } of bindings) if (binding.origin) origins.push(binding.origin);
+
+    for (const origin of new Set(origins)) {
+      const browserUrl = await probeBrowserUrl(origin);
+      if (browserUrl) return browserUrl;
+    }
+    return null;
+  }
+
   return {
     bindingFor,
     rebind,
     existingPageInfo,
+
+    async listOpenPages() {
+      const bindings = await allBindings();
+      const browserUrl = await reachableBrowser(bindings);
+      if (!browserUrl) return [];
+      const owner = new Map(bindings.map(({ sessionKey, binding }) => [binding.targetId, sessionKey]));
+      return (await listPageTargets(browserUrl)).map((target) => ({
+        targetId: target.targetId,
+        // Same hidden marker as existingPageInfo: what gets logged when a
+        // page is reaped should be where the page is, not how it was found.
+        url: isMarker(target.url) ? "about:blank" : target.url,
+        sessionKey: owner.get(target.targetId) ?? null,
+      }));
+    },
+
+    async closeUnboundPage(targetId) {
+      const bindings = await allBindings();
+      // Re-read rather than trusting the caller's snapshot: a binding written
+      // since it was taken is a live thread's page, and closing it would take
+      // that page away and leave the binding pointing at nothing.
+      const owner = bindings.find(({ binding }) => binding.targetId === targetId);
+      if (owner) {
+        throw new Error(`refusing to close ${targetId}: ${owner.sessionKey} is bound to it`);
+      }
+      const browserUrl = await reachableBrowser(bindings);
+      // No browser, no page: there is nothing to close and nothing to report.
+      if (!browserUrl) return;
+      await closeTarget(browserUrl, targetId);
+    },
 
     async pageUrlFor(sessionKey, profile) {
       return (await bindingFor(sessionKey, profile)).cdpUrl;
