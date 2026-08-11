@@ -1,22 +1,18 @@
-// One page per session key, remembered across restarts and verified on use.
+// Putting a thread on a page of its own: the half that is allowed to create.
 //
-// Remembering matters because a thread that comes back after a bb restart
-// should still be on its page. Verifying matters because a page can vanish
-// without telling us — the panel's close button, a crash, the idle reaper —
-// and a stale id must produce a fresh page rather than an error.
+// Everything here can start a browser and open a tab, which is why it is a
+// module of its own and why it holds the only reference to `engine` outside
+// operations.ts. Its read-only counterpart is page-registry.ts, which cannot
+// — that split is what enforces "watching never creates a page, and never
+// launches a browser" by the import graph instead of by a comment. The
+// stream route, the panel's read path, the screencast and the reaper all
+// depend on the registry; only this module and operations.ts depend on the
+// engine.
 //
-// A binding carries two handles to the same tab, because the two halves of
-// this plugin address it differently and neither handle works for both:
-//
-//   targetId — what CDP needs. The screencast opens
-//              ws://host/devtools/page/<targetId> to stream the page.
-//   tab      — the agent-browser tab LABEL the page was created under, which
-//              is what a command session needs. agent-browser's `connect`
-//              ignores the /devtools/page/<id> path entirely (measured, 0.33.2),
-//              so the only way to point a session at a specific tab is to
-//              select it by ref, and a label is the one ref that fails loudly
-//              instead of silently resolving to somebody else's tab.
-import { randomUUID } from "node:crypto";
+// Remembering a page matters because a thread that comes back after a bb
+// restart should still be on its page. Verifying matters because a page can
+// vanish without telling us — the panel's close button, a crash, the idle
+// reaper — and a stale id must produce a fresh page rather than an error.
 import type { CdpOptions } from "./cdp.js";
 import type { Engine } from "./engine.js";
 import {
@@ -25,8 +21,18 @@ import {
   httpOriginOf,
   listPageTargets,
   pageUrl,
-  probeBrowserUrl,
 } from "./browser-endpoint.js";
+import {
+  bindingKey,
+  markerUrl,
+  originKey,
+  withoutPrefix,
+  type Binding,
+  type BrowserPointer,
+  type PageRegistry,
+} from "./page-registry.js";
+
+export type { OpenPage } from "./page-registry.js";
 
 export interface PagesDeps {
   /**
@@ -40,49 +46,18 @@ export interface PagesDeps {
     get<T>(key: string): Promise<T | undefined>;
     set(key: string, value: unknown): Promise<void>;
     delete(key: string): Promise<void>;
-    /** Every stored key, for the reaper's "who owns which tab" question. */
     list(prefix?: string): Promise<string[]>;
   };
+  /**
+   * The read-only half. Passed in rather than constructed here so that the
+   * one instance the whole plugin shares is the one the stream route, the
+   * panel and the reaper hold — and so that nothing has to hand those a
+   * launch-capable object just to give them a lookup.
+   */
+  registry: PageRegistry;
   log: (message: string) => void;
-  /**
-   * CDP client tuning, in practice only ever the connect timeout, and in
-   * practice only ever set by a test: production takes the defaults. It is
-   * here because the composed consequence of a connect that hangs — an
-   * `inflight` entry that never settles, so every later call for that
-   * session joins a dead promise — cannot be tested at all without a way to
-   * make a connect give up in less than the production timeout.
-   */
+  /** See PageRegistryDeps.cdp — a test's way to shorten the connect timeout. */
   cdp?: CdpOptions;
-}
-
-interface Binding {
-  profile: string;
-  targetId: string;
-  /**
-   * The browser's DevTools HTTP origin (e.g. "http://127.0.0.1:9222") at
-   * the moment this page was created. Lets a read-only lookup confirm the
-   * browser is alive with a plain HTTP probe instead of going through
-   * `engine.browserCdpUrl`, which is launch mode and would start Chromium
-   * just to answer the question. Absent on bindings written before this
-   * field existed — those are treated as unreachable, never as licence to
-   * call `browserCdpUrl` to find out.
-   */
-  origin?: string;
-  /**
-   * The tab label this page was created under. Absent on bindings written
-   * before Task 9b, whose tab carries no label in any session and therefore
-   * cannot be pointed at — such a page is closed and replaced on first use.
-   */
-  tab?: string;
-}
-
-/** One open page in the shared browser, and who (if anyone) owns it. */
-export interface OpenPage {
-  targetId: string;
-  /** The document url, with the internal creation marker hidden. */
-  url: string;
-  /** The session key whose binding names this target, or null for nobody's. */
-  sessionKey: string | null;
 }
 
 /** What a session needs to put itself on this thread's page. */
@@ -95,7 +70,12 @@ export interface PageBinding {
   tab: string;
 }
 
-export interface Pages {
+/**
+ * Everything the registry can answer, plus the four things only a
+ * launch-capable module can do: create a page, replace one, and take a
+ * browser (or every browser) down.
+ */
+export interface Pages extends PageRegistry {
   /** The page-level CDP websocket for this session, creating it if needed. */
   pageUrlFor(sessionKey: string, profile: string): Promise<string>;
   /** Everything a command session needs to bind, creating the page if needed. */
@@ -109,81 +89,17 @@ export interface Pages {
    */
   rebind(sessionKey: string, profile: string): Promise<PageBinding>;
   /**
-   * The bound page's CDP websocket if a binding exists and its target is
-   * still open — `null` otherwise. Unlike `pageUrlFor`, a miss here is never
-   * a reason to create anything: this exists so a viewer (the stream route)
-   * can ask "is there a real page to watch?" without ever being the reason
-   * one gets spawned. Read-only: a stale binding is left exactly as found,
-   * for `pageUrlFor` to reconcile on the next real use.
-   */
-  existingPageUrl(sessionKey: string): Promise<string | null>;
-  /**
-   * The same read-only lookup, plus the document URL the page is on — what
-   * the panel's address bar shows. It comes from the target list the lookup
-   * already fetches, so it costs nothing extra and creates nothing either.
-   */
-  existingPageInfo(sessionKey: string): Promise<{ cdpUrl: string; url: string } | null>;
-  /**
-   * Every open page in the shared browser, each carrying the session key
-   * bound to it. What the reaper sweeps: a page with no session key is one
-   * nobody owns — a tab Chromium restored on relaunch, or one left behind by
-   * a create that died before its binding was written.
-   *
-   * Read-only and never launch-capable: an empty list means "no browser is
-   * reachable", never "start one and look again". The sweep runs every
-   * minute forever, so a launch here would hold a Chromium open on an idle
-   * machine for good.
-   */
-  listOpenPages(): Promise<OpenPage[]>;
-  /**
-   * Close one page by target id, for pages no binding names. Refuses if a
-   * binding turns out to name it after all — that is the window between a
-   * sweep's listing and its close, and closing there would take a live
-   * thread's page away. Rejects when the close itself fails, so a tab that
-   * survived is visible rather than assumed gone.
-   */
-  closeUnboundPage(targetId: string): Promise<void>;
-  /**
    * Close a profile's browser and forget where it was — the two halves of
    * one act, which is why they are not two calls a caller has to remember to
    * pair. A remembered address whose browser has gone points at a freed
    * ephemeral port, and the next process to take that port is somebody
-   * else's browser; the identity check in `reachableBrowser` refuses to
-   * adopt it, and this makes sure there is nothing stale to refuse.
+   * else's browser; the identity check in the registry refuses to adopt it,
+   * and this makes sure there is nothing stale to refuse.
    */
   shutdownBrowser(profile: string): Promise<void>;
   /** The same, for every browser this engine has running. */
   shutdownAllBrowsers(): Promise<void>;
-  closePage(sessionKey: string): Promise<void>;
-  forget(sessionKey: string): Promise<void>;
 }
-
-const key = (sessionKey: string) => `page:${sessionKey}`;
-/**
- * Where a profile's browser was last reachable, remembered independently of
- * any one binding. Without it, a browser holding nothing but leftover tabs —
- * every binding gone with the restart that left them — could not be found at
- * all, and the debris would be unreachable forever.
- */
-const originKey = (profile: string) => `origin:${profile}`;
-
-/**
- * Where a profile's browser was, and WHICH browser it was. The address alone
- * is not a handle on anything: ports are ephemeral and get reused by
- * unrelated processes, so the uuid is what makes going back to it safe.
- */
-interface BrowserPointer {
-  origin: string;
-  browserId: string;
-}
-
-/**
- * bb's `kv.list` returns full keys; this tolerates either form so a host that
- * ever returned them stripped could not silently turn every binding lookup
- * into a miss (which would read as "nobody owns any tab" — and reap them all).
- */
-const withoutPrefix = (prefix: string, storedKey: string) =>
-  storedKey.startsWith(prefix) ? storedKey.slice(prefix.length) : storedKey;
 
 /**
  * The label every thread's page is created under. One constant, not a
@@ -192,16 +108,6 @@ const withoutPrefix = (prefix: string, storedKey: string) =>
  * label to disambiguate.
  */
 export const TAB_LABEL = "bbpage";
-
-/**
- * A fresh tab is created at `about:blank#<marker>` purely so the target it
- * became can be picked out of the browser's target list by URL: `tab new`
- * reports no CDP target id. Chrome keeps the fragment verbatim (measured),
- * and nothing can collide with a random one — whereas diffing the target
- * list before and after breaks the moment a page opens a popup.
- */
-const markerUrl = () => `about:blank#bb-${randomUUID().slice(0, 8)}`;
-const isMarker = (url: string) => /^about:blank#bb-[0-9a-f]{8}$/.test(url);
 
 export function createPages(deps: PagesDeps): Pages {
   async function createPage(
@@ -251,7 +157,7 @@ export function createPages(deps: PagesDeps): Pages {
       origin,
       tab: TAB_LABEL,
     };
-    await deps.kv.set(key(sessionKey), binding);
+    await deps.kv.set(bindingKey(sessionKey), binding);
     // Remembered per profile as well as per binding: the reaper has to be
     // able to find this browser after every binding for it is gone, which is
     // exactly the state a restart leaves behind together with the tabs it
@@ -272,7 +178,7 @@ export function createPages(deps: PagesDeps): Pages {
     replace: boolean,
   ): Promise<PageBinding> {
     const browserWsUrl = await deps.engine.browserCdpUrl(profile);
-    const bound = await deps.kv.get<Binding>(key(sessionKey));
+    const bound = await deps.kv.get<Binding>(bindingKey(sessionKey));
     const open = await listPageTargets(browserWsUrl, deps.cdp);
     const stillOpen = bound && open.some((target) => target.targetId === bound.targetId);
 
@@ -298,8 +204,9 @@ export function createPages(deps: PagesDeps): Pages {
   // fleet case. Without coalescing, both see no binding, both create a page,
   // and only the last kv.set wins — orphaning a tab forever and handing the
   // first caller a page id closePage will never know about. One in-flight
-  // promise per key, dropped once settled so a failure doesn't poison later
-  // calls.
+  // promise per key, dropped once settled — including when it REJECTS, which
+  // is what keeps a failed or timed-out resolution from becoming this
+  // session's permanent answer.
   const inflight = new Map<string, Promise<PageBinding>>();
   // Rebinds coalesce too, in their own map. Their own, because a rebind must
   // never join an in-flight ordinary resolve — that one may hand back the
@@ -335,122 +242,17 @@ export function createPages(deps: PagesDeps): Pages {
     return rebinding.get(sessionKey) ?? start(rebinding, sessionKey, profile, true);
   }
 
-  async function existingPageInfo(
-    sessionKey: string,
-  ): Promise<{ cdpUrl: string; url: string } | null> {
-    const bound = await deps.kv.get<Binding>(key(sessionKey));
-    // No origin covers both "never bound" and "bound before this field
-    // existed" — either way, there is nothing to probe, so this must
-    // report "no page" rather than fall back to a launch-capable lookup.
-    if (!bound?.origin) return null;
-    const browserUrl = await probeBrowserUrl(bound.origin);
-    if (!browserUrl) return null;
-    const open = await listPageTargets(browserUrl, deps.cdp);
-    const target = open.find((candidate) => candidate.targetId === bound.targetId);
-    if (!target) return null;
-    // The marker fragment is an implementation detail of how this page was
-    // found; showing it in the panel's address bar would be a lie about
-    // where the page is.
-    const url = isMarker(target.url) ? "about:blank" : target.url;
-    return { cdpUrl: pageUrl(browserUrl, bound.targetId), url };
-  }
-
-  /** Every binding on disk, with the session key that owns it. */
-  async function allBindings(): Promise<{ sessionKey: string; binding: Binding }[]> {
-    const stored = await deps.kv.list("page:");
-    const bindings: { sessionKey: string; binding: Binding }[] = [];
-    for (const storedKey of stored) {
-      const sessionKey = withoutPrefix("page:", storedKey);
-      const binding = await deps.kv.get<Binding>(key(sessionKey));
-      // A row under some other prefix (a host whose `list` ignores it) reads
-      // back as undefined here and is simply not a binding.
-      if (binding?.targetId) bindings.push({ sessionKey, binding });
-    }
-    return bindings;
-  }
-
-  /**
-   * A live browser this plugin owns, found by probing the addresses it has
-   * recorded — never by `engine.browserCdpUrl`, which is launch mode. `null`
-   * means "no browser of ours is reachable", which is a complete answer.
-   *
-   * The identity check is not belt-and-braces, it is the whole point.
-   * Debugging ports are ephemeral and a closed browser frees one at once, so
-   * a recorded address is stale the moment its browser goes away — and the
-   * reaper acts on what it finds there by CLOSING every tab no binding of
-   * ours names. Against somebody else's Chromium (this machine runs its own
-   * agent-browser sessions on ports from the same pool) that would mean
-   * silently closing all of their tabs, once a minute, with nobody watching.
-   * So: match the browser's uuid or treat the address as dead.
-   *
-   * A pointer with no recorded identity — a row written before this check
-   * existed — is likewise treated as dead rather than trusted, and the next
-   * page creation replaces it.
-   */
-  async function reachableBrowser(): Promise<string | null> {
-    for (const storedKey of await deps.kv.list("origin:")) {
-      const profile = withoutPrefix("origin:", storedKey);
-      // Partial, deliberately: a row written before this check existed
-      // carries no identity (or is a bare origin string), and the comparison
-      // below is what has to reject it. No separate "has an id?" guard —
-      // `undefined` already matches no browser, and a second branch saying
-      // so would be one no test could ever fail against.
-      const pointer = await deps.kv.get<Partial<BrowserPointer>>(originKey(profile));
-      if (!pointer?.origin) continue;
-
-      const browserUrl = await probeBrowserUrl(pointer.origin);
-      if (!browserUrl) continue;
-      if (browserIdOf(browserUrl) !== pointer.browserId) {
-        deps.log(
-          `${pointer.origin} is answering, but it is not the browser we left there — ignoring it`,
-        );
-        continue;
-      }
-      return browserUrl;
-    }
-    return null;
-  }
-
   return {
+    // Every read-only answer comes from the one registry the rest of the
+    // plugin holds, so a lookup made through `pages` and the same lookup
+    // made through the registry can never diverge.
+    ...deps.registry,
+
     bindingFor,
     rebind,
-    existingPageInfo,
-
-    async listOpenPages() {
-      const bindings = await allBindings();
-      const browserUrl = await reachableBrowser();
-      if (!browserUrl) return [];
-      const owner = new Map(bindings.map(({ sessionKey, binding }) => [binding.targetId, sessionKey]));
-      return (await listPageTargets(browserUrl, deps.cdp)).map((target) => ({
-        targetId: target.targetId,
-        // Same hidden marker as existingPageInfo: what gets logged when a
-        // page is reaped should be where the page is, not how it was found.
-        url: isMarker(target.url) ? "about:blank" : target.url,
-        sessionKey: owner.get(target.targetId) ?? null,
-      }));
-    },
-
-    async closeUnboundPage(targetId) {
-      const bindings = await allBindings();
-      // Re-read rather than trusting the caller's snapshot: a binding written
-      // since it was taken is a live thread's page, and closing it would take
-      // that page away and leave the binding pointing at nothing.
-      const owner = bindings.find(({ binding }) => binding.targetId === targetId);
-      if (owner) {
-        throw new Error(`refusing to close ${targetId}: ${owner.sessionKey} is bound to it`);
-      }
-      const browserUrl = await reachableBrowser();
-      // No browser, no page: there is nothing to close and nothing to report.
-      if (!browserUrl) return;
-      await closeTarget(browserUrl, targetId, deps.cdp);
-    },
 
     async pageUrlFor(sessionKey, profile) {
       return (await bindingFor(sessionKey, profile)).cdpUrl;
-    },
-
-    async existingPageUrl(sessionKey) {
-      return (await existingPageInfo(sessionKey))?.cdpUrl ?? null;
     },
 
     async shutdownBrowser(profile) {
@@ -472,42 +274,6 @@ export function createPages(deps: PagesDeps): Pages {
           await deps.kv.delete(originKey(withoutPrefix("origin:", storedKey)));
         }
       }
-    },
-
-    async closePage(sessionKey) {
-      const bound = await deps.kv.get<Binding>(key(sessionKey));
-      if (!bound) return;
-
-      if (!bound.origin) {
-        // A pre-origin binding: there is no way to confirm a browser is
-        // even there without launching one, and a cold-start cleanup must
-        // not do that. Treat as already gone.
-        deps.log(`closePage: ${sessionKey} has no recorded origin, clearing binding without probing`);
-        await deps.kv.delete(key(sessionKey));
-        return;
-      }
-
-      const browserUrl = await probeBrowserUrl(bound.origin);
-      if (!browserUrl) {
-        // Unreachable: the page this binding names cannot exist either, so
-        // there is nothing to close through CDP — just drop the binding
-        // rather than launching a browser to close a page in it.
-        deps.log(`closePage: browser for ${sessionKey} not reachable at ${bound.origin}, clearing binding`);
-        await deps.kv.delete(key(sessionKey));
-        return;
-      }
-
-      // Real Chrome errors closing a targetId it no longer has (the panel's
-      // close button, a crash, the reaper). The page is gone either way, so
-      // that is confirmation, not a reason to strand the binding.
-      await closeTarget(browserUrl, bound.targetId, deps.cdp).catch((error: Error) => {
-        deps.log(`closePage: ${bound.targetId} already gone (${error.message})`);
-      });
-      await deps.kv.delete(key(sessionKey));
-    },
-
-    async forget(sessionKey) {
-      await deps.kv.delete(key(sessionKey));
     },
   };
 }

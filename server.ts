@@ -7,6 +7,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { createEngine } from "./src/engine.js";
 import { defaultProfile } from "./src/identity.js";
 import { createOperations } from "./src/operations.js";
+import { createPageRegistry } from "./src/page-registry.js";
 import { createPages } from "./src/pages.js";
 import { registerPanelRpc } from "./src/panel-rpc.js";
 import {
@@ -56,9 +57,20 @@ export default async function plugin(bb: BbPluginApi) {
     log: (message) => bb.log.info(message),
   });
 
+  // The read-only half, built first and shared. Everything that must never
+  // create a page or start a browser — the stream route, the panel's read
+  // path, the reaper, the thread teardown — takes THIS, and it has no
+  // access to `engine` to do either with. `pages` adds the create/bind
+  // half on top for the callers that are allowed to.
+  const registry = createPageRegistry({
+    kv: bb.storage.kv,
+    log: (message) => bb.log.info(message),
+  });
+
   const pages = createPages({
     engine,
     kv: bb.storage.kv,
+    registry,
     log: (message) => bb.log.info(message),
   });
 
@@ -81,9 +93,9 @@ export default async function plugin(bb: BbPluginApi) {
     // landing inside that window must not close a page a thread is about to
     // be handed.
     graceMs: SWEEP_INTERVAL_MS,
-    closePage: (sessionKey) => pages.closePage(sessionKey),
-    listOpenPages: () => pages.listOpenPages(),
-    closeUnboundPage: (targetId) => pages.closeUnboundPage(targetId),
+    closePage: (sessionKey) => registry.closePage(sessionKey),
+    listOpenPages: () => registry.listOpenPages(),
+    closeUnboundPage: (targetId) => registry.closeUnboundPage(targetId),
     log: (message) => bb.log.info(message),
     // A failed close means a tab is still open that nothing may reference
     // again — that belongs at warn, not info.
@@ -101,27 +113,23 @@ export default async function plugin(bb: BbPluginApi) {
     activity: reaper,
   });
 
-  const screencast = createScreencast({ pages, quality: 60, maxWidth: 1280 });
-  // Same single profile as operations above — one cookie jar, one browser,
-  // for now.
+  const screencast = createScreencast({ quality: 60, maxWidth: 1280 });
   registerStreamRoute(bb, {
     screencast,
-    pages,
+    pages: registry,
     resolveSessionKey,
-    profileFor: async () => defaultProfile,
     // A viewer is a user of the page: watching it must keep it alive.
     viewers: reaper,
   });
 
-  // The panel tab's data plane. Same single profile again, and the same rule
-  // as the stream route: it takes a thread id and resolves the session key
-  // itself.
+  // The panel tab's data plane, on the same read-only registry as the stream
+  // route and under the same rule: it takes a thread id and derives the
+  // session key itself.
   registerPanelRpc(bb, {
     resolveSessionKey,
     operations,
-    pages,
+    pages: registry,
     screencast,
-    profileFor: async () => defaultProfile,
   });
 
   registerTools(bb, operations, resolveSessionKey);
@@ -136,7 +144,7 @@ export default async function plugin(bb: BbPluginApi) {
   // then deleted.
   const teardown = createThreadTeardown({
     resolveSessionKey,
-    closePage: (sessionKey) => pages.closePage(sessionKey),
+    closePage: (sessionKey) => registry.closePage(sessionKey),
     forget: (sessionKey) => reaper.forget(sessionKey),
     warn: (message) => bb.log.warn(message),
   });

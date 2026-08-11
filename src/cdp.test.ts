@@ -80,12 +80,18 @@ describe("openCdp", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   }, 5_000);
 
-  it("rejects a connect to a port nothing is listening on, rather than waiting out the timeout", async () => {
-    server = await fakeCdp();
-    const dead = server.url.replace(/:(\d+)\//, (_match, port) => `:${Number(port) + 1}/`);
-    await server.close();
-    await expect(openCdp(dead, { connectTimeoutMs: 5_000 })).rejects.toThrow(/cdp connect/);
-  }, 5_000);
+  it("rejects a refused connection promptly, rather than waiting out the timeout", async () => {
+    // Port 1 on loopback, which nothing on a Mac may bind without root and
+    // nothing does: a refusal, deterministically. (An earlier version of
+    // this test guessed "the fake's port plus one", which on a busy machine
+    // is sometimes a real listener — it connected, and the test failed for
+    // a reason that had nothing to do with the code.)
+    const started = Date.now();
+    await expect(
+      openCdp("ws://127.0.0.1:1/devtools/browser/nothing", { connectTimeoutMs: 5_000 }),
+    ).rejects.toThrow(/cdp connect/);
+    expect(Date.now() - started).toBeLessThan(4_000);
+  }, 8_000);
 
   it("ignores a literal null frame instead of throwing out of the message handler", async () => {
     // `JSON.parse("null")` succeeds, and reading `.id` off the result

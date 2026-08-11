@@ -1,15 +1,22 @@
 // The Browser tab's data plane: what to draw, and the two ways to act on it.
 //
 // Three methods, one rule between them: the panel names a THREAD, never a
-// session key. Every handler resolves the key server-side through the same
-// resolver the tools and the CLI use, and the input schemas are strict, so a
-// caller cannot smuggle one in as an extra field (docs/design.md: "Session
-// keys are derived server-side from the calling thread, never accepted as a
-// parameter").
+// session key. Every handler derives the key through the same resolver the
+// tools and the CLI use, and the input schemas are `.strict()`, so a caller
+// cannot smuggle one in as an extra field either.
+//
+// What that rule buys, precisely: a session key can only ever be one this
+// server derived from a thread id, so no request can address a key of its
+// own choosing. What it does NOT buy is isolation between threads. These
+// handlers run under bb's local RPC auth, which carries no caller identity,
+// so anything with local RPC access can pass any thread id and drive that
+// thread's page. That is defence in depth — every thread already has a
+// shell, and a shell reaches the same profile directly — and the honest
+// claim is "no key smuggling", not "one thread cannot reach another's".
 import type { BbPluginApi, PluginRpcContract, PluginRpcHandlers } from "@bb/plugin-sdk";
 import { z } from "zod";
 import type { Operations } from "./operations.js";
-import type { Pages } from "./pages.js";
+import type { PageRegistry } from "./page-registry.js";
 import type { InputEvent, Screencast } from "./screencast.js";
 import type { SessionKeyResolver } from "./session-key.js";
 import { STREAM_PATH } from "./stream.js";
@@ -89,9 +96,15 @@ export interface PanelRpcDeps {
   token(): Promise<string>;
   resolveSessionKey: SessionKeyResolver;
   operations: Pick<Operations, "open">;
-  pages: Pick<Pages, "existingPageInfo">;
+  /**
+   * The read-only registry, not `Pages`: opening the panel must not be able
+   * to create a page or start a browser, and page-registry.ts cannot reach
+   * `engine` at all. `navigate` goes through `operations` instead, which is
+   * the one panel action that is allowed to create — the user asked, by
+   * typing an address and pressing Go.
+   */
+  pages: Pick<PageRegistry, "existingPageInfo">;
   screencast: Pick<Screencast, "dispatchInput" | "viewportOf">;
-  profileFor(sessionKey: string): Promise<string>;
 }
 
 /**
@@ -136,14 +149,13 @@ export function createPanelRpcHandlers(
 
     async input({ threadId, event }) {
       const sessionKey = await deps.resolveSessionKey(threadId);
-      // A live cast is the precondition, and it is free to check: without it
-      // `dispatchInput` falls back to `pageUrlFor`, which would mint a blank
-      // page for a click aimed at one that has already closed. It also keeps
+      // A live cast is the precondition, and it is free to check: it keeps
       // a keystroke from costing an HTTP probe plus a CDP round trip the way
-      // an `existingPageInfo` check would.
+      // an `existingPageInfo` check would, and it turns "the page closed
+      // while you were looking at it" into a quiet `ok: false` rather than
+      // the rejection `dispatchInput` would otherwise raise.
       if (!deps.screencast.viewportOf(sessionKey)) return { ok: false };
-      const profile = await deps.profileFor(sessionKey);
-      await deps.screencast.dispatchInput(sessionKey, profile, event);
+      await deps.screencast.dispatchInput(sessionKey, event);
       return { ok: true };
     },
   };

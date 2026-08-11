@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createPageRegistry } from "./page-registry.js";
 import { createPages, TAB_LABEL } from "./pages.js";
 import { createReaper, runSweeps } from "./reaper.js";
 import { fakeBrowser } from "./test-support/fake-browser.js";
@@ -42,8 +43,11 @@ function pagesFor(
     },
   };
   const kv = memoryKv();
-  const pages = createPages({ engine, kv, log: () => {}, cdp: options.cdp });
-  return { pages, browserCdpUrl, kv, browser, shutdown, shutdownAll };
+  // The real registry over the same kv — the read-only half is not a thing
+  // to stub here, it is half the behaviour under test.
+  const registry = createPageRegistry({ kv, log: () => {}, cdp: options.cdp });
+  const pages = createPages({ engine, kv, registry, log: () => {}, cdp: options.cdp });
+  return { pages, registry, browserCdpUrl, kv, browser, shutdown, shutdownAll };
 }
 
 /** Every `tab new` the sessions ran, decoded out of the batch payloads. */

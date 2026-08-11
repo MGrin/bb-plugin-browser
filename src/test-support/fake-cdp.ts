@@ -34,6 +34,13 @@ export interface FakeCdp {
    * precisely the failure being reproduced.
    */
   holdConnections(): void;
+  /**
+   * Resolves once at least `count` upgrades are sitting in the queue — the
+   * signal that a client really has reached the handshake, as opposed to a
+   * sleep that hopes it has. Without it, "hold, then let the next one
+   * through" races the first client's TCP connect.
+   */
+  whenHeld(count: number, timeoutMs?: number): Promise<void>;
   /** Stop queueing NEW upgrades; anything already queued stays queued. */
   allowConnections(): void;
   /** Complete `count` queued upgrades (default: all of them). */
@@ -79,6 +86,7 @@ export async function fakeCdp(): Promise<FakeCdp> {
   let holding = false;
   const held: { complete: () => void; abandon: () => void }[] = [];
   const connectionWatchers = new Set<() => void>();
+  const heldWatchers = new Set<() => void>();
 
   httpServer.on("upgrade", (request, socket, head) => {
     // A client that gives up on a held handshake (which is what a connect
@@ -90,8 +98,10 @@ export async function fakeCdp(): Promise<FakeCdp> {
         server.emit("connection", ws, request);
       });
     };
-    if (holding) held.push({ complete, abandon: () => socket.destroy() });
-    else complete();
+    if (holding) {
+      held.push({ complete, abandon: () => socket.destroy() });
+      for (const watcher of [...heldWatchers]) watcher();
+    } else complete();
   });
 
   const state: FakeCdp = {
@@ -123,6 +133,22 @@ export async function fakeCdp(): Promise<FakeCdp> {
     },
     holdConnections() {
       holding = true;
+    },
+    whenHeld(count, timeoutMs = 2_000) {
+      if (held.length >= count) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          heldWatchers.delete(check);
+          reject(new Error(`only ${held.length} held handshake(s) after ${timeoutMs}ms`));
+        }, timeoutMs);
+        function check() {
+          if (held.length < count) return;
+          clearTimeout(timer);
+          heldWatchers.delete(check);
+          resolve();
+        }
+        heldWatchers.add(check);
+      });
     },
     allowConnections() {
       holding = false;

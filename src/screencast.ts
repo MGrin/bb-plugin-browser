@@ -8,7 +8,6 @@
 // viewer — that is what a phone on a bad link looks like, and it must cost
 // memory in the viewer's own pipe, never in this module.
 import { openCdp, type CdpSession } from "./cdp.js";
-import type { Pages } from "./pages.js";
 
 export type InputEvent =
   | {
@@ -29,21 +28,30 @@ export interface Viewport {
 }
 
 export interface ScreencastDeps {
-  // Only `pageUrlFor` is ever called here. Narrowed so this module's real
-  // dependency is legible, and so growing the `Pages` interface for other
-  // callers cannot silently widen what a screencast may do to a page.
-  pages: Pick<Pages, "pageUrlFor">;
   quality: number;
   maxWidth: number;
 }
 
 export interface Screencast {
+  /**
+   * Watch a page that ALREADY EXISTS. The caller passes the page's CDP
+   * websocket, resolved read-only — this module has no way to resolve one
+   * and therefore no way to be the reason a page or a browser gets created.
+   * That used to be a TOCTOU pre-check in stream.ts (which checked for a
+   * page, then subscribed through a launch-capable lookup); it is now a
+   * property of this signature and of what this file imports.
+   */
   subscribe(
     sessionKey: string,
-    profile: string,
+    cdpUrl: string,
     onFrame: (jpegBase64: string) => void,
   ): Promise<() => void>;
-  dispatchInput(sessionKey: string, profile: string, event: InputEvent): Promise<void>;
+  /**
+   * Send input to the live cast for this session. Rejects when nothing is
+   * casting: a click has no page url of its own, and inventing one is how a
+   * keystroke aimed at a page that already closed used to mint a blank one.
+   */
+  dispatchInput(sessionKey: string, event: InputEvent): Promise<void>;
   /**
    * The CSS viewport the latest frame of this session's cast was captured
    * from, or null when nothing is casting (or no frame has arrived yet).
@@ -80,9 +88,8 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     cast.session.send("Page.stopScreencast").catch(() => {}).finally(() => cast.session.close());
   }
 
-  async function startCast(sessionKey: string, profile: string): Promise<Cast> {
-    const url = await deps.pages.pageUrlFor(sessionKey, profile);
-    const session = await openCdp(url);
+  async function startCast(cdpUrl: string): Promise<Cast> {
+    const session = await openCdp(cdpUrl);
     try {
       const cast: Cast = { session, subscribers: new Set(), viewport: null };
       session.on("Page.screencastFrame", (params) => {
@@ -150,7 +157,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     }
   }
 
-  function getOrStartCast(sessionKey: string, profile: string): Promise<Cast> {
+  function getOrStartCast(sessionKey: string, cdpUrl: string): Promise<Cast> {
     const existing = casts.get(sessionKey);
     if (existing) return Promise.resolve(existing);
     const inflight = starting.get(sessionKey);
@@ -164,7 +171,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     // for this key" can, in every ordering, including the one where some
     // *other* stale start's cleanup would otherwise have evicted this
     // entry out from under it.
-    const promise: Promise<Cast> = startCast(sessionKey, profile).then(
+    const promise: Promise<Cast> = startCast(cdpUrl).then(
       (cast) => {
         if (starting.get(sessionKey) !== promise) {
           // Something else now owns this key — a stopAll cleared this
@@ -203,8 +210,8 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
   }
 
   return {
-    async subscribe(sessionKey, profile, onFrame) {
-      const cast = await getOrStartCast(sessionKey, profile);
+    async subscribe(sessionKey, cdpUrl, onFrame) {
+      const cast = await getOrStartCast(sessionKey, cdpUrl);
       cast.subscribers.add(onFrame);
 
       // A flag local to this closure, not a re-derived check against the
@@ -225,40 +232,41 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
       return casts.get(sessionKey)?.viewport ?? null;
     },
 
-    async dispatchInput(sessionKey, profile, event) {
+    async dispatchInput(sessionKey, event) {
+      // No fallback that resolves a page: the panel already gates input on
+      // `viewportOf`, and the old fallback went through a launch-capable
+      // lookup — so a click aimed at a page that had just closed could mint
+      // a blank one, or start a browser, from a keystroke.
       const cast = casts.get(sessionKey);
-      const session = cast ? cast.session : await openCdp(await deps.pages.pageUrlFor(sessionKey, profile));
-      try {
-        if (event.kind === "mouse") {
-          await session.send("Input.dispatchMouseEvent", {
-            type: event.type,
-            x: event.x,
-            y: event.y,
-            button: event.button,
-            clickCount: event.clickCount,
-          });
-        } else if (event.kind === "key") {
-          await session.send("Input.dispatchKeyEvent", {
-            type: event.type,
-            text: event.text,
-            key: event.key,
-          });
-        } else {
-          await session.send("Input.dispatchMouseEvent", {
-            type: "mouseWheel",
-            x: event.x,
-            y: event.y,
-            deltaX: 0,
-            deltaY: event.deltaY,
-            button: "none",
-            clickCount: 0,
-          });
-        }
-      } finally {
-        // Only a throwaway session gets closed here — a live cast's session
-        // is owned by subscribe/stopCast, and dispatchInput borrowing it
-        // must leave its lifecycle untouched.
-        if (!cast) session.close();
+      if (!cast) throw new Error(`nothing is casting for ${sessionKey}`);
+      // The cast's own session, never a throwaway of our own: its lifecycle
+      // belongs to subscribe/stopCast, and borrowing it must leave that
+      // untouched.
+      const session = cast.session;
+      if (event.kind === "mouse") {
+        await session.send("Input.dispatchMouseEvent", {
+          type: event.type,
+          x: event.x,
+          y: event.y,
+          button: event.button,
+          clickCount: event.clickCount,
+        });
+      } else if (event.kind === "key") {
+        await session.send("Input.dispatchKeyEvent", {
+          type: event.type,
+          text: event.text,
+          key: event.key,
+        });
+      } else {
+        await session.send("Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x: event.x,
+          y: event.y,
+          deltaX: 0,
+          deltaY: event.deltaY,
+          button: "none",
+          clickCount: 0,
+        });
       }
     },
 

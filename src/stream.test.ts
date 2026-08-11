@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi, PluginHttpHandler } from "@bb/plugin-sdk";
+import { createPageRegistry } from "./page-registry.js";
 import { createPages } from "./pages.js";
 import type { Screencast } from "./screencast.js";
 import { mjpegResponse, registerStreamRoute, STREAM_PATH } from "./stream.js";
@@ -235,7 +236,6 @@ describe("registerStreamRoute", () => {
       screencast: fakeScreencast(),
       pages: { existingPageUrl: async () => null },
       resolveSessionKey: async () => "scratch",
-      profileFor: async () => "main",
       viewers: countingViewers().viewers,
     });
     expect(routes).toHaveLength(1);
@@ -258,7 +258,6 @@ describe("registerStreamRoute", () => {
       screencast: fakeScreencast(subscribe),
       pages: { existingPageUrl },
       resolveSessionKey,
-      profileFor: async () => "main",
       viewers: countingViewers().viewers,
     });
 
@@ -278,7 +277,6 @@ describe("registerStreamRoute", () => {
       screencast: fakeScreencast(subscribe),
       pages: { existingPageUrl },
       resolveSessionKey,
-      profileFor: async () => "main",
       viewers: countingViewers().viewers,
     });
 
@@ -301,7 +299,7 @@ describe("registerStreamRoute", () => {
     // ReadableStream. Calling onFrame synchronously here (before that
     // stream exists) would make this fake unrepresentative of the real
     // dependency and drop the frame instead of testing anything.
-    const subscribe = vi.fn(async (sessionKey: string, profile: string, onFrame: (f: string) => void) => {
+    const subscribe = vi.fn(async (sessionKey: string, cdpUrl: string, onFrame: (f: string) => void) => {
       push = onFrame;
       return () => {};
     });
@@ -309,20 +307,55 @@ describe("registerStreamRoute", () => {
       screencast: fakeScreencast(subscribe),
       pages: { existingPageUrl },
       resolveSessionKey,
-      profileFor: async () => "main",
       viewers: countingViewers().viewers,
     });
 
     const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("multipart/x-mixed-replace");
-    expect(subscribe).toHaveBeenCalledWith("key-for-thr_a", "main", expect.any(Function));
+    // The url this route already resolved, handed straight to the
+    // screencast: it has no way to resolve one for itself, which is what
+    // makes "watching never creates a page" structural rather than a
+    // pre-check with a TOCTOU gap behind it.
+    expect(subscribe).toHaveBeenCalledWith("key-for-thr_a", "ws://x", expect.any(Function));
 
     const reader = response.body!.getReader();
     push(jpeg);
     const chunk = await reader.read();
     expect(Buffer.from(chunk.value!).toString("binary")).toContain("Content-Type: image/jpeg");
     await reader.cancel();
+  });
+
+  // The claim both this file and panel-rpc.ts make about session keys is
+  // "derived here, never a parameter". That is worth exactly one thing —
+  // no request can name a key of its own — and this is what proves it: a
+  // sessionKey in the query is not read, not preferred, and not merged in.
+  // (What it is NOT is isolation between threads: this route's auth is the
+  // per-plugin token, which carries no caller identity, so anything local
+  // holding it can name any thread id. Both files now say so.)
+  it("ignores a session key offered in the query and uses the derived one", async () => {
+    const { bb, routes } = fakeBbHttp();
+    const resolveSessionKey = vi.fn(async (threadId: string | undefined) => `key-for-${threadId}`);
+    const asked: string[] = [];
+    const existingPageUrl = vi.fn(async (sessionKey: string) => {
+      asked.push(sessionKey);
+      return "ws://x";
+    });
+    const subscribe = vi.fn(async () => () => {});
+    registerStreamRoute(bb, {
+      screencast: fakeScreencast(subscribe),
+      pages: { existingPageUrl },
+      resolveSessionKey,
+      viewers: countingViewers().viewers,
+    });
+
+    const response = await routes[0].handler(
+      fakeContext({ threadId: "thr_a", sessionKey: "someone-elses-key" }),
+    );
+    expect(response.status).toBe(200);
+    expect(asked).toEqual(["key-for-thr_a"]);
+    expect(subscribe).toHaveBeenCalledWith("key-for-thr_a", "ws://x", expect.any(Function));
+    await response.body!.cancel();
   });
 
   // Someone with the panel open is USING the page, even though no command
@@ -335,7 +368,6 @@ describe("registerStreamRoute", () => {
       screencast: fakeScreencast(),
       pages: { existingPageUrl: async () => "ws://x" },
       resolveSessionKey: async (threadId) => `key-for-${threadId}`,
-      profileFor: async () => "main",
       viewers: viewers.viewers,
     });
 
@@ -363,7 +395,6 @@ describe("registerStreamRoute", () => {
       }),
       pages: { existingPageUrl: async () => "ws://x" },
       resolveSessionKey: async () => "key-for-thr_a",
-      profileFor: async () => "main",
       viewers: viewers.viewers,
     });
 
@@ -384,6 +415,7 @@ describe("registerStreamRoute with the real Pages", () => {
   it("404s for a thread whose bound browser is gone, without ever calling engine.browserCdpUrl again", async () => {
     server = await fakeCdp();
     const browserCdpUrl = vi.fn(async () => server.url);
+    const kv = memoryKv();
     const pages = createPages({
       // Exactly what PagesDeps.engine declares. `run` is there because a
       // page has to be created by the session that will drive it — only
@@ -394,7 +426,8 @@ describe("registerStreamRoute with the real Pages", () => {
         shutdown: async () => {},
         shutdownAll: async () => {},
       },
-      kv: memoryKv(),
+      kv,
+      registry: createPageRegistry({ kv, log: () => {} }),
       log: () => {},
     });
 
@@ -412,7 +445,6 @@ describe("registerStreamRoute with the real Pages", () => {
       screencast: fakeScreencast(),
       pages,
       resolveSessionKey: async (threadId) => `key-for-${threadId}`,
-      profileFor: async () => "main",
       viewers: countingViewers().viewers,
     });
 

@@ -8,6 +8,7 @@
 // each session says about itself.
 import { afterEach, describe, expect, it } from "vitest";
 import { createOperations } from "./operations.js";
+import { createPageRegistry } from "./page-registry.js";
 import { createPages, type Pages } from "./pages.js";
 import { createReaper } from "./reaper.js";
 import {
@@ -40,7 +41,8 @@ async function stack(land: Landing = landOnNewest) {
     shutdownAll: async () => {},
   };
   const kv = memoryKv();
-  const pages: Pages = createPages({ engine, kv, log: () => {} });
+  const registry = createPageRegistry({ kv, log: () => {} });
+  const pages: Pages = createPages({ engine, kv, registry, log: () => {} });
   // The real reaper over the real Pages, not a stand-in: whether a sweep
   // actually removes a tab from the browser is the only question worth
   // asking about it, and a stubbed closePage cannot answer it.
@@ -49,9 +51,9 @@ async function stack(land: Landing = landOnNewest) {
     idleMs: async () => idle.ms,
     graceMs: 500,
     headed: async () => false,
-    closePage: (sessionKey) => pages.closePage(sessionKey),
-    listOpenPages: () => pages.listOpenPages(),
-    closeUnboundPage: (targetId) => pages.closeUnboundPage(targetId),
+    closePage: (sessionKey) => registry.closePage(sessionKey),
+    listOpenPages: () => registry.listOpenPages(),
+    closeUnboundPage: (targetId) => registry.closeUnboundPage(targetId),
     log: () => {},
     warn: (message) => warnings.push(message),
   });

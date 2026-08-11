@@ -32,7 +32,6 @@ function handlersWith(overrides: Partial<PanelRpcDeps> = {}) {
     operations: { open },
     pages: { existingPageInfo },
     screencast: { dispatchInput, viewportOf: () => ({ width: 1440, height: 900 }) },
-    profileFor: async () => "main",
     ...overrides,
   };
   return { handlers: createPanelRpcHandlers(deps), dispatchInput, open, existingPageInfo };
@@ -130,10 +129,10 @@ describe("panel rpc handlers", () => {
     expect(open).toHaveBeenCalledWith("thr_root", "https://example.com");
   });
 
-  it("input dispatches to the resolved session key and its profile", async () => {
+  it("input dispatches to the session key derived from the thread", async () => {
     const { handlers, dispatchInput } = handlersWith();
     expect(await handlers.input({ threadId: "thr_child", event: CLICK })).toEqual({ ok: true });
-    expect(dispatchInput).toHaveBeenCalledWith("thr_root", "main", CLICK);
+    expect(dispatchInput).toHaveBeenCalledWith("thr_root", CLICK);
   });
 
   it("input is dropped when nothing is casting, rather than opening a page to receive it", async () => {

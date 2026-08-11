@@ -12,7 +12,7 @@
 // token in the query string is what lets this load over the Cloudflare
 // tunnel from a phone that has no cookie jar shared with the bb app origin.
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import type { Pages } from "./pages.js";
+import type { PageRegistry } from "./page-registry.js";
 import type { Screencast } from "./screencast.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
@@ -149,9 +149,16 @@ export const STREAM_PATH = "/stream";
 
 export interface StreamRouteDeps {
   screencast: Pick<Screencast, "subscribe">;
-  pages: Pick<Pages, "existingPageUrl">;
+  /**
+   * The READ-ONLY page registry, not `Pages`. page-registry.ts has no
+   * access to `engine`, so nothing this route can reach is able to create a
+   * page or start a browser — the invariant is the import graph's now, not
+   * a comment's. It used to be a pre-check here followed by a subscribe
+   * that resolved through the launch-capable path anyway, which was a
+   * TOCTOU gap as well as a lie.
+   */
+  pages: Pick<PageRegistry, "existingPageUrl">;
   resolveSessionKey: SessionKeyResolver;
-  profileFor: (sessionKey: string) => Promise<string>;
   /**
    * A viewer counts as using the page. Someone watching the panel is using
    * it even when no command has run for an hour, so the idle reaper must not
@@ -163,16 +170,26 @@ export interface StreamRouteDeps {
 }
 
 export function registerStreamRoute(bb: BbPluginApi, deps: StreamRouteDeps): void {
-  const { screencast, pages, resolveSessionKey, profileFor, viewers } = deps;
+  const { screencast, pages, resolveSessionKey, viewers } = deps;
   bb.http.route(
     "GET",
     STREAM_PATH,
     async (context) => {
-      // A thread id, never a session key: session keys are derived
-      // server-side (docs/design.md, "Session keys are derived server-side
-      // from the calling thread, never accepted as a parameter") — a caller
-      // that could hand us an arbitrary session key could spawn or attach
-      // to a page it has no business watching.
+      // A thread id, and only a thread id. The session key is DERIVED from
+      // it here (session-key.ts walks the thread's ancestry), never read
+      // from the request, so no caller can name a session key directly:
+      // not one belonging to a thread that does not exist, not one outside
+      // the thread graph, and not one smuggled past the derivation.
+      //
+      // What this is NOT is an authorization boundary, and the comment that
+      // used to sit here implied it was. This route's auth is bb's
+      // per-plugin token, which carries no caller identity — so any local
+      // process holding that token can name any thread id and watch that
+      // thread's page. That is defence in depth rather than a privilege
+      // boundary: every thread on this machine already has a shell, and a
+      // shell can read the same profile directly. The value of deriving the
+      // key is that it removes a whole class of parameter-tampering bugs,
+      // not that it keeps one thread out of another's browser.
       const threadId = context.req.query("threadId");
       if (!threadId) return new Response("missing threadId", { status: 400 });
 
@@ -186,9 +203,12 @@ export function registerStreamRoute(bb: BbPluginApi, deps: StreamRouteDeps): voi
         return new Response("no page open for this thread", { status: 404 });
       }
 
-      const profile = await profileFor(sessionKey);
       return mjpegResponse(async (onFrame) => {
-        const unsubscribe = await screencast.subscribe(sessionKey, profile, onFrame);
+        // The url this route already resolved, handed straight over. The
+        // screencast has no way to resolve one for itself, so "watching
+        // never creates a page" holds even in the window between the check
+        // above and the subscribe: the worst case is a connect that fails.
+        const unsubscribe = await screencast.subscribe(sessionKey, existing, onFrame);
         // Counted only once the subscribe has actually succeeded, so a
         // failed one cannot leave a phantom viewer holding a page open for
         // the life of the plugin. Released exactly once: mjpegResponse can
