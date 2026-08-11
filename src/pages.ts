@@ -132,24 +132,38 @@ export function createPages(deps: PagesDeps): Pages {
     browserWsUrl: string,
   ): Promise<PageBinding> {
     const marker = markerUrl();
+    // Labels are unique within a session: a second `tab new --label bbpage`
+    // is refused outright ("Label `bbpage` is already used by another tab").
+    // Anything that leaves the session holding the label while this plugin
+    // thinks it has no page — a CDP close that failed, a reaper calling
+    // forget(), a throw after a successful tab new — would wedge the thread
+    // out of ever binding again, and only killing its daemon would clear it.
+    // So creating starts by reconciling with what the SESSION holds, not
+    // with what the binding claims.
+    //
+    // Deliberately NOT --bail: `tab close` fails whenever there is nothing
+    // to reconcile, which is the ordinary case, and measured behaviour is
+    // that the batch runs on and creates the tab while still exiting
+    // non-zero. The exit code therefore cannot be the verdict here — the
+    // marker either turned up in the browser or it did not.
     const made = await deps.engine.run({
       profile,
       session: sessionKey,
       attach: true,
-      argv: ["batch", "--bail"],
+      argv: ["batch"],
       stdin: JSON.stringify([
         ["connect", browserWsUrl],
+        ["tab", "close", TAB_LABEL],
         ["tab", "new", "--label", TAB_LABEL, marker],
       ]),
     });
-    if (made.code !== 0) {
-      throw new Error(`could not open a page for this thread: ${made.stderr.trim()}`);
-    }
 
     const open = await listPageTargets(browserWsUrl);
     const created = open.find((target) => target.url === marker);
     if (!created) {
-      throw new Error("opened a page for this thread but could not find it in the browser");
+      throw new Error(
+        `could not open a page for this thread: ${made.stderr.trim() || "no reason given"}`,
+      );
     }
 
     const binding: Binding = {
@@ -180,8 +194,12 @@ export function createPages(deps: PagesDeps): Pages {
       return { cdpUrl: pageUrl(browserWsUrl, bound.targetId), browserWsUrl, tab: bound.tab };
     }
     if (bound && stillOpen) {
-      // Don't leave the page we're walking away from open forever.
-      await closeTarget(browserWsUrl, bound.targetId).catch(() => {});
+      // Don't leave the page we're walking away from open forever. A
+      // failure here is logged, never swallowed: it means a labelled tab may
+      // still be alive, which createPage's reconcile step then has to clear.
+      await closeTarget(browserWsUrl, bound.targetId).catch((error: Error) => {
+        deps.log(`could not close ${bound.targetId} for ${sessionKey}: ${error.message}`);
+      });
     }
     return createPage(sessionKey, profile, browserWsUrl);
   }
@@ -194,16 +212,38 @@ export function createPages(deps: PagesDeps): Pages {
   // promise per key, dropped once settled so a failure doesn't poison later
   // calls.
   const inflight = new Map<string, Promise<PageBinding>>();
+  // Rebinds coalesce too, in their own map. Their own, because a rebind must
+  // never join an in-flight ordinary resolve — that one may hand back the
+  // very page the rebind exists to replace. And coalesced, because two
+  // concurrent rebinds for one key would otherwise race to `tab new` the
+  // same label, and the loser does not get "a labelled page of its own": it
+  // gets a hard "already used by another tab" and the command fails.
+  const rebinding = new Map<string, Promise<PageBinding>>();
 
-  function bindingFor(sessionKey: string, profile: string, replace = false): Promise<PageBinding> {
-    const existing = inflight.get(sessionKey);
-    if (existing && !replace) return existing;
-
+  function start(
+    map: Map<string, Promise<PageBinding>>,
+    sessionKey: string,
+    profile: string,
+    replace: boolean,
+  ): Promise<PageBinding> {
     const settling = resolveBinding(sessionKey, profile, replace).finally(() => {
-      if (inflight.get(sessionKey) === settling) inflight.delete(sessionKey);
+      if (map.get(sessionKey) === settling) map.delete(sessionKey);
     });
-    inflight.set(sessionKey, settling);
+    map.set(sessionKey, settling);
     return settling;
+  }
+
+  function bindingFor(sessionKey: string, profile: string): Promise<PageBinding> {
+    // A rebind in flight is the newer answer, so join it rather than racing.
+    return (
+      rebinding.get(sessionKey) ??
+      inflight.get(sessionKey) ??
+      start(inflight, sessionKey, profile, false)
+    );
+  }
+
+  function rebind(sessionKey: string, profile: string): Promise<PageBinding> {
+    return rebinding.get(sessionKey) ?? start(rebinding, sessionKey, profile, true);
   }
 
   async function existingPageInfo(
@@ -227,8 +267,8 @@ export function createPages(deps: PagesDeps): Pages {
   }
 
   return {
-    bindingFor: (sessionKey, profile) => bindingFor(sessionKey, profile),
-    rebind: (sessionKey, profile) => bindingFor(sessionKey, profile, true),
+    bindingFor,
+    rebind,
     existingPageInfo,
 
     async pageUrlFor(sessionKey, profile) {

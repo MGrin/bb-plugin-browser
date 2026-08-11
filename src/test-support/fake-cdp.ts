@@ -19,8 +19,12 @@ export interface FakeCdp {
   sendRaw(data: string): void;
   /** Never answer a call for this method — proves request timeouts. */
   silence(method: string): void;
-  /** Answer a call for this method with a CDP protocol error instead of a result. */
-  failOn(method: string, message: string): void;
+  /**
+   * Answer a call for this method with a CDP protocol error instead of a
+   * result. `null` clears it again, so a test can make one call fail and the
+   * next succeed — which is what "recovering from a failed call" needs.
+   */
+  failOn(method: string, message: string | null): void;
   close(): Promise<void>;
 }
 
@@ -60,7 +64,8 @@ export async function fakeCdp(): Promise<FakeCdp> {
       silenced.add(method);
     },
     failOn(method, message) {
-      failing.set(method, message);
+      if (message === null) failing.delete(method);
+      else failing.set(method, message);
     },
     async close() {
       for (const client of clients) client.close();

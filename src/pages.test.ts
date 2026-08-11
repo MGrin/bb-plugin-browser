@@ -23,7 +23,7 @@ function memoryKv() {
  * is the bug being fixed. Asserting a call *count* is the only way to prove
  * a call didn't happen, as opposed to merely not asserting on it.
  */
-function pagesFor(url: string) {
+function pagesFor(url: string, options: { afterRun?: () => void } = {}) {
   const browserCdpUrl = vi.fn(async () => url);
   // A page is created BY the session that will drive it, because only
   // `tab new --label` assigns the label the command path selects by. The
@@ -31,7 +31,17 @@ function pagesFor(url: string) {
   // "the session made a tab" and "the browser has that tab" are the same
   // fact here, exactly as they are in a real browser.
   const browser = fakeBrowser(server);
-  const engine = { browserCdpUrl, run: browser.run };
+  const engine = {
+    browserCdpUrl,
+    // `afterRun` fires the instant an invocation returns, which is the only
+    // way to land inside the window between `tab new` succeeding and the
+    // binding being written.
+    run: async (args: Parameters<typeof browser.run>[0]) => {
+      const result = await browser.run(args);
+      options.afterRun?.();
+      return result;
+    },
+  };
   const kv = memoryKv();
   const pages = createPages({ engine, kv, log: () => {} });
   return { pages, browserCdpUrl, kv, browser };
@@ -187,6 +197,98 @@ describe("pages", () => {
     // ...and the page it walked away from is closed, not left as an orphan
     // tab nobody owns and nothing will ever close.
     expect(server.targets.some((target) => target.targetId === "old-tab")).toBe(false);
+  });
+
+  // agent-browser refuses a second `tab new --label bbpage` outright
+  // ("Label `bbpage` is already used by another tab"), and closing the tab is
+  // the only thing that frees it. Every path that reaches creation while the
+  // session still holds the label on an OPEN tab would otherwise wedge that
+  // thread out of ever binding again — only killing its daemon would clear
+  // it. There are three such paths, and all three are covered here.
+  describe("never wedges a session out of binding", () => {
+    it("binds again after a reaper forgets the binding under a live labelled tab", async () => {
+      server = await fakeCdp();
+      const { pages, browser } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      expect(browser.labelsOf("thr_a")).toEqual([TAB_LABEL]);
+
+      // Exactly what this task's report asks Task 10's reaper to do.
+      await pages.forget("thr_a");
+      expect(browser.labelsOf("thr_a")).toEqual([TAB_LABEL]);
+
+      const revived = await pages.pageUrlFor("thr_a", "main");
+      expect(revived).toMatch(/\/devtools\/page\/tab-2$/);
+      // ...and the tab it could not account for is gone, not left labelled
+      // and orphaned for the next attempt to trip over.
+      expect(server.targets).toHaveLength(1);
+    });
+
+    it("binds again after the CDP close of the old page genuinely fails", async () => {
+      server = await fakeCdp();
+      const { pages } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      server.failOn("Target.closeTarget", "boom");
+
+      await expect(pages.rebind("thr_a", "main")).resolves.toMatchObject({ tab: TAB_LABEL });
+      // The old tab survived the failed close, so the reconcile had to be
+      // what freed the label — and the thread ends on exactly one page.
+      expect(server.targets).toHaveLength(1);
+    });
+
+    it("binds again after a create threw between tab new and the binding being written", async () => {
+      server = await fakeCdp();
+      let breakLookup = false;
+      const { pages, kv, browser } = pagesFor(server.url, {
+        // Break the marker lookup the moment `tab new` has returned: the tab
+        // exists and is labelled, and no binding will be written for it.
+        afterRun: () => {
+          if (breakLookup) server.failOn("Target.getTargets", "lookup exploded");
+        },
+      });
+
+      breakLookup = true;
+      // Whatever blew up — here the marker lookup itself — propagates.
+      await expect(pages.pageUrlFor("thr_a", "main")).rejects.toThrow(/lookup exploded/);
+      expect(kv.store.has("page:thr_a")).toBe(false);
+      expect(browser.labelsOf("thr_a")).toEqual([TAB_LABEL]);
+      expect(server.targets).toHaveLength(1);
+
+      breakLookup = false;
+      server.failOn("Target.getTargets", null);
+      await expect(pages.pageUrlFor("thr_a", "main")).resolves.toBeTruthy();
+      // The orphan was reconciled away rather than left to collide forever.
+      expect(server.targets).toHaveLength(1);
+    });
+  });
+
+  it("coalesces concurrent rebinds instead of racing for the same label", async () => {
+    server = await fakeCdp();
+    const { pages, browser } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+
+    // Two rebinds at once cannot "each end up on a labelled page of their
+    // own": labels are unique per session, so without coalescing the loser
+    // gets a hard "already used by another tab" and its command fails.
+    const [first, second] = await Promise.all([
+      pages.rebind("thr_a", "main"),
+      pages.rebind("thr_a", "main"),
+    ]);
+    expect(second).toEqual(first);
+    expect(tabsOpened(browser)).toHaveLength(2);
+    expect(server.targets).toHaveLength(1);
+  });
+
+  // The ProcessSingleton hazard: a thread session that passes --profile makes
+  // Chromium abort on a profile directory another process already holds, and
+  // the session is dead for every later command. The create path spawns
+  // agent-browser too, and nothing else in the suite watches it.
+  it("never launches a browser from the session that creates the page", async () => {
+    server = await fakeCdp();
+    const { pages, browser } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    await pages.rebind("thr_a", "main");
+    expect(browser.calls.length).toBeGreaterThan(0);
+    for (const call of browser.calls) expect(call.attach).toBe(true);
   });
 
   it("rebind swaps in a fresh, freshly labelled page and closes the old one", async () => {
