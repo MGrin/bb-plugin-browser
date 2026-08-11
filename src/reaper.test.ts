@@ -173,6 +173,49 @@ describe("reaper: pages nobody is bound to", () => {
     expect(closedTargets).toEqual(["orphan-1"]);
   });
 
+  // The grace period is a DURATION, not "one more sweep". Every test around
+  // it that only sweeps twice passes just as well against a zero-length
+  // grace — so this one sweeps repeatedly inside the window and requires the
+  // page to still be there each time. It is the window between `tab new` and
+  // the binding being written that this protects, and that window is
+  // measured in time, not in sweeps.
+  it("waits out the whole grace period, not merely one further sweep", async () => {
+    const { closedTargets, state, reaper } = reaperWith();
+    state.pages = [page("orphan-1")];
+
+    await reaper.sweep(0);
+    for (const now of [100, 200, 300, 400, 499]) {
+      await reaper.sweep(now);
+      expect(closedTargets).toEqual([]);
+    }
+    await reaper.sweep(500);
+    expect(closedTargets).toEqual(["orphan-1"]);
+  });
+
+  // And the clock restarts when a page stops being unowned and then is
+  // again: a target that regained a binding has served no part of a fresh
+  // grace period, so the time it spent unowned BEFORE must not count.
+  it("gives a page that regained and then lost a binding a fresh grace period", async () => {
+    const { closedTargets, state, reaper } = reaperWith();
+    state.pages = [page("t1")];
+    await reaper.sweep(0);
+
+    // Bound — the create-then-bind window closing, most likely.
+    state.pages = [page("t1", "thr_a")];
+    await reaper.sweep(100);
+
+    // Unowned again: its binding was dropped, or its thread was torn down.
+    state.pages = [page("t1")];
+    await reaper.sweep(200);
+    await reaper.sweep(600);
+    // 600 is past the grace period counted from the FIRST sighting, and not
+    // past it counted from the second. Only the second is right.
+    expect(closedTargets).toEqual([]);
+
+    await reaper.sweep(700);
+    expect(closedTargets).toEqual(["t1"]);
+  });
+
   // pages.ts creates a tab and only then writes the binding. A sweep landing
   // inside that window must not close the tab a thread is about to be handed.
   it("never closes a page that gained a binding during the grace period", async () => {

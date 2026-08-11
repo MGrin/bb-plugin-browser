@@ -154,7 +154,11 @@ export default async function plugin(bb: BbPluginApi) {
         );
         // The casts point at pages that are about to stop existing.
         screencast.stopAll();
-        await engine.shutdown(defaultProfile);
+        // Through `pages`, not `engine`: closing the browser and forgetting
+        // where it was are one act. A remembered address outlives its
+        // browser by pointing at a freed ephemeral port, and the next
+        // process to take that port is somebody else's browser.
+        await pages.shutdownBrowser(defaultProfile);
       } catch (error) {
         bb.log.warn(
           `could not relaunch the browser after the headed change: ${
@@ -174,6 +178,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(async () => {
     screencast.stopAll();
-    await engine.shutdownAll();
+    await pages.shutdownAllBrowsers();
   });
 }

@@ -22,8 +22,12 @@ function pagesFor(url: string, options: { afterRun?: () => void } = {}) {
   // "the session made a tab" and "the browser has that tab" are the same
   // fact here, exactly as they are in a real browser.
   const browser = fakeBrowser(server);
+  const shutdown = vi.fn(async () => {});
+  const shutdownAll = vi.fn(async () => {});
   const engine = {
     browserCdpUrl,
+    shutdown,
+    shutdownAll,
     // `afterRun` fires the instant an invocation returns, which is the only
     // way to land inside the window between `tab new` succeeding and the
     // binding being written.
@@ -35,7 +39,7 @@ function pagesFor(url: string, options: { afterRun?: () => void } = {}) {
   };
   const kv = memoryKv();
   const pages = createPages({ engine, kv, log: () => {} });
-  return { pages, browserCdpUrl, kv, browser };
+  return { pages, browserCdpUrl, kv, browser, shutdown, shutdownAll };
 }
 
 /** Every `tab new` the sessions ran, decoded out of the batch payloads. */
@@ -395,6 +399,88 @@ describe("pages", () => {
 
       await expect(pages.closeUnboundPage("restored")).rejects.toThrow(/boom/);
       expect(server.targets).toHaveLength(2);
+    });
+
+    // The hazard this closes, spelled out: a debugging port is ephemeral and
+    // freed the moment its browser exits, and this machine runs OTHER
+    // agent-browser Chromiums on ports from the same pool. A reaper that
+    // adopted whatever answered at a remembered address would list a
+    // stranger's tabs as unowned and close every one of them, once a minute,
+    // with nobody watching.
+    it("refuses a browser at the remembered address that is not the one we left there", async () => {
+      server = await fakeCdp();
+      const { pages, kv } = pagesFor(server.url);
+      // A tab belonging to whoever owns this browser — the one the reaper
+      // would close if it adopted the endpoint.
+      server.targets.push({ targetId: "someone-elses", type: "page", url: "https://theirs.example/" });
+      await pages.pageUrlFor("thr_a", "main");
+      expect(await pages.listOpenPages()).toHaveLength(2);
+
+      // Same host and port, a different browser: exactly what a reused port
+      // looks like from the outside.
+      server.url = server.url.replace(/\/devtools\/browser\/.*$/, "/devtools/browser/somebody-else");
+
+      expect(await pages.listOpenPages()).toEqual([]);
+      // ...and it must not act on it either, however the caller got there.
+      await expect(pages.closeUnboundPage("someone-elses")).resolves.toBeUndefined();
+      expect(server.targets).toHaveLength(2);
+      expect(kv.store.has("origin:main")).toBe(true);
+    });
+
+    // Both shapes an identity-less row can take: the bare string written
+    // before this check existed, and an object carrying an address and
+    // nothing to check it against. Neither may be trusted — an address with
+    // no identity is exactly an address that cannot be told from a
+    // stranger's, which is the whole hazard.
+    it("treats an address remembered without an identity as dead, rather than trusting it", async () => {
+      const origin = (url: string) => new URL(url).origin.replace("ws:", "http:");
+      for (const legacy of [
+        (url: string) => origin(url),
+        (url: string) => ({ origin: origin(url) }),
+      ]) {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        expect(await pages.listOpenPages()).toHaveLength(1);
+
+        await kv.set("origin:main", legacy(server.url));
+        expect(await pages.listOpenPages()).toEqual([]);
+        await server.close();
+      }
+    });
+
+    it("forgets where the browser was when it shuts the browser down", async () => {
+      server = await fakeCdp();
+      const { pages, kv, shutdown } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      expect(kv.store.has("origin:main")).toBe(true);
+
+      await pages.shutdownBrowser("main");
+      expect(shutdown).toHaveBeenCalledWith("main");
+      // The address it left behind names a port that is free again. Keeping
+      // it is what lets a stranger's browser be adopted later.
+      expect(kv.store.has("origin:main")).toBe(false);
+    });
+
+    it("forgets every address when it shuts every browser down", async () => {
+      server = await fakeCdp();
+      const { pages, kv, shutdownAll } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      await kv.set("origin:other", { origin: "http://127.0.0.1:1", browserId: "x" });
+
+      await pages.shutdownAllBrowsers();
+      expect(shutdownAll).toHaveBeenCalled();
+      expect([...kv.store.keys()].filter((storedKey) => storedKey.startsWith("origin:"))).toEqual([]);
+    });
+
+    it("still forgets the address when the shutdown itself fails", async () => {
+      server = await fakeCdp();
+      const { pages, kv, shutdown } = pagesFor(server.url);
+      await pages.pageUrlFor("thr_a", "main");
+      shutdown.mockRejectedValueOnce(new Error("close failed"));
+
+      await expect(pages.shutdownBrowser("main")).rejects.toThrow(/close failed/);
+      expect(kv.store.has("origin:main")).toBe(false);
     });
 
     it("closing an unbound page never launches a browser either", async () => {

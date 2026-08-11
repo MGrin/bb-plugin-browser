@@ -19,6 +19,7 @@
 import { randomUUID } from "node:crypto";
 import type { Engine } from "./engine.js";
 import {
+  browserIdOf,
   closeTarget,
   httpOriginOf,
   listPageTargets,
@@ -33,7 +34,7 @@ export interface PagesDeps {
    * select by, a label session A assigned), and `tab new --label` is the
    * only command that assigns one.
    */
-  engine: Pick<Engine, "browserCdpUrl" | "run">;
+  engine: Pick<Engine, "browserCdpUrl" | "run" | "shutdown" | "shutdownAll">;
   kv: {
     get<T>(key: string): Promise<T | undefined>;
     set(key: string, value: unknown): Promise<void>;
@@ -132,6 +133,17 @@ export interface Pages {
    * survived is visible rather than assumed gone.
    */
   closeUnboundPage(targetId: string): Promise<void>;
+  /**
+   * Close a profile's browser and forget where it was — the two halves of
+   * one act, which is why they are not two calls a caller has to remember to
+   * pair. A remembered address whose browser has gone points at a freed
+   * ephemeral port, and the next process to take that port is somebody
+   * else's browser; the identity check in `reachableBrowser` refuses to
+   * adopt it, and this makes sure there is nothing stale to refuse.
+   */
+  shutdownBrowser(profile: string): Promise<void>;
+  /** The same, for every browser this engine has running. */
+  shutdownAllBrowsers(): Promise<void>;
   closePage(sessionKey: string): Promise<void>;
   forget(sessionKey: string): Promise<void>;
 }
@@ -144,6 +156,16 @@ const key = (sessionKey: string) => `page:${sessionKey}`;
  * all, and the debris would be unreachable forever.
  */
 const originKey = (profile: string) => `origin:${profile}`;
+
+/**
+ * Where a profile's browser was, and WHICH browser it was. The address alone
+ * is not a handle on anything: ports are ephemeral and get reused by
+ * unrelated processes, so the uuid is what makes going back to it safe.
+ */
+interface BrowserPointer {
+  origin: string;
+  browserId: string;
+}
 
 /**
  * bb's `kv.list` returns full keys; this tolerates either form so a host that
@@ -212,18 +234,24 @@ export function createPages(deps: PagesDeps): Pages {
       );
     }
 
+    const origin = httpOriginOf(browserWsUrl);
     const binding: Binding = {
       profile,
       targetId: created.targetId,
-      origin: httpOriginOf(browserWsUrl),
+      origin,
       tab: TAB_LABEL,
     };
     await deps.kv.set(key(sessionKey), binding);
     // Remembered per profile as well as per binding: the reaper has to be
     // able to find this browser after every binding for it is gone, which is
     // exactly the state a restart leaves behind together with the tabs it
-    // restored.
-    await deps.kv.set(originKey(profile), binding.origin);
+    // restored. With the browser's uuid, so that going back to the address
+    // later can tell "our browser" from "whatever now holds that port".
+    const browserId = browserIdOf(browserWsUrl);
+    if (browserId) {
+      const pointer: BrowserPointer = { origin, browserId };
+      await deps.kv.set(originKey(profile), pointer);
+    }
     deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
     return { cdpUrl: pageUrl(browserWsUrl, created.targetId), browserWsUrl, tab: TAB_LABEL };
   }
@@ -332,24 +360,43 @@ export function createPages(deps: PagesDeps): Pages {
   }
 
   /**
-   * A live browser's CDP websocket, found by probing origins we have already
-   * seen — never by `engine.browserCdpUrl`, which is launch mode. `null`
-   * means "no browser is reachable", which is a complete answer.
+   * A live browser this plugin owns, found by probing the addresses it has
+   * recorded — never by `engine.browserCdpUrl`, which is launch mode. `null`
+   * means "no browser of ours is reachable", which is a complete answer.
+   *
+   * The identity check is not belt-and-braces, it is the whole point.
+   * Debugging ports are ephemeral and a closed browser frees one at once, so
+   * a recorded address is stale the moment its browser goes away — and the
+   * reaper acts on what it finds there by CLOSING every tab no binding of
+   * ours names. Against somebody else's Chromium (this machine runs its own
+   * agent-browser sessions on ports from the same pool) that would mean
+   * silently closing all of their tabs, once a minute, with nobody watching.
+   * So: match the browser's uuid or treat the address as dead.
+   *
+   * A pointer with no recorded identity — a row written before this check
+   * existed — is likewise treated as dead rather than trusted, and the next
+   * page creation replaces it.
    */
-  async function reachableBrowser(
-    bindings: { binding: Binding }[],
-  ): Promise<string | null> {
-    const origins: string[] = [];
+  async function reachableBrowser(): Promise<string | null> {
     for (const storedKey of await deps.kv.list("origin:")) {
       const profile = withoutPrefix("origin:", storedKey);
-      const origin = await deps.kv.get<string>(originKey(profile));
-      if (typeof origin === "string") origins.push(origin);
-    }
-    for (const { binding } of bindings) if (binding.origin) origins.push(binding.origin);
+      // Partial, deliberately: a row written before this check existed
+      // carries no identity (or is a bare origin string), and the comparison
+      // below is what has to reject it. No separate "has an id?" guard —
+      // `undefined` already matches no browser, and a second branch saying
+      // so would be one no test could ever fail against.
+      const pointer = await deps.kv.get<Partial<BrowserPointer>>(originKey(profile));
+      if (!pointer?.origin) continue;
 
-    for (const origin of new Set(origins)) {
-      const browserUrl = await probeBrowserUrl(origin);
-      if (browserUrl) return browserUrl;
+      const browserUrl = await probeBrowserUrl(pointer.origin);
+      if (!browserUrl) continue;
+      if (browserIdOf(browserUrl) !== pointer.browserId) {
+        deps.log(
+          `${pointer.origin} is answering, but it is not the browser we left there — ignoring it`,
+        );
+        continue;
+      }
+      return browserUrl;
     }
     return null;
   }
@@ -361,7 +408,7 @@ export function createPages(deps: PagesDeps): Pages {
 
     async listOpenPages() {
       const bindings = await allBindings();
-      const browserUrl = await reachableBrowser(bindings);
+      const browserUrl = await reachableBrowser();
       if (!browserUrl) return [];
       const owner = new Map(bindings.map(({ sessionKey, binding }) => [binding.targetId, sessionKey]));
       return (await listPageTargets(browserUrl)).map((target) => ({
@@ -382,7 +429,7 @@ export function createPages(deps: PagesDeps): Pages {
       if (owner) {
         throw new Error(`refusing to close ${targetId}: ${owner.sessionKey} is bound to it`);
       }
-      const browserUrl = await reachableBrowser(bindings);
+      const browserUrl = await reachableBrowser();
       // No browser, no page: there is nothing to close and nothing to report.
       if (!browserUrl) return;
       await closeTarget(browserUrl, targetId);
@@ -394,6 +441,27 @@ export function createPages(deps: PagesDeps): Pages {
 
     async existingPageUrl(sessionKey) {
       return (await existingPageInfo(sessionKey))?.cdpUrl ?? null;
+    },
+
+    async shutdownBrowser(profile) {
+      try {
+        await deps.engine.shutdown(profile);
+      } finally {
+        // In a finally: a close that failed may still have taken the browser
+        // down, and forgetting an address needlessly costs only a sweep that
+        // finds nothing, while keeping a stale one is the hazard itself.
+        await deps.kv.delete(originKey(profile));
+      }
+    },
+
+    async shutdownAllBrowsers() {
+      try {
+        await deps.engine.shutdownAll();
+      } finally {
+        for (const storedKey of await deps.kv.list("origin:")) {
+          await deps.kv.delete(originKey(withoutPrefix("origin:", storedKey)));
+        }
+      }
     },
 
     async closePage(sessionKey) {

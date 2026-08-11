@@ -388,7 +388,12 @@ describe("registerStreamRoute with the real Pages", () => {
       // Exactly what PagesDeps.engine declares. `run` is there because a
       // page has to be created by the session that will drive it — only
       // `tab new --label` assigns the label the command path selects by.
-      engine: { browserCdpUrl, run: fakeBrowser(server).run },
+      engine: {
+        browserCdpUrl,
+        run: fakeBrowser(server).run,
+        shutdown: async () => {},
+        shutdownAll: async () => {},
+      },
       kv: memoryKv(),
       log: () => {},
     });

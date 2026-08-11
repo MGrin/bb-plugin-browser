@@ -66,6 +66,8 @@ function opsWith(
     existingPageInfo: async () => null,
     listOpenPages: async () => [],
     closeUnboundPage: async () => {},
+    shutdownBrowser: async () => {},
+    shutdownAllBrowsers: async () => {},
     closePage: async (sessionKey: string) => {
       closed.push(sessionKey);
     },

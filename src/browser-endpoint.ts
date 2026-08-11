@@ -17,6 +17,22 @@ export function pageUrl(browserUrl: string, targetId: string): string {
   return `${base.protocol}//${base.host}/devtools/page/${targetId}`;
 }
 
+/**
+ * The browser's own identity, out of its CDP websocket URL — the uuid Chrome
+ * mints per process and serves at `/devtools/browser/<uuid>`.
+ *
+ * A host and port identify nothing durable: debugging ports are ephemeral, a
+ * closed browser frees one immediately, and the next process to take it may
+ * belong to somebody else entirely (this machine runs its own agent-browser
+ * Chromiums, in another namespace, on ports from the same pool). So anything
+ * that goes back to a remembered address has to check it reached the same
+ * browser it remembered, and this is the value to check.
+ */
+export function browserIdOf(browserUrl: string): string | null {
+  const match = /\/devtools\/browser\/([^/?#]+)/.exec(browserUrl);
+  return match?.[1] ?? null;
+}
+
 /** The plain-HTTP origin backing a CDP websocket URL, for `/json/version`. */
 export function httpOriginOf(browserUrl: string): string {
   const base = new URL(browserUrl);
