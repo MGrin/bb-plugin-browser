@@ -3,6 +3,7 @@ import type { BbPluginApi, PluginHttpHandler } from "@bb/plugin-sdk";
 import { createPages } from "./pages.js";
 import type { Screencast } from "./screencast.js";
 import { mjpegResponse, registerStreamRoute, STREAM_PATH } from "./stream.js";
+import { fakeBrowser } from "./test-support/fake-browser.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
@@ -295,9 +296,10 @@ describe("registerStreamRoute with the real Pages", () => {
     server = await fakeCdp();
     const browserCdpUrl = vi.fn(async () => server.url);
     const pages = createPages({
-      // Only what PagesDeps.engine actually declares (Pick<Engine,
-      // "browserCdpUrl">) — pages.ts never calls anything else on it.
-      engine: { browserCdpUrl },
+      // Exactly what PagesDeps.engine declares. `run` is there because a
+      // page has to be created by the session that will drive it — only
+      // `tab new --label` assigns the label the command path selects by.
+      engine: { browserCdpUrl, run: fakeBrowser(server).run },
       kv: (() => {
         const store = new Map<string, unknown>();
         return {

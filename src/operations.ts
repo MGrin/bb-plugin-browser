@@ -1,8 +1,23 @@
 // What a browser can be asked to do, in the plugin's own vocabulary.
 //
-// Every operation binds this session to its own page first. Binding is
-// idempotent and costs one process spawn, and it is the reason two threads
-// acting at the same time cannot land on each other's page.
+// Every operation puts this session on its own page first, in the SAME
+// invocation that acts. Not as an optimisation — as the only correct order.
+// Measured against agent-browser 0.33.2:
+//
+//   * `connect ws://host/devtools/page/<id>` ignores the page path. The
+//     session lands on some other tab; which one varies. So connecting is
+//     not binding, and a thread cannot be pointed at its page that way.
+//   * A session's selected tab is silently replaced whenever any new page
+//     appears in the browser — including a background tab another thread
+//     opened over CDP. So selecting once and remembering it is not binding
+//     either: the next thread to open a page moves everyone.
+//
+// What remains is: connect, select this thread's tab, act — as one `batch`,
+// so nothing can slip between the select and the act. A readiness marker is
+// evaluated between them, which is both how the real command's output is
+// found in the batch's combined output and how "the session lost my tab" is
+// told apart from "the command failed", without parsing an error message.
+import { randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -82,44 +97,95 @@ export function assertOpenableUrl(url: string): void {
   }
 }
 
-/** Page-controlled output: ask agent-browser to truncate before it reaches us. */
-const capped = (argv: string[]) => [...argv, "--max-output", String(MAX_OUTPUT_CHARS)];
-
 export function createOperations(deps: OperationsDeps): Operations {
-  async function command(sessionKey: string, argv: string[]): Promise<string> {
-    const profile = await deps.profileFor(sessionKey);
-    const pageUrl = await deps.pages.pageUrlFor(sessionKey, profile);
-
-    // attach: true on BOTH calls, not just the bind. A thread session that
-    // passes --profile asks agent-browser to LAUNCH Chromium against a
-    // profile directory the profile's own browser already holds; Chromium
-    // aborts ("Failed to create a ProcessSingleton for your profile
-    // directory") and the session is dead for every later command.
-    // Measured against agent-browser 0.33.2. Launch mode is the control
-    // session's job alone — browserCdpUrl and shutdown own it inside the
-    // engine, and the engine's ensure-before-attach guarantees the browser
-    // this bind needs is already up.
-    const bind = await deps.engine.run({
-      profile,
+  /**
+   * One spawn: connect, select this thread's tab, prove it, act. `--bail`
+   * means a failure to select stops the batch before the real command runs,
+   * so a session that has lost its tab never acts on somebody else's page —
+   * and retrying afterwards is safe, because nothing happened.
+   */
+  async function attempt(
+    sessionKey: string,
+    binding: { browserWsUrl: string; tab: string },
+    argv: string[],
+    maxOutput?: number,
+  ): Promise<{ bound: boolean; output: string; stderr: string; code: number }> {
+    const marker = `bbready-${randomUUID()}`;
+    // attach: true, always. A thread session that passes --profile asks
+    // agent-browser to LAUNCH Chromium against a profile directory the
+    // profile's own browser already holds; Chromium aborts ("Failed to
+    // create a ProcessSingleton for your profile directory") and the session
+    // is dead for every later command. Launch mode is the control session's
+    // job alone — browserCdpUrl and shutdown own it inside the engine, and
+    // the engine's ensure-before-attach guarantees the browser this connect
+    // needs is already up.
+    const result = await deps.engine.run({
+      profile: await deps.profileFor(sessionKey),
       session: sessionKey,
       attach: true,
-      argv: ["connect", pageUrl],
+      maxOutput,
+      argv: ["batch", "--bail"],
+      // JSON on stdin, not batch's argument form: that form splits each
+      // command string on whitespace, which would tear a selector or a piece
+      // of typed text containing a space into separate arguments.
+      stdin: JSON.stringify([
+        // Every time, not only on the first command: without it a session
+        // whose daemon has been restarted launches a Chromium of its own on
+        // a throwaway profile (measured — a stray browser process, logged
+        // out, that nothing ever closes). It costs nothing measurable when
+        // the session is already connected.
+        ["connect", binding.browserWsUrl],
+        ["tab", binding.tab],
+        ["eval", JSON.stringify(marker)],
+        argv,
+      ]),
     });
-    if (bind.code !== 0) {
-      throw new Error(`could not bind to this thread's page: ${bind.stderr.trim()}`);
+
+    const at = result.stdout.indexOf(marker);
+    if (at === -1) return { bound: false, output: "", stderr: result.stderr, code: result.code };
+    return {
+      bound: true,
+      // Everything the real command printed: the marker is the last thing
+      // before it, and it is a fresh uuid, so no page's own text can be
+      // mistaken for it.
+      output: result.stdout.slice(at + marker.length).replace(/^"/, "").trim(),
+      stderr: result.stderr,
+      code: result.code,
+    };
+  }
+
+  async function command(sessionKey: string, argv: string[], maxOutput?: number): Promise<string> {
+    const profile = await deps.profileFor(sessionKey);
+    let result = await attempt(
+      sessionKey,
+      await deps.pages.bindingFor(sessionKey, profile),
+      argv,
+      maxOutput,
+    );
+
+    if (!result.bound) {
+      // The session could not be put on its tab. The one cause that is
+      // recoverable without a human is its daemon having died, taking its
+      // labels with it while the browser kept running — so give the thread a
+      // fresh, freshly labelled page and try once more. A second failure is
+      // reported rather than retried forever.
+      result = await attempt(sessionKey, await deps.pages.rebind(sessionKey, profile), argv, maxOutput);
+      if (!result.bound) {
+        throw new Error(
+          `could not put this thread on its own page: ${result.stderr.trim() || "no reason given"}`,
+        );
+      }
     }
 
-    const result = await deps.engine.run({
-      profile,
-      session: sessionKey,
-      attach: true,
-      argv,
-    });
     if (result.code !== 0) {
       throw new Error(result.stderr.trim() || `browser command failed: ${argv.join(" ")}`);
     }
-    return result.stdout.trim();
+    return result.output;
   }
+
+  /** Page-controlled output: ask agent-browser to truncate before it reaches us. */
+  const capped = (sessionKey: string, argv: string[]) =>
+    command(sessionKey, argv, MAX_OUTPUT_CHARS);
 
   return {
     // async, so a refused scheme arrives as a rejected promise like every
@@ -131,9 +197,9 @@ export function createOperations(deps: OperationsDeps): Operations {
     },
 
     // read, snapshot and eval are the three that return page-controlled text.
-    read: (sessionKey) => command(sessionKey, capped(["read"])),
+    read: (sessionKey) => capped(sessionKey, ["read"]),
     snapshot: (sessionKey, interactive) =>
-      command(sessionKey, capped(interactive ? ["snapshot", "-i"] : ["snapshot"])),
+      capped(sessionKey, interactive ? ["snapshot", "-i"] : ["snapshot"]),
     click: (sessionKey, selector) => command(sessionKey, ["click", selector]),
 
     async type(sessionKey, selector, text, submit) {
@@ -142,7 +208,7 @@ export function createOperations(deps: OperationsDeps): Operations {
       return command(sessionKey, ["press", "Enter"]);
     },
 
-    evaluate: (sessionKey, expression) => command(sessionKey, capped(["eval", expression])),
+    evaluate: (sessionKey, expression) => capped(sessionKey, ["eval", expression]),
 
     async screenshot(sessionKey) {
       const path = join(

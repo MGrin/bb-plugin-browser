@@ -8,23 +8,60 @@ import {
 
 type Runner = (args: RunArgs) => Promise<RunResult>;
 
-function opsWith(run: Runner | string = "ok") {
+/**
+ * A stand-in agent-browser that understands only as much of `batch` as this
+ * module produces: it decodes the JSON command list off stdin, echoes back
+ * the readiness marker the way `eval` of a string literal would, and hands
+ * the last command to the test's own runner. `bindsWith` drives whether the
+ * marker comes back at all — that is what distinguishes "this session lost
+ * its tab" from "the command failed", and both paths are exercised below.
+ */
+function opsWith(
+  run: Runner | string = "ok",
+  options: { forgetLabel?: boolean; neverBinds?: boolean } = {},
+) {
   const runs: RunArgs[] = [];
-  const stdout = typeof run === "string" ? run : undefined;
+  let labelKnown = !(options.forgetLabel || options.neverBinds);
+  const rebinds: string[] = [];
   const engine = {
     run: async (args: RunArgs) => {
       runs.push(args);
-      return typeof run === "string"
-        ? { stdout, stderr: "", code: 0 } as RunResult
-        : run(args);
+      const steps = JSON.parse(args.stdin ?? "[]") as string[][];
+      const marker = JSON.parse(steps[2]?.[1] ?? '""') as string;
+      const argv = steps[3] ?? [];
+      if (!labelKnown) {
+        // Exactly what the binary does: --bail stops the batch, the real
+        // command never runs, and the marker never reaches stdout.
+        return { stdout: "✓ Done", stderr: "No tab with label `bbpage`", code: 1 } as RunResult;
+      }
+      const inner =
+        typeof run === "string"
+          ? ({ stdout: run, stderr: "", code: 0 } as RunResult)
+          : await run({ ...args, argv });
+      return {
+        stdout: `✓ Done\n\n✓\n\n"${marker}"\n\n${inner.stdout}`,
+        stderr: inner.stderr,
+        code: inner.code,
+      } as RunResult;
     },
     browserCdpUrl: async () => "ws://127.0.0.1:1/devtools/browser/x",
     shutdown: async () => {},
     shutdownAll: async () => {},
   };
   const closed: string[] = [];
+  const binding = {
+    cdpUrl: "ws://127.0.0.1:1/devtools/page/p1",
+    browserWsUrl: "ws://127.0.0.1:1/devtools/browser/x",
+    tab: "bbpage",
+  };
   const pages = {
-    pageUrlFor: async () => "ws://127.0.0.1:1/devtools/page/p1",
+    pageUrlFor: async () => binding.cdpUrl,
+    bindingFor: async () => binding,
+    rebind: async (sessionKey: string) => {
+      rebinds.push(sessionKey);
+      if (!options.neverBinds) labelKnown = true;
+      return binding;
+    },
     existingPageUrl: async () => null,
     existingPageInfo: async () => null,
     closePage: async (sessionKey: string) => {
@@ -35,8 +72,14 @@ function opsWith(run: Runner | string = "ok") {
   return {
     runs,
     closed,
+    rebinds,
+    /** The batch steps of every invocation. */
+    get batches() {
+      return runs.map((args) => JSON.parse(args.stdin ?? "[]") as string[][]);
+    },
+    /** The real command of every invocation — the last step of its batch. */
     get calls() {
-      return runs.map((args) => args.argv);
+      return this.batches.map((steps) => steps[3] ?? []);
     },
     operations: createOperations({
       engine,
@@ -47,11 +90,59 @@ function opsWith(run: Runner | string = "ok") {
 }
 
 describe("operations", () => {
-  it("binds the session to its own page before acting", async () => {
+  // Selecting the tab and acting on it have to be ONE invocation. Measured
+  // against agent-browser 0.33.2: any new page appearing in the browser —
+  // including a background tab another thread opens over CDP — silently
+  // replaces every session's selected tab, so a select in its own spawn is
+  // a select that another thread can undo before the command lands.
+  it("connects, selects this thread's tab and acts in a single invocation", async () => {
     const ops = opsWith();
     await ops.operations.open("thr_a", "https://example.com");
-    expect(ops.calls[0]).toEqual(["connect", "ws://127.0.0.1:1/devtools/page/p1"]);
-    expect(ops.calls[1]).toEqual(["open", "https://example.com"]);
+    expect(ops.runs).toHaveLength(1);
+    expect(ops.runs[0]!.argv).toEqual(["batch", "--bail"]);
+    expect(ops.batches[0]).toEqual([
+      ["connect", "ws://127.0.0.1:1/devtools/browser/x"],
+      ["tab", "bbpage"],
+      ["eval", expect.stringMatching(/^"bbready-/)],
+      ["open", "https://example.com"],
+    ]);
+  });
+
+  // A session whose daemon was restarted has no browser and no labels. Left
+  // to itself it launches a Chromium of its own on a throwaway profile
+  // (measured) — a stray, logged-out browser nothing ever closes.
+  it("connects on every command, not only the first", async () => {
+    const ops = opsWith();
+    await ops.operations.read("thr_a");
+    await ops.operations.read("thr_a");
+    for (const steps of ops.batches) expect(steps[0]![0]).toBe("connect");
+  });
+
+  it("rebinds and retries once when the session has lost its tab", async () => {
+    const ops = opsWith("ok", { forgetLabel: true });
+    await expect(ops.operations.read("thr_a")).resolves.toBe("ok");
+    expect(ops.rebinds).toEqual(["thr_a"]);
+    expect(ops.runs).toHaveLength(2);
+  });
+
+  it("gives up rather than retrying forever when rebinding does not help", async () => {
+    const ops = opsWith("ok", { neverBinds: true });
+    await expect(ops.operations.read("thr_a")).rejects.toThrow(/could not put this thread on its own page/);
+    expect(ops.runs).toHaveLength(2);
+  });
+
+  // `--bail` (asserted above) is what makes the retry safe: the real command
+  // is the step AFTER the tab select, so a failed select stops the batch
+  // before it, and a retry cannot repeat a navigation or a click. What this
+  // test adds is that the retry's output is the command's own, not a
+  // leftover fragment of the failed attempt.
+  it("returns the retried command's own output after a rebind", async () => {
+    const ops = opsWith(
+      async ({ argv }) => ({ stdout: `ran ${argv.join(" ")}`, stderr: "", code: 0 }),
+      { forgetLabel: true },
+    );
+    const text = await ops.operations.read("thr_a");
+    expect(text).toBe("ran read");
   });
 
   // A thread session that passes --profile makes Chromium abort on the
@@ -79,27 +170,32 @@ describe("operations", () => {
   it("reads page text", async () => {
     const ops = opsWith("Example Domain");
     const text = await ops.operations.read("thr_a");
-    expect(ops.calls[1]).toEqual(["read", "--max-output", String(MAX_OUTPUT_CHARS)]);
+    expect(ops.calls[0]).toEqual(["read"]);
+    // The cap is a GLOBAL flag: inside a batch a step carrying it is rejected
+    // ("Unknown subcommand: --max-output"), so it rides on the invocation.
+    expect(ops.runs[0]!.maxOutput).toBe(MAX_OUTPUT_CHARS);
     expect(text).toBe("Example Domain");
   });
 
   it("asks for an interactive snapshot when requested", async () => {
     const ops = opsWith();
     await ops.operations.snapshot("thr_a", true);
-    expect(ops.calls[1]).toEqual(["snapshot", "-i", "--max-output", String(MAX_OUTPUT_CHARS)]);
+    expect(ops.calls[0]).toEqual(["snapshot", "-i"]);
+    expect(ops.runs[0]!.maxOutput).toBe(MAX_OUTPUT_CHARS);
   });
 
   it("asks for the full snapshot when not", async () => {
     const ops = opsWith();
     await ops.operations.snapshot("thr_a", false);
-    expect(ops.calls[1]).toEqual(["snapshot", "--max-output", String(MAX_OUTPUT_CHARS)]);
+    expect(ops.calls[0]).toEqual(["snapshot"]);
+    expect(ops.runs[0]!.maxOutput).toBe(MAX_OUTPUT_CHARS);
   });
 
   it("types and submits in one call", async () => {
     const ops = opsWith();
     await ops.operations.type("thr_a", "#q", "hello", true);
-    expect(ops.calls[1]).toEqual(["fill", "#q", "hello"]);
-    expect(ops.calls[3]).toEqual(["press", "Enter"]);
+    expect(ops.calls[0]).toEqual(["fill", "#q", "hello"]);
+    expect(ops.calls[1]).toEqual(["press", "Enter"]);
   });
 
   it("does not press Enter when submit is false", async () => {
@@ -145,12 +241,10 @@ describe("operations", () => {
   });
 
   it("surfaces a failing command as an error", async () => {
-    const ops = opsWith(async ({ argv }) =>
-      argv[0] === "connect"
-        ? { stdout: "", stderr: "", code: 0 }
-        : { stdout: "", stderr: "no such element", code: 1 },
-    );
+    const ops = opsWith(async () => ({ stdout: "", stderr: "no such element", code: 1 }));
     await expect(ops.operations.click("thr_a", "#gone")).rejects.toThrow(/no such element/);
+    // The command's own failure, not a binding failure — no retry.
+    expect(ops.rebinds).toEqual([]);
   });
 
   // file:// + read is a local-file exfiltration path, reachable by injection
@@ -190,7 +284,7 @@ describe("operations", () => {
       it(`still opens ${url}`, async () => {
         const ops = opsWith();
         await ops.operations.open("thr_a", url);
-        expect(ops.calls[1]).toEqual(["open", url]);
+        expect(ops.calls[0]).toEqual(["open", url]);
       });
     }
   });
@@ -209,15 +303,13 @@ describe("operations", () => {
   it("does not cap commands whose output the page does not control", async () => {
     const ops = opsWith();
     await ops.operations.click("thr_a", "#go");
-    expect(ops.calls[1]).toEqual(["click", "#go"]);
+    expect(ops.calls[0]).toEqual(["click", "#go"]);
   });
 
-  it("says so when the bind itself fails", async () => {
-    const ops = opsWith(async ({ argv }) =>
-      argv[0] === "connect"
-        ? { stdout: "", stderr: "connect refused", code: 1 }
-        : { stdout: "ok", stderr: "", code: 0 },
+  it("says so, naming the reason, when it cannot reach this thread's page at all", async () => {
+    const ops = opsWith("ok", { neverBinds: true });
+    await expect(ops.operations.read("thr_a")).rejects.toThrow(
+      /could not put this thread on its own page.*No tab with label/s,
     );
-    await expect(ops.operations.read("thr_a")).rejects.toThrow(/bind.*connect refused/s);
   });
 });

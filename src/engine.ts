@@ -8,10 +8,34 @@
 import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { agentBrowserNamespace, launchArgs } from "./identity.js";
 
-const run = promisify(execFile);
+/**
+ * execFile, but with stdin. `promisify(execFile)` hands back only the
+ * output, and `batch` takes its command list on stdin — so the callback form
+ * is used here purely to get at the ChildProcess and write to it. stdin is
+ * always closed, including when there is nothing to send: a `batch` left
+ * waiting for EOF would hang forever, and no other command reads it.
+ */
+function runBinary(binary: string, argv: string[], stdin?: string): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      binary,
+      argv,
+      { maxBuffer: 32 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const failure = error as (Error & { code?: number }) | null;
+        if (!failure) return resolve({ stdout, stderr, code: 0 });
+        resolve({
+          stdout,
+          stderr: stderr || String(error),
+          code: typeof failure.code === "number" ? failure.code : 1,
+        });
+      },
+    );
+    child.stdin?.end(stdin ?? "");
+  });
+}
 
 export interface EngineOptions {
   /**
@@ -53,6 +77,21 @@ export interface RunArgs {
    * attaching to a browser someone else already started.
    */
   attach?: boolean;
+  /**
+   * Text piped to the process's stdin. `batch` reads its command list as
+   * JSON from stdin, which is the only form that survives arguments
+   * containing spaces and quotes — its argument form splits each command
+   * string on whitespace, so a selector or a piece of typed text with a
+   * space in it would be torn into separate arguments.
+   */
+  stdin?: string;
+  /**
+   * agent-browser's `--max-output`, which truncates page-controlled text.
+   * It is a GLOBAL flag: inside `batch`, a step that carries it is rejected
+   * with "Unknown subcommand: --max-output" (measured), so the cap has to be
+   * declared once for the whole invocation, before the subcommand.
+   */
+  maxOutput?: number;
 }
 
 export interface RunResult {
@@ -101,6 +140,7 @@ export function createEngine(options: EngineOptions): Engine {
 
   async function baseArgs(args: RunArgs): Promise<string[]> {
     const flags = ["--namespace", agentBrowserNamespace, "--session", args.session];
+    if (args.maxOutput !== undefined) flags.push("--max-output", String(args.maxOutput));
     if (!args.attach) {
       flags.push("--profile", await profileDir(args.profile), "--args", launchArgs);
       // Launch mode only: --headed describes a browser being started, and an
@@ -114,19 +154,7 @@ export function createEngine(options: EngineOptions): Engine {
     const dir = await profileDir(args.profile);
     await mkdir(dir, { recursive: true });
     live.add(args.profile);
-    try {
-      const { stdout, stderr } = await run(binary, [...(await baseArgs(args)), ...args.argv], {
-        maxBuffer: 32 * 1024 * 1024,
-      });
-      return { stdout, stderr, code: 0 };
-    } catch (error) {
-      const failure = error as { stdout?: string; stderr?: string; code?: number };
-      return {
-        stdout: failure.stdout ?? "",
-        stderr: failure.stderr ?? String(error),
-        code: typeof failure.code === "number" ? failure.code : 1,
-      };
-    }
+    return runBinary(binary, [...(await baseArgs(args)), ...args.argv], args.stdin);
   }
 
   async function browserCdpUrl(profile: string): Promise<string> {
