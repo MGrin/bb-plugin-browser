@@ -46,6 +46,15 @@ export interface Engine {
   shutdownAll(): Promise<void>;
 }
 
+/**
+ * The session name the engine uses for its own profile-level commands
+ * (cdp-url lookups, shutdown) rather than a thread's page session. Exported
+ * so callers can reference or avoid colliding with it.
+ */
+export function controlSessionFor(profile: string): string {
+  return `${profile}-control`;
+}
+
 export function createEngine(options: EngineOptions): Engine {
   const binary = options.binary ?? "agent-browser";
   const live = new Set<string>();
@@ -100,7 +109,7 @@ export function createEngine(options: EngineOptions): Engine {
     async browserCdpUrl(profile) {
       const result = await exec({
         profile,
-        session: `${profile}-control`,
+        session: controlSessionFor(profile),
         argv: ["get", "cdp-url"],
       });
       const url = result.stdout.trim().split("\n").pop()?.trim() ?? "";
@@ -112,7 +121,7 @@ export function createEngine(options: EngineOptions): Engine {
 
     async shutdown(profile) {
       if (!live.has(profile)) return;
-      await exec({ profile, session: `${profile}-control`, argv: ["close", "--all"] });
+      await exec({ profile, session: controlSessionFor(profile), argv: ["close"] });
       live.delete(profile);
       options.log(`closed browser for profile ${profile}`);
     },
