@@ -7,7 +7,12 @@ afterEach(async () => { await server?.close(); });
 
 function screencastFor(url: string) {
   return createScreencast({
-    pages: { pageUrlFor: async () => url, closePage: async () => {}, forget: async () => {} },
+    pages: {
+      pageUrlFor: async () => url,
+      existingPageUrl: async () => null,
+      closePage: async () => {},
+      forget: async () => {},
+    },
     quality: 60,
     maxWidth: 1280,
   });
@@ -220,7 +225,12 @@ describe("screencast", () => {
     server = await fakeCdp();
     const gate = deferred<string>();
     const screencast = createScreencast({
-      pages: { pageUrlFor: async () => gate.promise, closePage: async () => {}, forget: async () => {} },
+      pages: {
+        pageUrlFor: async () => gate.promise,
+        existingPageUrl: async () => null,
+        closePage: async () => {},
+        forget: async () => {},
+      },
       quality: 60,
       maxWidth: 1280,
     });
@@ -246,6 +256,7 @@ describe("screencast", () => {
           pageUrlForCalls += 1;
           return pageUrlForCalls === 1 ? gate.promise : server.url;
         },
+        existingPageUrl: async () => null,
         closePage: async () => {},
         forget: async () => {},
       },
@@ -315,6 +326,7 @@ describe("screencast", () => {
           if (pageUrlForCalls === 2) return gateB.promise;
           return server.url;
         },
+        existingPageUrl: async () => null,
         closePage: async () => {},
         forget: async () => {},
       },

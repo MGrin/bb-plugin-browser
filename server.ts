@@ -56,7 +56,7 @@ export default async function plugin(bb: BbPluginApi) {
   const screencast = createScreencast({ pages, quality: 60, maxWidth: 1280 });
   // Same single profile as operations above — one cookie jar, one browser,
   // for now.
-  registerStreamRoute(bb, screencast, async () => defaultProfile);
+  registerStreamRoute(bb, screencast, pages, resolveSessionKey, async () => defaultProfile);
 
   registerTools(bb, operations, resolveSessionKey);
   registerCli(bb, operations, resolveSessionKey);

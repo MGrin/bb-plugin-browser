@@ -31,6 +31,15 @@ interface Binding {
 export interface Pages {
   /** The page-level CDP websocket for this session, creating it if needed. */
   pageUrlFor(sessionKey: string, profile: string): Promise<string>;
+  /**
+   * The bound page's CDP websocket if a binding exists and its target is
+   * still open — `null` otherwise. Unlike `pageUrlFor`, a miss here is never
+   * a reason to create anything: this exists so a viewer (the stream route)
+   * can ask "is there a real page to watch?" without ever being the reason
+   * one gets spawned. Read-only: a stale binding is left exactly as found,
+   * for `pageUrlFor` to reconcile on the next real use.
+   */
+  existingPageUrl(sessionKey: string): Promise<string | null>;
   closePage(sessionKey: string): Promise<void>;
   forget(sessionKey: string): Promise<void>;
 }
@@ -103,6 +112,15 @@ export function createPages(deps: PagesDeps): Pages {
 
   return {
     pageUrlFor,
+
+    async existingPageUrl(sessionKey) {
+      const bound = await deps.kv.get<Binding>(key(sessionKey));
+      if (!bound) return null;
+      const browserUrl = await deps.engine.browserCdpUrl(bound.profile);
+      const open = await targets(browserUrl);
+      if (!open.some((target) => target.targetId === bound.targetId)) return null;
+      return pageUrl(browserUrl, bound.targetId);
+    },
 
     async closePage(sessionKey) {
       const bound = await deps.kv.get<Binding>(key(sessionKey));

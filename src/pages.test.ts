@@ -83,6 +83,37 @@ describe("pages", () => {
     expect(server.targets).toHaveLength(0);
   });
 
+  it("existingPageUrl returns null and touches nothing when no page was ever opened", async () => {
+    server = await fakeCdp();
+    const pages = pagesFor(server.url);
+    const url = await pages.existingPageUrl("thr_never_opened");
+    expect(url).toBeNull();
+    // The whole point: a viewer asking about a session nobody drove yet must
+    // never be the reason a page gets created.
+    expect(server.received.some((m) => m.method === "Target.createTarget")).toBe(false);
+  });
+
+  it("existingPageUrl returns the bound page's url when it is still open", async () => {
+    server = await fakeCdp();
+    const pages = pagesFor(server.url);
+    const created = await pages.pageUrlFor("thr_a", "main");
+    const found = await pages.existingPageUrl("thr_a");
+    expect(found).toBe(created);
+    // Only the one create from pageUrlFor above — the lookup itself must
+    // never create a second page.
+    expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(1);
+  });
+
+  it("existingPageUrl returns null, and does not create, when the bound target vanished", async () => {
+    server = await fakeCdp();
+    const pages = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    server.targets = [];
+    const found = await pages.existingPageUrl("thr_a");
+    expect(found).toBeNull();
+    expect(server.received.filter((m) => m.method === "Target.createTarget")).toHaveLength(1);
+  });
+
   it("closePage clears the binding even when Target.closeTarget errors", async () => {
     server = await fakeCdp();
     const pages = pagesFor(server.url);

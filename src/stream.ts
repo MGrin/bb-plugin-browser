@@ -12,7 +12,9 @@
 // token in the query string is what lets this load over the Cloudflare
 // tunnel from a phone that has no cookie jar shared with the bb app origin.
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { Pages } from "./pages.js";
 import type { Screencast } from "./screencast.js";
+import type { SessionKeyResolver } from "./session-key.js";
 
 const BOUNDARY = "bbbrowserframe";
 
@@ -20,76 +22,87 @@ export type FrameSource = (
   onFrame: (jpegBase64: string) => void,
 ) => Promise<() => void>;
 
-export function mjpegResponse(subscribe: FrameSource): Response {
-  let unsubscribe: (() => void) | null = null;
-  // Set on every termination path — cancel(), an enqueue that throws because
-  // the client is already gone, and a cancel that lands while subscribe() is
-  // still in flight. Once true, the cast is either already unsubscribed or
-  // about to be the moment `unsubscribe` is assigned; no path may double-fire
-  // or skip it.
+// `subscribe` is resolved to completion before any Response is constructed
+// (review finding 6): a subscribe that rejects — the page vanished in the
+// narrow gap between the route's existence check and here, say — must
+// produce a real error status and a readable body, not an <img> stuck on a
+// 200 whose multipart body immediately errors out with no diagnostic. This
+// also means a client can never cancel while subscribe() is still pending:
+// there is no Response, and therefore no reader, until subscribe already
+// settled.
+export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
+  // Bridges subscribe()'s onFrame (armed immediately) to the
+  // ReadableStream's controller (which cannot exist until subscribe has
+  // already resolved). The two are guaranteed to line up before any frame
+  // this module's own onFrame is ever handed can arrive: nothing here
+  // awaits between `unsub = await subscribe(...)` resolving and `start()`
+  // running synchronously inside `new ReadableStream(...)` just below it.
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+  // Guards `unsub()` against firing twice as independent termination
+  // signals race each other (a client cancel and a write failure can both
+  // observe the same dead connection).
   let stopped = false;
+  let unsub: () => void = () => {};
 
   function stop(): void {
     if (stopped) return;
     stopped = true;
-    unsubscribe?.();
+    unsub();
+  }
+
+  try {
+    unsub = await subscribe((jpegBase64) => {
+      const controller = controllerRef;
+      if (!controller || stopped) return;
+
+      // The honest backpressure signal on a default ReadableStream
+      // controller is desiredSize: at or below zero means the consumer
+      // has not drained what's already queued. `enqueue` itself has no
+      // opinion — it accepts chunks regardless of whether anyone is
+      // reading, so a "wrote last time" flag would let an unbounded
+      // backlog build the instant the client can't keep up. A stale frame
+      // is worthless to a live view, so the fix here is to drop it, not
+      // buffer it: memory for a slow viewer belongs in that viewer's own
+      // pipe, never in this process, and never at the expense of every
+      // other viewer sharing this session's cast.
+      if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
+
+      const frame = Buffer.from(jpegBase64, "base64");
+      try {
+        // All three enqueues happen in one synchronous turn under one
+        // desiredSize check, so a frame is either written whole or not at
+        // all — nothing here can leave a dangling header with no body on
+        // the wire.
+        controller.enqueue(
+          Buffer.from(
+            `--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
+            "binary",
+          ),
+        );
+        controller.enqueue(frame);
+        controller.enqueue(Buffer.from("\r\n", "binary"));
+      } catch {
+        // enqueue throws once the client is gone and the controller has
+        // been errored/closed out from under us by something other than
+        // our own cancel() below (some runtimes never call cancel() for
+        // that case — a dropped socket mid-write surfaces only here).
+        // Release the cast's reference right here instead of waiting for a
+        // cancel() that may not come.
+        stop();
+      }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return new Response(`stream unavailable: ${message}`, {
+      status: 502,
+      headers: { "content-type": "text/plain" },
+    });
   }
 
   const body = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        unsubscribe = await subscribe((jpegBase64) => {
-          if (stopped) return;
-
-          // The honest backpressure signal on a default ReadableStream
-          // controller is desiredSize: at or below zero means the consumer
-          // has not drained what's already queued. `enqueue` itself has no
-          // opinion — it accepts chunks regardless of whether anyone is
-          // reading, so a "wrote last time" flag (as opposed to this) would
-          // let an unbounded backlog build the instant the client can't keep
-          // up. A stale frame is worthless to a live view, so the fix here
-          // is to drop it, not to buffer it: memory for a slow viewer belongs
-          // in that viewer's own pipe, never in this process.
-          if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
-
-          const frame = Buffer.from(jpegBase64, "base64");
-          try {
-            // All three enqueues happen in one synchronous turn under one
-            // desiredSize check, so a frame is either written whole or not
-            // at all — nothing here can leave a dangling header with no
-            // body on the wire.
-            controller.enqueue(
-              Buffer.from(
-                `--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
-                "binary",
-              ),
-            );
-            controller.enqueue(frame);
-            controller.enqueue(Buffer.from("\r\n", "binary"));
-          } catch {
-            // enqueue throws once the client is gone and the controller has
-            // been errored/closed out from under us. Some runtimes never
-            // call cancel() for that case, so this is the only signal we
-            // get — release the cast's reference right here instead of
-            // waiting for a cancel() that may not come.
-            stop();
-          }
-        });
-      } catch (error) {
-        // subscribe() itself rejected (e.g. the page vanished mid-start).
-        // Nothing to unsubscribe from, but the stream must still end.
-        stop();
-        throw error;
-      }
-
-      if (stopped) {
-        // The client cancelled while subscribe() was still in flight:
-        // `stop()` ran with `unsubscribe` still null and had nothing to
-        // call. Finish the job now that it exists, or this cast would sit
-        // subscribed — encoding frames for nobody — until some other
-        // subscriber happens to unsubscribe it.
-        unsubscribe();
-      }
+    start(controller) {
+      controllerRef = controller;
     },
     cancel() {
       stop();
@@ -107,25 +120,43 @@ export function mjpegResponse(subscribe: FrameSource): Response {
 
 // The path carries no session key: bb's plugin HTTP dispatcher matches a
 // registered route path by exact string equality, not by pattern (verified
-// against the running host — see task-8-report.md) — a literal
-// "/stream/:sessionKey" registration can never match a real request path
-// like "/stream/thr_abc123". The first-party `tasks` plugin hits the same
-// constraint and works around it the same way: a static path plus the id in
-// the query string (its /attachments/download?attachmentId=... route). This
-// mirrors that.
+// against the running host's dispatcher source — see task-8-report.md) — a
+// literal "/stream/:sessionKey" registration can never match a real request
+// path like "/stream/thr_abc123". The first-party `tasks` plugin hits the
+// same constraint and works around it the same way: a static path plus the
+// id in the query string (its /attachments/download?attachmentId=... route).
+// This mirrors that.
 export const STREAM_PATH = "/stream";
 
 export function registerStreamRoute(
   bb: BbPluginApi,
   screencast: Screencast,
+  pages: Pick<Pages, "existingPageUrl">,
+  resolveSessionKey: SessionKeyResolver,
   profileFor: (sessionKey: string) => Promise<string>,
 ): void {
   bb.http.route(
     "GET",
     STREAM_PATH,
     async (context) => {
-      const sessionKey = context.req.query("sessionKey");
-      if (!sessionKey) return new Response("missing sessionKey", { status: 400 });
+      // A thread id, never a session key: session keys are derived
+      // server-side (docs/design.md, "Session keys are derived server-side
+      // from the calling thread, never accepted as a parameter") — a caller
+      // that could hand us an arbitrary session key could spawn or attach
+      // to a page it has no business watching.
+      const threadId = context.req.query("threadId");
+      if (!threadId) return new Response("missing threadId", { status: 400 });
+
+      const sessionKey = await resolveSessionKey(threadId);
+
+      // Never creates. A thread with no page open yet — or whose page
+      // already closed — gets a 404, not a freshly minted about:blank tab
+      // nobody asked for: watching must never be the reason a page exists.
+      const existing = await pages.existingPageUrl(sessionKey);
+      if (!existing) {
+        return new Response("no page open for this thread", { status: 404 });
+      }
+
       const profile = await profileFor(sessionKey);
       return mjpegResponse((onFrame) => screencast.subscribe(sessionKey, profile, onFrame));
     },
