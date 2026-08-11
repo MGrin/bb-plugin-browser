@@ -1,3 +1,4 @@
+import { createServer, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 
 export interface FakeCdp {
@@ -24,7 +25,21 @@ export interface FakeCdp {
 }
 
 export async function fakeCdp(): Promise<FakeCdp> {
-  const server = new WebSocketServer({ port: 0 });
+  // A real `http.Server`, not the bare internal one `new WebSocketServer({
+  // port })` would make for itself: pages.ts's origin probe hits plain HTTP
+  // GET /json/version on the same port real Chrome serves it on, alongside
+  // the WS upgrade — so a fake that only handles upgrades can no longer
+  // stand in for a real browser.
+  const httpServer: Server = createServer((req, res) => {
+    if (req.url === "/json/version") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: state.url }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const server = new WebSocketServer({ server: httpServer });
   const clients = new Set<WebSocket>();
   const silenced = new Set<string>();
   const failing = new Map<string, string>();
@@ -50,6 +65,10 @@ export async function fakeCdp(): Promise<FakeCdp> {
     async close() {
       for (const client of clients) client.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      // `WebSocketServer` attached to an external server (the `{ server }`
+      // option above) never closes that server itself — without this, the
+      // HTTP listener (and therefore the port) would leak past the test.
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },
   };
 
@@ -102,8 +121,8 @@ export async function fakeCdp(): Promise<FakeCdp> {
     });
   });
 
-  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
-  const address = server.address();
+  await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
+  const address = httpServer.address();
   const port = typeof address === "object" && address ? address.port : 0;
   state.url = `ws://127.0.0.1:${port}/devtools/browser/fake`;
   return state;

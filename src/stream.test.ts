@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi, PluginHttpHandler } from "@bb/plugin-sdk";
-import type { Pages } from "./pages.js";
+import { createPages } from "./pages.js";
 import type { Screencast } from "./screencast.js";
 import { mjpegResponse, registerStreamRoute, STREAM_PATH } from "./stream.js";
+import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
 
@@ -172,6 +173,9 @@ function fakeContext(query: Record<string, string | undefined>): Parameters<Plug
   } as unknown as Parameters<PluginHttpHandler>[0];
 }
 
+let server: FakeCdp;
+afterEach(async () => { await server?.close(); });
+
 function fakeScreencast(subscribe: Screencast["subscribe"] = vi.fn(async () => () => {})): Screencast {
   return {
     subscribe,
@@ -257,5 +261,54 @@ describe("registerStreamRoute", () => {
     const chunk = await reader.read();
     expect(Buffer.from(chunk.value!).toString("binary")).toContain("Content-Type: image/jpeg");
     await reader.cancel();
+  });
+});
+
+// End to end with the real Pages (not a stub for existingPageUrl): proves
+// the whole route→pages chain, not just pages.ts in isolation, never falls
+// back to a launch-capable lookup for a session whose browser is gone —
+// the same defect class as "viewing creates a page", one level up.
+describe("registerStreamRoute with the real Pages", () => {
+  it("404s for a thread whose bound browser is gone, without ever calling engine.browserCdpUrl again", async () => {
+    server = await fakeCdp();
+    const browserCdpUrl = vi.fn(async () => server.url);
+    const pages = createPages({
+      // Only what PagesDeps.engine actually declares (Pick<Engine,
+      // "browserCdpUrl">) — pages.ts never calls anything else on it.
+      engine: { browserCdpUrl },
+      kv: (() => {
+        const store = new Map<string, unknown>();
+        return {
+          get: async <T,>(k: string) => store.get(k) as T | undefined,
+          set: async (k: string, v: unknown) => { store.set(k, v); },
+          delete: async (k: string) => { store.delete(k); },
+        };
+      })(),
+      log: () => {},
+    });
+
+    // A real page, really created — the one call to browserCdpUrl this test
+    // permits.
+    await pages.pageUrlFor("key-for-thr_a", "main");
+    expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+
+    // The browser (and the machine, in the scenario this regression-tests)
+    // is gone by the time the stream request arrives.
+    await server.close();
+
+    const { bb, routes } = fakeBbHttp();
+    registerStreamRoute(
+      bb,
+      fakeScreencast(),
+      pages,
+      async (threadId) => `key-for-${threadId}`,
+      async () => "main",
+    );
+
+    const response = await routes[0].handler(fakeContext({ threadId: "thr_a" }));
+    expect(response.status).toBe(404);
+    // The whole point: a stream request against a stale binding must not
+    // be the reason a browser process gets launched.
+    expect(browserCdpUrl).toHaveBeenCalledTimes(1);
   });
 });

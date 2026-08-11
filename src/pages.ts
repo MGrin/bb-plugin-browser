@@ -14,7 +14,12 @@ interface TargetInfo {
 }
 
 export interface PagesDeps {
-  engine: Pick<Engine, "browserCdpUrl" | "run">;
+  // "run" was never called anywhere in this file even before this round's
+  // fix — only browserCdpUrl ever was. Narrowing the Pick to match is a
+  // deliberate correction (not just what silences a test fixture's excess-
+  // property error), and it also closes the over-declared-deps gap between
+  // what this module asks for and what it actually uses.
+  engine: Pick<Engine, "browserCdpUrl">;
   kv: {
     get<T>(key: string): Promise<T | undefined>;
     set(key: string, value: unknown): Promise<void>;
@@ -26,6 +31,16 @@ export interface PagesDeps {
 interface Binding {
   profile: string;
   targetId: string;
+  /**
+   * The browser's DevTools HTTP origin (e.g. "http://127.0.0.1:9222") at
+   * the moment this page was created. Lets a read-only lookup confirm the
+   * browser is alive with a plain HTTP probe instead of going through
+   * `engine.browserCdpUrl`, which is launch mode and would start Chromium
+   * just to answer the question. Absent on bindings written before this
+   * field existed — those are treated as unreachable, never as licence to
+   * call `browserCdpUrl` to find out.
+   */
+  origin?: string;
 }
 
 export interface Pages {
@@ -49,6 +64,40 @@ const key = (sessionKey: string) => `page:${sessionKey}`;
 function pageUrl(browserUrl: string, targetId: string): string {
   const base = new URL(browserUrl);
   return `${base.protocol}//${base.host}/devtools/page/${targetId}`;
+}
+
+/** The plain-HTTP origin backing a CDP websocket URL, for `/json/version`. */
+function httpOriginOf(browserUrl: string): string {
+  const base = new URL(browserUrl);
+  return `${base.protocol === "wss:" ? "https:" : "http:"}//${base.host}`;
+}
+
+// A local process is either already answering or plainly isn't — there is
+// no reason to wait anywhere near CDP's normal 30s command timeout to find
+// out, and every caller of this (existingPageUrl, closePage) is a read-only
+// or best-effort path that must resolve quickly rather than stall a stream
+// route or a cleanup on a dead port.
+const PROBE_TIMEOUT_MS = 750;
+
+/**
+ * The browser's current, live CDP websocket URL, discovered by asking its
+ * DevTools HTTP endpoint directly — never by calling `engine.browserCdpUrl`,
+ * which is launch mode and would start a browser to answer this. `null`
+ * covers every failure uniformly (connection refused, timeout, a stale port
+ * now held by something else, a malformed response): none of them are a
+ * reason to try harder or fall back to launching.
+ */
+async function probeBrowserUrl(origin: string): Promise<string | null> {
+  try {
+    const response = await fetch(`${origin}/json/version`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { webSocketDebuggerUrl?: unknown };
+    return typeof body.webSocketDebuggerUrl === "string" ? body.webSocketDebuggerUrl : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createPages(deps: PagesDeps): Pages {
@@ -80,7 +129,12 @@ export function createPages(deps: PagesDeps): Pages {
       const created = await session.send<{ targetId: string }>("Target.createTarget", {
         url: "about:blank",
       });
-      await deps.kv.set(key(sessionKey), { profile, targetId: created.targetId });
+      const binding: Binding = {
+        profile,
+        targetId: created.targetId,
+        origin: httpOriginOf(browserUrl),
+      };
+      await deps.kv.set(key(sessionKey), binding);
       deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
       return pageUrl(browserUrl, created.targetId);
     } finally {
@@ -115,8 +169,12 @@ export function createPages(deps: PagesDeps): Pages {
 
     async existingPageUrl(sessionKey) {
       const bound = await deps.kv.get<Binding>(key(sessionKey));
-      if (!bound) return null;
-      const browserUrl = await deps.engine.browserCdpUrl(bound.profile);
+      // No origin covers both "never bound" and "bound before this field
+      // existed" — either way, there is nothing to probe, so this must
+      // report "no page" rather than fall back to a launch-capable lookup.
+      if (!bound?.origin) return null;
+      const browserUrl = await probeBrowserUrl(bound.origin);
+      if (!browserUrl) return null;
       const open = await targets(browserUrl);
       if (!open.some((target) => target.targetId === bound.targetId)) return null;
       return pageUrl(browserUrl, bound.targetId);
@@ -125,7 +183,26 @@ export function createPages(deps: PagesDeps): Pages {
     async closePage(sessionKey) {
       const bound = await deps.kv.get<Binding>(key(sessionKey));
       if (!bound) return;
-      const browserUrl = await deps.engine.browserCdpUrl(bound.profile);
+
+      if (!bound.origin) {
+        // A pre-origin binding: there is no way to confirm a browser is
+        // even there without launching one, and a cold-start cleanup must
+        // not do that. Treat as already gone.
+        deps.log(`closePage: ${sessionKey} has no recorded origin, clearing binding without probing`);
+        await deps.kv.delete(key(sessionKey));
+        return;
+      }
+
+      const browserUrl = await probeBrowserUrl(bound.origin);
+      if (!browserUrl) {
+        // Unreachable: the page this binding names cannot exist either, so
+        // there is nothing to close through CDP — just drop the binding
+        // rather than launching a browser to close a page in it.
+        deps.log(`closePage: browser for ${sessionKey} not reachable at ${bound.origin}, clearing binding`);
+        await deps.kv.delete(key(sessionKey));
+        return;
+      }
+
       const session = await openCdp(browserUrl);
       try {
         await session.send("Target.closeTarget", { targetId: bound.targetId });
