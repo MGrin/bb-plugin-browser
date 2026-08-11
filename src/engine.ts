@@ -69,6 +69,14 @@ export function controlSessionFor(profile: string): string {
 export function createEngine(options: EngineOptions): Engine {
   const binary = options.binary ?? "agent-browser";
   const live = new Set<string>();
+  // Profiles this engine instance has confirmed have a browser running,
+  // via a launch-mode cdp-url call — the precondition attach mode relies
+  // on. Deliberately not derived from `live`: `live` is in-memory process
+  // state that resets on a plugin reload or bb restart while the
+  // agent-browser daemon and its browser keep running, so treating an
+  // empty `live` as "not running" would misfire on the most ordinary case
+  // there is. Cleared per-profile on shutdown so a later attach re-ensures.
+  const ensured = new Set<string>();
   let dataDir: string | undefined;
 
   async function resolveDataDir(): Promise<string> {
@@ -89,7 +97,7 @@ export function createEngine(options: EngineOptions): Engine {
     return flags;
   }
 
-  async function exec(args: RunArgs): Promise<RunResult> {
+  async function execRaw(args: RunArgs): Promise<RunResult> {
     const dir = await profileDir(args.profile);
     await mkdir(dir, { recursive: true });
     live.add(args.profile);
@@ -108,26 +116,44 @@ export function createEngine(options: EngineOptions): Engine {
     }
   }
 
+  async function browserCdpUrl(profile: string): Promise<string> {
+    const result = await execRaw({
+      profile,
+      session: controlSessionFor(profile),
+      argv: ["get", "cdp-url"],
+    });
+    const url = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+    if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
+      throw new Error(`no cdp endpoint for profile ${profile}: ${result.stdout || result.stderr}`);
+    }
+    return url;
+  }
+
+  async function exec(args: RunArgs): Promise<RunResult> {
+    if (args.attach && !ensured.has(args.profile)) {
+      // Runs once per profile per engine lifetime, not once per command:
+      // browserCdpUrl is launch mode and idempotent — it starts the
+      // browser if none is running yet and just returns the endpoint if
+      // one already is. Every later attach call for this profile, within
+      // this engine instance, skips straight past this block. If it
+      // throws, we let it propagate: an attach that can't guarantee a
+      // browser must fail loudly rather than silently launch one without
+      // the anti-detection args.
+      await browserCdpUrl(args.profile);
+      ensured.add(args.profile);
+    }
+    return execRaw(args);
+  }
+
   return {
     run: exec,
-
-    async browserCdpUrl(profile) {
-      const result = await exec({
-        profile,
-        session: controlSessionFor(profile),
-        argv: ["get", "cdp-url"],
-      });
-      const url = result.stdout.trim().split("\n").pop()?.trim() ?? "";
-      if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
-        throw new Error(`no cdp endpoint for profile ${profile}: ${result.stdout || result.stderr}`);
-      }
-      return url;
-    },
+    browserCdpUrl,
 
     async shutdown(profile) {
       if (!live.has(profile)) return;
-      await exec({ profile, session: controlSessionFor(profile), argv: ["close"] });
+      await execRaw({ profile, session: controlSessionFor(profile), argv: ["close"] });
       live.delete(profile);
+      ensured.delete(profile);
       options.log(`closed browser for profile ${profile}`);
     },
 

@@ -60,14 +60,18 @@ describe("engine.run", () => {
   });
 
   it("omits --profile and --args when attaching to an already-running browser", async () => {
-    const { binary, engine } = engineWith();
+    // A valid ws:// stdout so the attach's ensure-first-use step (a
+    // launch-mode cdp-url call) succeeds and doesn't mask this assertion.
+    const { binary, engine } = engineWith("ws://127.0.0.1:9222/devtools/browser/abc\n");
     await engine.run({
       profile: "main",
       session: "thr_a",
       argv: ["get", "url"],
       attach: true,
     });
-    const call = binary.calls()[0];
+    // calls[0] is the ensure step's launch-mode cdp-url call; calls[1] is
+    // the actual attach invocation under test here.
+    const call = binary.calls()[1];
     expect(call).not.toContain("--profile");
     expect(call).not.toContain("--args");
     expect(call.join(" ")).not.toContain("--disable-blink-features=AutomationControlled");
@@ -155,5 +159,37 @@ describe("engine.shutdownAll", () => {
     const callsBeforeSecondShutdown = binary.calls().length;
     await engine.shutdownAll();
     expect(binary.calls().length).toBe(callsBeforeSecondShutdown);
+  });
+});
+
+describe("engine.run attach ensures a browser first", () => {
+  it("triggers a launch-mode get cdp-url before the first attach for a profile", async () => {
+    const { binary, engine } = engineWith("ws://127.0.0.1:9222/devtools/browser/abc\n");
+    await engine.run({ profile: "main", session: "thr_a", argv: ["get", "url"], attach: true });
+    const calls = binary.calls();
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain("cdp-url");
+    expect(calls[0]).toContain("--profile");
+    expect(calls[1]).not.toContain("--profile");
+    expect(calls[1]).toContain("thr_a");
+  });
+
+  it("does not re-ensure on a second attach for the same profile", async () => {
+    const { binary, engine } = engineWith("ws://127.0.0.1:9222/devtools/browser/abc\n");
+    await engine.run({ profile: "main", session: "thr_a", argv: ["get", "url"], attach: true });
+    expect(binary.calls()).toHaveLength(2);
+    await engine.run({ profile: "main", session: "thr_b", argv: ["get", "url"], attach: true });
+    const calls = binary.calls();
+    expect(calls).toHaveLength(3);
+    expect(calls.filter((call) => call.includes("cdp-url"))).toHaveLength(1);
+  });
+
+  it("re-ensures after shutdown clears the profile", async () => {
+    const { binary, engine } = engineWith("ws://127.0.0.1:9222/devtools/browser/abc\n");
+    await engine.run({ profile: "main", session: "thr_a", argv: ["get", "url"], attach: true });
+    await engine.shutdown("main");
+    await engine.run({ profile: "main", session: "thr_b", argv: ["get", "url"], attach: true });
+    const cdpUrlCalls = binary.calls().filter((call) => call.includes("cdp-url"));
+    expect(cdpUrlCalls).toHaveLength(2);
   });
 });
