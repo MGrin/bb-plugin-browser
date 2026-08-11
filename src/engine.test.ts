@@ -1,9 +1,19 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { controlSessionFor, createEngine } from "./engine.js";
 import { fakeAgentBrowser } from "./test-support/fake-agent-browser.js";
+
+// Every test in this file spawns at least one real process (a shell script
+// standing in for agent-browser, which is the only honest way to assert on
+// argv). Process spawn is the one cost here that scales with what else the
+// machine is doing: at load average ~30 these tests take seconds rather than
+// milliseconds, and vitest's 5s default turned that into 5-10 spurious
+// failures per full-suite run — the "flaky under CPU contention" note that
+// has been carried since Task 8. Nothing is asserted less strictly; only the
+// deadline moves, and it moves for the file that actually forks.
+vi.setConfig({ testTimeout: 30_000 });
 
 function engineWith(stdout?: string, headed?: () => Promise<boolean>) {
   const binary = fakeAgentBrowser(stdout);

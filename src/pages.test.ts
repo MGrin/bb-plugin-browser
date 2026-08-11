@@ -579,7 +579,15 @@ describe("pages", () => {
  * are those things.
  */
 describe("a CDP connect that never completes", () => {
-  async function until(predicate: () => boolean, what: string, timeoutMs = 3_000) {
+  /**
+   * Short enough that four tests waiting it out cost about a second, long
+   * enough that a LEGITIMATE local websocket handshake still fits inside it
+   * on a machine under load — an earlier 50ms made these tests fail on a
+   * box at load average 31, which is a test defect and not a finding.
+   */
+  const CONNECT_TIMEOUT_MS = 300;
+
+  async function until(predicate: () => boolean, what: string, timeoutMs = 5_000) {
     const deadline = Date.now() + timeoutMs;
     while (!predicate()) {
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
@@ -589,10 +597,10 @@ describe("a CDP connect that never completes", () => {
 
   it("rejects the call instead of leaving it pending", async () => {
     server = await fakeCdp();
-    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: CONNECT_TIMEOUT_MS } });
     server.holdConnections();
     await expect(pages.pageUrlFor("thr_a", "main")).rejects.toThrow(/connect timed out/);
-  }, 5_000);
+  }, 8_000);
 
   // The composed consequence, and the reason this was a Critical rather
   // than an annoyance: `inflight` entries are deleted in a `finally`, so a
@@ -601,7 +609,7 @@ describe("a CDP connect that never completes", () => {
   // One thread's unlucky moment becomes its permanent state.
   it("does not leave the session's coalescing entry dead for every later call", async () => {
     server = await fakeCdp();
-    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: CONNECT_TIMEOUT_MS } });
 
     server.holdConnections();
     await expect(pages.pageUrlFor("thr_a", "main")).rejects.toThrow();
@@ -612,18 +620,18 @@ describe("a CDP connect that never completes", () => {
     await expect(pages.pageUrlFor("thr_a", "main")).resolves.toMatch(
       /\/devtools\/page\/tab-1$/,
     );
-  }, 5_000);
+  }, 8_000);
 
   it("rejects every caller coalesced onto the hung resolution, not just the first", async () => {
     server = await fakeCdp();
-    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: CONNECT_TIMEOUT_MS } });
     server.holdConnections();
     const settled = await Promise.allSettled([
       pages.pageUrlFor("thr_a", "main"),
       pages.pageUrlFor("thr_a", "main"),
     ]);
     expect(settled.map((outcome) => outcome.status)).toEqual(["rejected", "rejected"]);
-  }, 5_000);
+  }, 8_000);
 
   // The other composed consequence: `runSweeps` awaits `sweep()`, which
   // awaits `listOpenPages`. A hang there stops the reaper for the plugin's
@@ -632,7 +640,7 @@ describe("a CDP connect that never completes", () => {
   // is tabs quietly accumulating forever.
   it("does not stop the reaper's sweep loop for the life of the plugin", async () => {
     server = await fakeCdp();
-    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: 50 } });
+    const { pages } = pagesFor(server.url, { cdp: { connectTimeoutMs: CONNECT_TIMEOUT_MS } });
     await pages.pageUrlFor("thr_a", "main");
 
     const listed: string[] = [];
@@ -669,5 +677,5 @@ describe("a CDP connect that never completes", () => {
       controller.abort();
       await loop;
     }
-  }, 10_000);
+  }, 15_000);
 });
