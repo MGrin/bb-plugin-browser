@@ -10,6 +10,7 @@ import { createOperations } from "./src/operations.js";
 import { createPages } from "./src/pages.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
 import { registerTools, TOOL_NAMES } from "./src/tools.js";
+import { registerCli } from "./src/cli.js";
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -51,12 +52,14 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerTools(bb, operations, resolveSessionKey);
+  registerCli(bb, operations, resolveSessionKey);
 
   // Registering a tool only makes it exist; `configure` is what puts it in a
-  // session's tool set. `skills` stays empty until Task 6 writes
-  // skills/browser/SKILL.md — naming a skill this plugin's manifest cannot
-  // resolve rejects the whole selection, tools included.
-  bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: [] }));
+  // session's tool set. A `configure()` return is accepted or rejected as a
+  // whole, so naming a skill this plugin's manifest cannot resolve would
+  // silently drop the tools too — skills/browser/SKILL.md must resolve for
+  // this to have any effect.
+  bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 
   bb.onDispose(async () => {
     await engine.shutdownAll();
