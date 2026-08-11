@@ -59,6 +59,31 @@ describe("engine.run", () => {
     expect(result.code).toBe(0);
   });
 
+  it("omits --profile and --args when attaching to an already-running browser", async () => {
+    const { binary, engine } = engineWith();
+    await engine.run({
+      profile: "main",
+      session: "thr_a",
+      argv: ["get", "url"],
+      attach: true,
+    });
+    const call = binary.calls()[0];
+    expect(call).not.toContain("--profile");
+    expect(call).not.toContain("--args");
+    expect(call.join(" ")).not.toContain("--disable-blink-features=AutomationControlled");
+    expect(call).toContain("--namespace");
+    expect(call).toContain("bb-plugin-browser");
+    expect(call).toContain("thr_a");
+  });
+
+  it("passes --profile when not attaching, exactly as a launch does today", async () => {
+    const { binary, dataDir, engine } = engineWith();
+    await engine.run({ profile: "main", session: "thr_a", argv: ["get", "url"] });
+    const call = binary.calls()[0];
+    expect(call).toContain("--profile");
+    expect(call.join(" ")).toContain(join(dataDir, "plugins", "browser", "profiles", "main"));
+  });
+
   it("resolves the dataDir thunk lazily and caches it", async () => {
     const binary = fakeAgentBrowser();
     const dataDir = mkdtempSync(join(tmpdir(), "bb-browser-data-"));

@@ -31,6 +31,17 @@ export interface RunArgs {
   session: string;
   argv: string[];
   headed?: boolean;
+  /**
+   * True for a session that attaches to a profile's already-running
+   * browser rather than launching it. `--profile` is omitted: passing it
+   * on a connect call makes agent-browser try to launch a second Chromium
+   * against a profile directory another process already holds, which
+   * aborts on a SingletonLock conflict and kills the session for every
+   * later command. `--args` (launch args) is also omitted — it configures
+   * how Chromium is launched, and there is no launch to configure when
+   * attaching to a browser someone else already started.
+   */
+  attach?: boolean;
 }
 
 export interface RunResult {
@@ -70,16 +81,10 @@ export function createEngine(options: EngineOptions): Engine {
   }
 
   async function baseArgs(args: RunArgs): Promise<string[]> {
-    const flags = [
-      "--namespace",
-      agentBrowserNamespace,
-      "--session",
-      args.session,
-      "--profile",
-      await profileDir(args.profile),
-      "--args",
-      launchArgs,
-    ];
+    const flags = ["--namespace", agentBrowserNamespace, "--session", args.session];
+    if (!args.attach) {
+      flags.push("--profile", await profileDir(args.profile), "--args", launchArgs);
+    }
     if (args.headed) flags.push("--headed");
     return flags;
   }
