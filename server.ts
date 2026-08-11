@@ -8,7 +8,9 @@ import { createEngine } from "./src/engine.js";
 import { defaultProfile } from "./src/identity.js";
 import { createOperations } from "./src/operations.js";
 import { createPages } from "./src/pages.js";
+import { createScreencast } from "./src/screencast.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
+import { registerStreamRoute } from "./src/stream.js";
 import { registerTools, TOOL_NAMES } from "./src/tools.js";
 import { registerCli } from "./src/cli.js";
 
@@ -51,6 +53,11 @@ export default async function plugin(bb: BbPluginApi) {
     profileFor: async () => defaultProfile,
   });
 
+  const screencast = createScreencast({ pages, quality: 60, maxWidth: 1280 });
+  // Same single profile as operations above — one cookie jar, one browser,
+  // for now.
+  registerStreamRoute(bb, screencast, async () => defaultProfile);
+
   registerTools(bb, operations, resolveSessionKey);
   registerCli(bb, operations, resolveSessionKey);
 
@@ -62,6 +69,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 
   bb.onDispose(async () => {
+    screencast.stopAll();
     await engine.shutdownAll();
   });
 }
