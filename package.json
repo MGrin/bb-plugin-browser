@@ -9,7 +9,6 @@
     "description": "A browser inside bb: agents drive pages, you watch and take over from any device.",
     "branding": { "icon": "Globe" },
     "server": "./server.ts",
-    "app": "./app.tsx",
     "skills": ["skills"]
   },
   "scripts": {
