@@ -5,10 +5,15 @@ import { describe, expect, it } from "vitest";
 import { controlSessionFor, createEngine } from "./engine.js";
 import { fakeAgentBrowser } from "./test-support/fake-agent-browser.js";
 
-function engineWith(stdout?: string) {
+function engineWith(stdout?: string, headed?: () => Promise<boolean>) {
   const binary = fakeAgentBrowser(stdout);
   const dataDir = mkdtempSync(join(tmpdir(), "bb-browser-data-"));
-  const engine = createEngine({ dataDir: async () => dataDir, log: () => {}, binary: binary.path });
+  const engine = createEngine({
+    dataDir: async () => dataDir,
+    headed,
+    log: () => {},
+    binary: binary.path,
+  });
   return { binary, dataDir, engine };
 }
 
@@ -44,12 +49,53 @@ describe("engine.run", () => {
     expect(binary.calls()[1]).toContain("thr_b");
   });
 
-  it("adds --headed only when asked", async () => {
+  it("stays headless when no headed thunk is supplied", async () => {
     const { binary, engine } = engineWith();
     await engine.run({ profile: "main", session: "s", argv: ["get", "url"] });
-    await engine.run({ profile: "main", session: "s", argv: ["get", "url"], headed: true });
+    expect(binary.calls()[0]).not.toContain("--headed");
+  });
+
+  it("adds --headed to a launch when the thunk says so", async () => {
+    const { binary, engine } = engineWith(undefined, async () => true);
+    await engine.run({ profile: "main", session: "s", argv: ["get", "url"] });
+    expect(binary.calls()[0]).toContain("--headed");
+  });
+
+  // --headed configures a launch, and an attach launches nothing. Passing it
+  // on an attach is a no-op that reads like a working feature.
+  it("never adds --headed to an attach, even when the thunk says true", async () => {
+    const { binary, engine } = engineWith(
+      "ws://127.0.0.1:9222/devtools/browser/abc\n",
+      async () => true,
+    );
+    await engine.run({ profile: "main", session: "s", argv: ["get", "url"], attach: true });
+    const calls = binary.calls();
+    expect(calls[0]).toContain("--headed"); // the ensure step's launch
+    expect(calls[1]).not.toContain("--headed"); // the attach itself
+  });
+
+  // The setting can change between launches; capturing it once would mean a
+  // relaunch still used the old value.
+  it("re-reads the headed thunk on every launch", async () => {
+    let headed = false;
+    const { binary, engine } = engineWith(undefined, async () => headed);
+    await engine.run({ profile: "main", session: "s", argv: ["get", "url"] });
+    headed = true;
+    await engine.run({ profile: "main", session: "s", argv: ["get", "url"] });
     expect(binary.calls()[0]).not.toContain("--headed");
     expect(binary.calls()[1]).toContain("--headed");
+  });
+
+  // browserCdpUrl is the one path that actually starts a browser, so if it
+  // does not carry --headed the setting can never do anything.
+  it("adds --headed to the control session's launch that starts the browser", async () => {
+    const { binary, engine } = engineWith(
+      "ws://127.0.0.1:9222/devtools/browser/abc\n",
+      async () => true,
+    );
+    await engine.browserCdpUrl("main");
+    expect(binary.calls()[0]).toContain("cdp-url");
+    expect(binary.calls()[0]).toContain("--headed");
   });
 
   it("returns stdout and the exit code", async () => {

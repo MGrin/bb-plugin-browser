@@ -27,6 +27,10 @@ export default async function plugin(bb: BbPluginApi) {
     // server is listening, and this factory runs first. The engine resolves
     // it on first use and caches it for its lifetime.
     dataDir: async () => (await bb.sdk.system.config()).dataDir,
+    // Read at every launch, so changing the setting and relaunching the
+    // browser is enough. The engine applies it only to launch-mode runs —
+    // an attach has no window to open.
+    headed: async () => (await settings.get()).headed,
     log: (message) => bb.log.info(message),
   });
 
@@ -44,7 +48,6 @@ export default async function plugin(bb: BbPluginApi) {
     // One profile for now, so every thread shares one cookie jar and one
     // browser. Per-project profiles are a later task's decision.
     profileFor: async () => defaultProfile,
-    headedFor: async () => (await settings.get()).headed,
   });
 
   registerTools(bb, operations, resolveSessionKey);

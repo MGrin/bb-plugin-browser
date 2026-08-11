@@ -21,6 +21,18 @@ export interface EngineOptions {
    * and cached for the engine's lifetime.
    */
   dataDir: () => Promise<string>;
+  /**
+   * Whether a browser this engine launches should show a window. A thunk,
+   * resolved at every launch rather than captured once, so changing the
+   * setting and relaunching the browser is enough to make it take effect.
+   *
+   * It lives here rather than on RunArgs because --headed configures a
+   * LAUNCH, and attach-mode runs launch nothing: passing it there was a knob
+   * that silently did nothing, which is exactly how the setting came to be
+   * inert. The only launch path is browserCdpUrl's control session, so this
+   * is the only place the answer is ever needed. Defaults to headless.
+   */
+  headed?: () => Promise<boolean>;
   log: (message: string) => void;
   /** Overridable for tests. */
   binary?: string;
@@ -30,7 +42,6 @@ export interface RunArgs {
   profile: string;
   session: string;
   argv: string[];
-  headed?: boolean;
   /**
    * True for a session that attaches to a profile's already-running
    * browser rather than launching it. `--profile` is omitted: passing it
@@ -92,8 +103,10 @@ export function createEngine(options: EngineOptions): Engine {
     const flags = ["--namespace", agentBrowserNamespace, "--session", args.session];
     if (!args.attach) {
       flags.push("--profile", await profileDir(args.profile), "--args", launchArgs);
+      // Launch mode only: --headed describes a browser being started, and an
+      // attach has no launch to describe.
+      if (await options.headed?.()) flags.push("--headed");
     }
-    if (args.headed) flags.push("--headed");
     return flags;
   }
 
