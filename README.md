@@ -1,11 +1,11 @@
 # bb-plugin-browser
 
-A real browser for bb's agents. One [Brave](https://brave.com) on a profile of
-its own, **one tab per thread**, headless by default — and on screen the moment
-a human is needed.
+A real browser for bb's agents. One installed browser on a profile of its own,
+**one tab per thread**, headless by default — and on screen the moment a human
+is needed.
 
 ```
-Brave (real app, agents' profile, one process)
+Your browser (real app, agents' profile, one process)
 ├── tab → thread A     agent A drives it
 ├── tab → thread B     agent B drives it, cannot touch A's
 └── tab → yours        never closed by the plugin
@@ -16,12 +16,27 @@ logged in for every thread. What they do not share is a tab.
 
 ## Install
 
-Requires Brave at `/Applications/Brave Browser.app` and bb ≥ 0.36.
+Requires bb ≥ 0.36 and a Chromium-family browser you already have.
 
 ```sh
 npm install          # playwright-core is loaded at runtime, not bundled
 bb plugin install .
 ```
+
+## Which browser it drives
+
+Anything Chromium-family: **Brave, Chrome, Chromium, Edge, Vivaldi, Opera**.
+Everything here is the DevTools Protocol, so the vendor does not matter. The
+first one installed is detected automatically, in that order.
+
+To pin a different one, set the plugin's **Browser binary** setting to its
+executable — for example `/Applications/Google Chrome.app/Contents/MacOS/Google
+Chrome`. `bb browser status` prints which browser is in use and whether it was
+detected or configured. A change takes effect at the next launch, so
+`bb browser quit` to apply it now.
+
+**Firefox and Safari cannot be used.** They do not speak CDP; pointing the
+setting at either produces a browser that starts and then never answers.
 
 ## For agents
 
@@ -48,8 +63,8 @@ bb browser quit     # close the shared browser
 Plus the same eight page commands (`bb browser open <url>`, `read`, `click`…).
 
 **Logging in:** the agents' profile starts empty. When a thread needs a site
-you are signed into, it calls `browser_show`; you log in once in that Brave
-window and it persists for every thread, across reloads and restarts.
+you are signed into, it calls `browser_show`; you log in once in that window
+and it persists for every thread, across reloads and restarts.
 
 **Your tabs are yours.** The idle reaper only ever closes tabs the plugin
 opened. A tab you open in that window is left alone however long it sits there.
@@ -69,7 +84,7 @@ thread has its own tab and its own CDP session.
 
 ```sh
 npm test         # fast, no browser, runs anywhere
-npm run test:live   # starts a real Brave; the tests that matter
+npm run test:live   # starts a real browser; the tests that matter
 ```
 
 The live suite is separate on purpose. It covers the four things v1's 335 unit

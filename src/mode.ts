@@ -11,7 +11,7 @@
 // one visible consequence worth being honest about: in-page state does not
 // survive the switch. A half-typed form is lost; the page it was on is not,
 // and neither is the login, because the profile directory is untouched.
-import type { BrowserMode } from "./brave.js";
+import type { BrowserMode } from "./launch.js";
 
 export interface ModeDeps {
   currentMode(): Promise<BrowserMode>;

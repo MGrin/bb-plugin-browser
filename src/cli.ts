@@ -8,6 +8,44 @@ import type { SessionKeyResolver } from "./session-key.js";
 const ok = (stdout: string): PluginCliResult => ({ exitCode: 0, stdout });
 const fail = (stderr: string): PluginCliResult => ({ exitCode: 1, stderr });
 
+/** What the browser sits on with nothing loaded — see `tabLabel`. */
+const BLANK_URLS = new Set([
+  "about:blank",
+  "chrome://newtab/",
+  "chrome://new-tab-page/",
+  "brave://newtab/",
+]);
+
+export interface TabRow {
+  url: string;
+  sessionKey: string | null;
+  ours: boolean;
+}
+
+/**
+ * How a tab is described in `bb browser tabs`.
+ *
+ * This is a whole named function because the label it replaced was actively
+ * misleading: every unbound tab the plugin had not opened was called "yours",
+ * including the blank tab the BROWSER opens at startup. A thread reading its
+ * own listing saw an authoritative-sounding "yours" row on about:blank next to
+ * its real page, and the reasonable conclusion — "my navigation failed" — was
+ * the opposite of the truth.
+ *
+ * So: never claim whose a tab is when that is not known. The startup tab is
+ * named as what it is, an unrecognised tab says only that this plugin did not
+ * open it, and the caller's own row is marked so it does not have to be found
+ * by matching a thread id by eye.
+ */
+export function tabLabel(tab: TabRow, callerKey: string): string {
+  if (tab.sessionKey) {
+    return tab.sessionKey === callerKey ? `${tab.sessionKey} (this thread)` : tab.sessionKey;
+  }
+  if (tab.ours) return "(agent tab, unbound)";
+  if (BLANK_URLS.has(tab.url)) return "(browser startup tab)";
+  return "(not opened by bb)";
+}
+
 export interface CliBrowser {
   /** Bring the browser on screen for the human. */
   show(): Promise<string>;
@@ -15,6 +53,8 @@ export interface CliBrowser {
   hide(): Promise<string>;
   /** Which mode it is in right now. */
   current(): Promise<"headless" | "headed">;
+  /** Which browser is being driven, and where it came from. */
+  describe(): Promise<string>;
   /** Close the shared browser. False when there was nothing running. */
   quit(): Promise<boolean>;
   /** Every open tab: ours and the human's alike. */
@@ -63,16 +103,11 @@ export async function runCli(
         if (!browser) return fail("tabs is not available here");
         const tabs = await browser.listTabs();
         if (tabs.length === 0) return ok("no tabs open");
+        // Whose tab this is matters more than its id: the plugin never closes
+        // one that is not its own, and seeing which is which is the point of
+        // listing them.
         return ok(
-          tabs
-            .map((tab) => {
-              // Whose tab this is matters more than its id: the plugin never
-              // closes one that is not its own, and seeing which is which is
-              // the point of listing them.
-              const who = tab.sessionKey ? tab.sessionKey : tab.ours ? "(ours, unbound)" : "yours";
-              return `${who.padEnd(24)} ${tab.url}`;
-            })
-            .join("\n"),
+          tabs.map((tab) => `${tabLabel(tab, sessionKey).padEnd(28)} ${tab.url}`).join("\n"),
         );
       }
       case "show": {
@@ -85,9 +120,20 @@ export async function runCli(
       }
       case "status": {
         if (!browser) return fail("status is not available here");
-        const [mode, tabs] = await Promise.all([browser.current(), browser.listTabs()]);
-        const ours = tabs.filter((tab) => tab.ours).length;
-        return ok(`${mode}, ${tabs.length} tab(s) open (${ours} opened by agents)`);
+        const [mode, tabs, which] = await Promise.all([
+          browser.current(),
+          browser.listTabs(),
+          browser.describe(),
+        ]);
+        // Broken out by kind rather than "N open, M ours": the leftover was
+        // the browser's own blank startup tab, and a bare remainder made it
+        // look like a stray nobody could account for.
+        const parts = [
+          `${tabs.filter((tab) => tab.ours).length} opened by agents`,
+          `${tabs.filter((tab) => !tab.ours && BLANK_URLS.has(tab.url)).length} browser startup`,
+          `${tabs.filter((tab) => !tab.ours && !BLANK_URLS.has(tab.url)).length} not ours`,
+        ];
+        return ok(`${which}\n${mode}, ${tabs.length} tab(s): ${parts.join(", ")}`);
       }
       case "quit": {
         if (!browser) return fail("quit is not available here");

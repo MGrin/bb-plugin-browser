@@ -1,10 +1,11 @@
-// Starting — or finding — the one real Brave that agents share.
+// Starting — or finding — the one real browser that agents share.
 //
 // v1 downloaded Chrome for Testing, which announces itself as "only for
 // automated testing", never updates, and is not the browser anyone actually
-// uses. This launches the real /Applications/Brave Browser.app against a
-// profile directory of its own, so it is a normal browser with a normal window
-// that happens to accept CDP.
+// uses. This launches an INSTALLED Chromium-family browser — whichever one
+// `src/browsers.ts` detects, or whichever one the `browserPath` setting names
+// — against a profile directory of its own, so it is a normal browser with a
+// normal window that happens to accept CDP.
 //
 // The rule that v1 got wrong, and the reason this module has no `stop()`:
 // THE BROWSER OUTLIVES THE PLUGIN. v1 shut its browser down whenever the
@@ -17,14 +18,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-
-/**
- * Where Brave lives. Only the real app — never a downloaded automation build.
- * Checked at launch so a missing Brave is a clear message rather than a spawn
- * error nobody can act on.
- */
-export const BRAVE_BINARY =
-  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
+import { resolveBrowser } from "./browsers.js";
 
 /**
  * Chromium writes the port it actually bound here, inside the profile. Asking
@@ -48,11 +42,15 @@ const MODE_FILE = "bb-mode";
 
 export type BrowserMode = "headless" | "headed";
 
-export interface BraveOptions {
+export interface LaunchOptions {
   /** The profile directory this browser owns. Never a human's profile. */
   profileDir: string;
   log: (message: string) => void;
-  /** Overridable for tests; defaults to the real Brave. */
+  /**
+   * A specific browser binary to use. When unset, the first Chromium-family
+   * browser installed on this machine is detected. Comes from the plugin's
+   * `browserPath` setting in normal use, and from the test in the live suite.
+   */
   binary?: string;
   /**
    * How to launch if nothing is running. Headless is the default because most
@@ -67,7 +65,7 @@ export interface BraveOptions {
   mode?: BrowserMode;
 }
 
-export interface BraveEndpoint {
+export interface BrowserEndpoint {
   /** e.g. "http://127.0.0.1:53211" — what Playwright's connectOverCDP takes. */
   httpEndpoint: string;
   port: number;
@@ -119,8 +117,7 @@ async function answersOn(port: number): Promise<boolean> {
  *                               not hygiene: an X account was locked in August
  *                               because a browser without it was detected.
  */
-export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoint> {
-  const binary = options.binary ?? BRAVE_BINARY;
+export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndpoint> {
   const wanted: BrowserMode = options.mode ?? "headless";
   await mkdir(options.profileDir, { recursive: true });
 
@@ -136,12 +133,11 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
     };
   }
 
-  if (!existsSync(binary)) {
-    throw new Error(
-      `Brave is not installed at ${binary}. The agents' browser is the real Brave, ` +
-        "not a downloaded automation build — install Brave or point BRAVE_BINARY at it.",
-    );
-  }
+  // Resolved here rather than at the top of the function ON PURPOSE: attaching
+  // to a browser that is already running must not depend on being able to find
+  // a binary. Otherwise a machine whose browser moved — an upgrade, a rename —
+  // would lose its running session to an error about how to start a new one.
+  const { name, path: binary } = resolveBrowser(options.binary);
 
   // Detached, and stdio ignored: this browser is meant to outlive the plugin
   // load that started it. Keeping a pipe open would tie its lifetime to ours,
@@ -157,6 +153,12 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
       // Chromium's modern headless: the same renderer as headed, so a page
       // does not render differently depending on whether anyone is looking.
       ...(wanted === "headless" ? ["--headless=new"] : []),
+      // Load-bearing, not cosmetic. Chromium exits when its last target
+      // closes, so without a tab that nothing ever reaps, the moment the
+      // reaper cleared the last idle agent tab the whole shared browser would
+      // go with it — taking every other thread's session and every login.
+      // This tab is never bound to a thread and never owned, so it survives.
+      // `bb browser tabs` names it, rather than implying a human opened it.
       "about:blank",
     ],
     { detached: true, stdio: "ignore" },
@@ -168,14 +170,15 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
     const port = await runningPort(options.profileDir);
     if (port) {
       await writeFile(join(options.profileDir, MODE_FILE), wanted, "utf8");
-      options.log(`started the agents' browser on port ${port} (${wanted})`);
+      options.log(`started ${name} for agents on port ${port} (${wanted})`);
       return { httpEndpoint: `http://127.0.0.1:${port}`, port, launched: true, mode: wanted };
     }
     await sleep(200);
   }
   throw new Error(
-    `Brave did not publish a debugging port within ${LAUNCH_TIMEOUT_MS}ms — ` +
-      `check ${join(options.profileDir, PORT_FILE)}`,
+    `${name} did not publish a debugging port within ${LAUNCH_TIMEOUT_MS}ms — ` +
+      `check ${join(options.profileDir, PORT_FILE)}. If ${binary} is not a ` +
+      "Chromium-family browser it will never publish one; Firefox and Safari cannot be used.",
   );
 }
 
