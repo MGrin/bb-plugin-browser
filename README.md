@@ -87,16 +87,15 @@ npm test         # fast, no browser, runs anywhere
 npm run test:live   # starts a real browser; the tests that matter
 ```
 
-The live suite is separate on purpose. It covers the four things v1's 335 unit
-tests could not: a tab surviving **time**, surviving a **plugin reload**,
-surviving a **second thread**, and a **human's tab** never being closed. Each
-one corresponds to a failure that actually happened — see `docs/design-v2.md`.
+The live suite is separate on purpose. It covers the four things a unit test
+cannot: a tab surviving **time**, surviving a **plugin reload**, surviving a
+**second thread**, and a **human's tab** never being closed. Each one
+corresponds to a failure that actually happened.
 
-## History
-
-`docs/design.md` describes v1, which streamed the browser into a bb panel. It
-is kept for the reasoning, not as a description of this plugin.
-`docs/design-v2.md` is what exists now, including why the panel is gone.
+Chromium needs to create a ProcessSingleton socket under `/tmp`, so under a
+restrictive sandbox the browser aborts at startup and the failure reads like a
+plugin bug. `BB_BROWSER_TEST_PROFILE_ROOT` moves the throwaway profiles, but
+the socket path is Chromium's own — run the live suite outside the sandbox.
 
 ## Credits
 
