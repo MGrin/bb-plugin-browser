@@ -72,6 +72,7 @@ function opsWith(
       closed.push(sessionKey);
     },
     forget: async () => {},
+    captureForRestore: async () => {},
   };
   // Every call the reaper is told about, in order — "watch thr_a", "touch
   // thr_a" and so on. Order is the whole point: a hold taken after the

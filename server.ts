@@ -172,6 +172,9 @@ export default async function plugin(bb: BbPluginApi) {
         );
         // The casts point at pages that are about to stop existing.
         screencast.stopAll();
+        // Where each thread was, so its next page can go back there rather
+        // than coming up blank for a reason that had nothing to do with it.
+        await pages.captureForRestore(defaultProfile);
         // Through `pages`, not `engine`: closing the browser and forgetting
         // where it was are one act. A remembered address outlives its
         // browser by pointing at a freed ephemeral port, and the next

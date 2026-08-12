@@ -779,3 +779,76 @@ describe("a CDP connect that never completes", () => {
     }
   }, 15_000);
 });
+
+// Toggling `headed` closes the browser, which takes every page with it. A
+// thread that was working somewhere would otherwise come back to a blank tab
+// for a reason that had nothing to do with it.
+describe("restoring where a thread was after a relaunch", () => {
+  /** Every `open` a session ran, decoded out of the batch payloads. */
+  const opened = (browser: { calls: { stdin?: string }[] }) =>
+    browser.calls
+      .flatMap((call) => JSON.parse(call.stdin ?? "[]") as string[][])
+      .filter((argv) => argv[0] === "open")
+      .map((argv) => argv[1]);
+
+  it("puts the session's next page back where it was", async () => {
+    server = await fakeCdp();
+    const { pages, kv, browser } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    server.targets = server.targets.map((target) =>
+      target.targetId === "tab-1" ? { ...target, url: "https://example.com/deep" } : target,
+    );
+
+    await pages.captureForRestore("main");
+    expect(await kv.get("restore:thr_a")).toMatchObject({ url: "https://example.com/deep" });
+
+    // The relaunch: the browser is gone, so the next command creates a page.
+    server.targets = [];
+    await pages.pageUrlFor("thr_a", "main");
+    expect(opened(browser)).toContain("https://example.com/deep");
+    // Used once and dropped, so it cannot fire again later.
+    expect(await kv.get("restore:thr_a")).toBeUndefined();
+  });
+
+  it("does not restore a capture that has gone stale", async () => {
+    server = await fakeCdp();
+    const { pages, kv, browser } = pagesFor(server.url);
+    await kv.set("restore:thr_a", {
+      profile: "main",
+      url: "https://example.com/old",
+      at: Date.now() - 60 * 60_000,
+    });
+    await pages.pageUrlFor("thr_a", "main");
+    expect(opened(browser)).not.toContain("https://example.com/old");
+    expect(await kv.get("restore:thr_a")).toBeUndefined();
+  });
+
+  it("captures nothing for a tab no thread is bound to", async () => {
+    server = await fakeCdp();
+    const { pages, kv } = pagesFor(server.url);
+    // A bound page first: without one there is no remembered browser address,
+    // so the listing comes back empty and this would pass without reaching
+    // the rule it is meant to check.
+    await pages.pageUrlFor("thr_a", "main");
+    server.targets = [
+      ...server.targets.map((target) =>
+        target.targetId === "tab-1" ? { ...target, url: "https://example.com/mine" } : target,
+      ),
+      { targetId: "someone-elses", type: "page", url: "https://example.org/" },
+    ];
+
+    await pages.captureForRestore("main");
+    // The human's tab is not a thread's page to put back.
+    expect(await kv.list("restore:")).toEqual(["restore:thr_a"]);
+  });
+
+  it("captures nothing for a page that is not on a real destination", async () => {
+    server = await fakeCdp();
+    const { pages, kv } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    // Left on the create marker: restoring a blank tab is just a blank tab,
+    // with a stale record left behind to expire.
+    await pages.captureForRestore("main");
+    expect(await kv.list("restore:")).toEqual([]);
+  });
+});
