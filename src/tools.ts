@@ -4,10 +4,10 @@
 // parameter, so one thread cannot address another thread's page.
 import { z } from "zod";
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { ALLOWED_SCHEMES, assertOpenableUrl, type Operations } from "./operations.js";
+import { ALLOWED_SCHEMES, assertOpenableUrl, type Actions } from "./actions.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
-/** The schema's view of the same rule Operations enforces by throwing. */
+/** The schema's view of the same rule Actions enforces by throwing. */
 function isOpenableUrl(value: string): boolean {
   try {
     assertOpenableUrl(value);
@@ -35,7 +35,7 @@ export const TOOL_NAMES = [
 
 export function registerTools(
   bb: BbPluginApi,
-  operations: Operations,
+  operations: Actions,
   resolveSessionKey: SessionKeyResolver,
 ): void {
   const tool = <Schema extends z.ZodType>(
@@ -53,7 +53,7 @@ export function registerTools(
 
   // http/https only. z.url() alone accepts file://, javascript: and data:,
   // and `open` + `read` on a file:// url is a local-file reader — reachable
-  // by injection from any page the agent is already reading. Operations
+  // by injection from any page the agent is already reading. Actions
   // enforces the same rule, so this schema is the message to the model, not
   // the security boundary.
   tool(

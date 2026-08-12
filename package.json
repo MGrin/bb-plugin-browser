@@ -9,12 +9,11 @@
   },
   "bb": {
     "name": "Browser",
-    "description": "A browser inside bb: agents drive pages, you watch and take over from any device.",
+    "description": "One real Brave shared by every agent: a tab per thread, and a window you can take over.",
     "branding": {
       "icon": "Globe"
     },
     "server": "./server.ts",
-    "app": "./app.tsx",
     "skills": [
       "skills"
     ]

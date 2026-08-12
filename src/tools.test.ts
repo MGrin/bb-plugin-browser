@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { z } from "zod";
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import type { Operations } from "./operations.js";
+import type { Actions } from "./actions.js";
 import { registerTools, TOOL_NAMES } from "./tools.js";
 
 interface Registered {
@@ -13,7 +13,7 @@ interface Registered {
     | Promise<unknown>;
 }
 
-function fakeOperations() {
+function fakeActions() {
   return {
     open: vi.fn(async () => "opened"),
     read: vi.fn(async () => "page text"),
@@ -23,10 +23,10 @@ function fakeOperations() {
     evaluate: vi.fn(async () => "42"),
     screenshot: vi.fn(async () => ({ base64: "aGVsbG8=" })),
     close: vi.fn(async () => "closed"),
-  } satisfies Record<keyof Operations, unknown>;
+  } satisfies Record<keyof Actions, unknown>;
 }
 
-function register(operations = fakeOperations()) {
+function register(operations = fakeActions()) {
   const tools: Registered[] = [];
   const bb = {
     agents: { registerTool: (tool: Registered) => tools.push(tool) },
@@ -38,7 +38,7 @@ function register(operations = fakeOperations()) {
     threadId ? `key-for-${threadId}` : "scratch",
   );
 
-  registerTools(bb, operations as unknown as Operations, resolveSessionKey);
+  registerTools(bb, operations as unknown as Actions, resolveSessionKey);
   const byName = (name: string) => {
     const tool = tools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error(`tool not registered: ${name}`);

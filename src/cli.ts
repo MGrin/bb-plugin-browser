@@ -2,14 +2,14 @@
 // agents that would rather type a command.
 import { writeFile } from "node:fs/promises";
 import type { BbPluginApi, PluginCliResult } from "@bb/plugin-sdk";
-import type { Operations } from "./operations.js";
+import type { Actions } from "./actions.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
 const ok = (stdout: string): PluginCliResult => ({ exitCode: 0, stdout });
 const fail = (stderr: string): PluginCliResult => ({ exitCode: 1, stderr });
 
 export async function runCli(
-  operations: Operations,
+  operations: Actions,
   sessionKey: string,
   argv: string[],
 ): Promise<PluginCliResult> {
@@ -53,7 +53,7 @@ export async function runCli(
 
 export function registerCli(
   bb: BbPluginApi,
-  operations: Operations,
+  operations: Actions,
   resolveSessionKey: SessionKeyResolver,
 ): void {
   bb.cli.register({
