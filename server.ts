@@ -19,7 +19,8 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Browser } from "playwright-core";
 import { chromium } from "./src/playwright-runtime.js";
 import { createActions } from "./src/actions.js";
-import { startOrAttach } from "./src/brave.js";
+import { currentMode, quit as quitBrowser, startOrAttach, type BrowserMode } from "./src/brave.js";
+import { createModeSwitch } from "./src/mode.js";
 import { registerCli } from "./src/cli.js";
 import { createReaper2, DEFAULT_IDLE_MINUTES, idleMsFrom } from "./src/reaper2.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
@@ -58,12 +59,16 @@ export default async function plugin(bb: BbPluginApi) {
    * old socket is gone but Brave is not, so this reconnects rather than
    * relaunching and the tabs — with their target ids — are still there.
    */
+  /** Only used when nothing is running; a live browser keeps its own mode. */
+  let launchMode: BrowserMode = "headless";
+
   async function connected(): Promise<Browser> {
     if (browser?.isConnected()) return browser;
     if (connecting) return connecting;
     connecting = (async () => {
       const endpoint = await startOrAttach({
         profileDir: await profileDir(),
+        mode: launchMode,
         log: (message) => bb.log.info(message),
       });
       const next = await chromium().connectOverCDP(endpoint.httpEndpoint);
@@ -91,8 +96,47 @@ export default async function plugin(bb: BbPluginApi) {
 
   const actions = createActions({ tabs, activity: reaper });
 
-  registerTools(bb, actions, createSessionKeyResolver(bb));
-  registerCli(bb, actions, createSessionKeyResolver(bb));
+  // Headless by default; headed for the two moments a human is needed. One
+  // profile can only be held by one process, so this is a relaunch — see
+  // src/mode.ts for what that costs and why it is worth it.
+  const mode = createModeSwitch({
+    currentMode: async () => currentMode(await profileDir()),
+    capture: async () =>
+      (await tabs.listTabs())
+        .filter((tab) => tab.sessionKey !== null)
+        .map((tab) => ({ sessionKey: tab.sessionKey as string, url: tab.url })),
+    quit: async () => {
+      const closed = await quitBrowser(await profileDir());
+      browser = null;
+      return closed;
+    },
+    relaunch: async (next) => {
+      launchMode = next;
+      // Brave needs a moment to release the profile lock before the next
+      // process can take it; without this the relaunch races the shutdown.
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await connected();
+    },
+    restore: async (sessionKey, url) => {
+      await actions.open(sessionKey, url);
+    },
+    log: (message) => bb.log.info(message),
+  });
+
+  registerTools(bb, actions, createSessionKeyResolver(bb), mode);
+  registerCli(bb, actions, createSessionKeyResolver(bb), {
+    // Browser-level, so it goes past Actions rather than through it: Actions
+    // is deliberately per-tab and has no way to end the browser.
+    quit: async () => {
+      const closed = await quitBrowser(await profileDir());
+      browser = null;
+      return closed;
+    },
+    listTabs: () => tabs.listTabs(),
+    show: () => mode.show(),
+    hide: () => mode.hide(),
+    current: () => mode.current(),
+  });
   bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 
   bb.background.service("reaper", {

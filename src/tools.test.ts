@@ -38,7 +38,9 @@ function register(operations = fakeActions()) {
     threadId ? `key-for-${threadId}` : "scratch",
   );
 
-  registerTools(bb, operations as unknown as Actions, resolveSessionKey);
+  registerTools(bb, operations as unknown as Actions, resolveSessionKey, {
+    show: async () => "shown",
+  });
   const byName = (name: string) => {
     const tool = tools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error(`tool not registered: ${name}`);
@@ -88,7 +90,13 @@ describe("registerTools", () => {
     expect(schemaKeys(byName("browser_screenshot"))).toEqual([]);
   });
 
-  it("derives the session key from ctx.threadId, for every tool", async () => {
+  // browser_show is the one tool that is not about a page: it asks for a
+  // human, and the browser is shared, so it takes no session key by design.
+  // Every OTHER tool must derive one — that is the boundary that stops a
+  // thread reaching another thread's tab.
+  const PAGELESS_TOOLS = ["browser_show"];
+
+  it("derives the session key from ctx.threadId, for every page tool", async () => {
     const { tools, byName, ctx, operations, resolveSessionKey } = register();
     const params: Record<string, unknown> = {
       browser_open: { url: "https://example.com" },
@@ -98,6 +106,7 @@ describe("registerTools", () => {
       browser_snapshot: { interactive: true },
     };
     for (const tool of tools) {
+      if (PAGELESS_TOOLS.includes(tool.name)) continue;
       await tool.execute(params[tool.name] ?? {}, ctx("thr_a"));
     }
     expect(resolveSessionKey).toHaveBeenCalledWith("thr_a");
@@ -106,7 +115,7 @@ describe("registerTools", () => {
     const everyCall = Object.values(operations).flatMap(
       (fn) => fn.mock.calls as unknown as unknown[][],
     );
-    expect(everyCall.length).toBe(tools.length);
+    expect(everyCall.length).toBe(tools.length - PAGELESS_TOOLS.length);
     for (const call of everyCall) {
       expect(call[0]).toBe("key-for-thr_a");
     }
@@ -152,9 +161,16 @@ describe("registerTools", () => {
     });
   });
 
-  it("tells the model page content is untrusted, on every tool", () => {
+  // Every tool that can return page content says so. browser_show returns a
+  // status line and no page text at all, so the warning would be noise there —
+  // it carries its own caution instead, about relaunching mid-form.
+  it("tells the model page content is untrusted, on every tool that returns any", () => {
     const { tools } = register();
     for (const tool of tools) {
+      if (PAGELESS_TOOLS.includes(tool.name)) {
+        expect(tool.description).toMatch(/relaunch/i);
+        continue;
+      }
       expect(tool.description).toMatch(/untrusted/i);
     }
   });

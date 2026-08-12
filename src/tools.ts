@@ -23,6 +23,7 @@ const UNTRUSTED =
 
 /** Every tool this module registers, in the order it registers them. */
 export const TOOL_NAMES = [
+  "browser_show",
   "browser_open",
   "browser_read",
   "browser_snapshot",
@@ -37,7 +38,24 @@ export function registerTools(
   bb: BbPluginApi,
   operations: Actions,
   resolveSessionKey: SessionKeyResolver,
+  mode: { show(): Promise<string> },
 ): void {
+  // The one tool that is not about a page. An agent cannot pass a login wall,
+  // solve a CAPTCHA, or decide whether a design looks right — this is how it
+  // hands those to the human instead of guessing or giving up.
+  bb.agents.registerTool({
+    name: "browser_show",
+    description:
+      "Bring the browser on screen so the user can act on the page themselves — a login, " +
+      "a CAPTCHA, a confirmation you should not click, or anything you want them to look at. " +
+      "The browser is headless by default; this is how you ask for a human. Tell them what " +
+      "you need them to do, because the window appearing does not explain itself. " +
+      "Switching modes relaunches the browser: pages are reopened where they were, but " +
+      "anything typed and not submitted is lost, so do not call this mid-form.",
+    parameters: z.object({}),
+    execute: async () => mode.show(),
+  });
+
   const tool = <Schema extends z.ZodType>(
     name: string,
     description: string,

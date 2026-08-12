@@ -15,7 +15,7 @@
 // the tabs keep existing, and their target ids stay valid.
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -36,12 +36,35 @@ const PORT_FILE = "DevToolsActivePort";
 /** How long to wait for a freshly launched Brave to publish its port. */
 const LAUNCH_TIMEOUT_MS = 20_000;
 
+/**
+ * Which mode the running browser was launched in.
+ *
+ * Written next to the profile because the answer has to survive a plugin
+ * reload: the plugin can reattach to a browser it did not start, and asking
+ * CDP whether it is headless is not reliable across builds. A file the
+ * launcher writes is.
+ */
+const MODE_FILE = "bb-mode";
+
+export type BrowserMode = "headless" | "headed";
+
 export interface BraveOptions {
   /** The profile directory this browser owns. Never a human's profile. */
   profileDir: string;
   log: (message: string) => void;
   /** Overridable for tests; defaults to the real Brave. */
   binary?: string;
+  /**
+   * How to launch if nothing is running. Headless is the default because most
+   * agent work needs no window; `headed` is for the two moments a human is
+   * needed — an auth wall, or "come and look at this".
+   *
+   * Ignored when a browser is ALREADY running: one profile directory can only
+   * be held by one process, so switching modes is a relaunch, and that is a
+   * decision for `relaunchAs` rather than a side effect of asking for the
+   * endpoint.
+   */
+  mode?: BrowserMode;
 }
 
 export interface BraveEndpoint {
@@ -50,6 +73,8 @@ export interface BraveEndpoint {
   port: number;
   /** True when this call started the browser rather than finding it. */
   launched: boolean;
+  /** What the running browser actually is, not what was asked for. */
+  mode: BrowserMode;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -96,12 +121,19 @@ async function answersOn(port: number): Promise<boolean> {
  */
 export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoint> {
   const binary = options.binary ?? BRAVE_BINARY;
+  const wanted: BrowserMode = options.mode ?? "headless";
   await mkdir(options.profileDir, { recursive: true });
 
   const existing = await runningPort(options.profileDir);
   if (existing) {
-    options.log(`attached to the agents' browser on port ${existing}`);
-    return { httpEndpoint: `http://127.0.0.1:${existing}`, port: existing, launched: false };
+    const running = await currentMode(options.profileDir);
+    options.log(`attached to the agents' browser on port ${existing} (${running})`);
+    return {
+      httpEndpoint: `http://127.0.0.1:${existing}`,
+      port: existing,
+      launched: false,
+      mode: running,
+    };
   }
 
   if (!existsSync(binary)) {
@@ -122,6 +154,9 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-blink-features=AutomationControlled",
+      // Chromium's modern headless: the same renderer as headed, so a page
+      // does not render differently depending on whether anyone is looking.
+      ...(wanted === "headless" ? ["--headless=new"] : []),
       "about:blank",
     ],
     { detached: true, stdio: "ignore" },
@@ -132,8 +167,9 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
   while (Date.now() < deadline) {
     const port = await runningPort(options.profileDir);
     if (port) {
-      options.log(`started the agents' browser on port ${port}`);
-      return { httpEndpoint: `http://127.0.0.1:${port}`, port, launched: true };
+      await writeFile(join(options.profileDir, MODE_FILE), wanted, "utf8");
+      options.log(`started the agents' browser on port ${port} (${wanted})`);
+      return { httpEndpoint: `http://127.0.0.1:${port}`, port, launched: true, mode: wanted };
     }
     await sleep(200);
   }
@@ -141,4 +177,44 @@ export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoin
     `Brave did not publish a debugging port within ${LAUNCH_TIMEOUT_MS}ms — ` +
       `check ${join(options.profileDir, PORT_FILE)}`,
   );
+}
+
+/**
+ * Close the agents' browser.
+ *
+ * Nothing in the plugin's own lifecycle calls this — the browser deliberately
+ * outlives plugin reloads, and closing it is the act that broke v1. It exists
+ * so a human can end it on purpose (`bb browser quit`), which is the only time
+ * it should happen: it is their window, with possibly their tabs in it.
+ *
+ * Returns false when there was nothing running to close, so a caller can say
+ * "already closed" rather than implying it did something.
+ */
+export async function quit(profileDir: string): Promise<boolean> {
+  const port = await runningPort(profileDir);
+  if (!port) return false;
+  const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+    signal: AbortSignal.timeout(2000),
+  });
+  const { webSocketDebuggerUrl } = (await response.json()) as { webSocketDebuggerUrl: string };
+  const socket = new WebSocket(webSocketDebuggerUrl);
+  await new Promise<void>((resolve, reject) => {
+    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("error", () => reject(new Error("could not reach the browser")), {
+      once: true,
+    });
+  });
+  socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+  socket.close();
+  return true;
+}
+
+/** What the running (or last-launched) browser is. Headless when unrecorded. */
+export async function currentMode(profileDir: string): Promise<BrowserMode> {
+  try {
+    const raw = (await readFile(join(profileDir, MODE_FILE), "utf8")).trim();
+    return raw === "headed" ? "headed" : "headless";
+  } catch {
+    return "headless";
+  }
 }
