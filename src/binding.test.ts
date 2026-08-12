@@ -55,6 +55,7 @@ async function stack(land: Landing = landOnNewest) {
     // mechanism against one live fake browser, and a sweep that empties it
     // must not take the browser out from under the next assertion.
     shutdownBrowser: async () => {},
+    shutdownWhenEmpty: async () => false,
     closePage: (sessionKey) => registry.closePage(sessionKey),
     listOpenPages: () => registry.listOpenPages(),
     closeUnboundPage: (targetId) => registry.closeUnboundPage(targetId),

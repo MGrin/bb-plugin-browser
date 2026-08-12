@@ -750,6 +750,7 @@ describe("a CDP connect that never completes", () => {
       shutdownBrowser: async () => {
         throw new Error("must not shut down when the listing never resolved");
       },
+      shutdownWhenEmpty: async () => false,
       listOpenPages: async () => {
         const open = await pages.listOpenPages();
         listed.push("ok");

@@ -106,6 +106,22 @@ export interface ReaperDeps {
    * does not own.
    */
   shutdownBrowser(): Promise<void>;
+  /**
+   * Whether shutting an empty browser down is allowed at all.
+   *
+   * Off by default, and that default is not timidity. Shutting the browser
+   * down also ends the agent-browser daemon that holds every session's tab
+   * LABELS — the handle each thread uses to find its own page. Losing them
+   * makes the next command rebind, which replaces its page, which orphans the
+   * old one, which the unbound pass then closes, which empties the browser
+   * again. Observed live: four pages created for one thread in fourteen
+   * minutes, each command destroying the page the last one made, and a login
+   * lost with them.
+   *
+   * Reclaiming idle RAM is not worth a loop that eats live state. Turn it on
+   * only once binding survives a browser restart.
+   */
+  shutdownWhenEmpty(): Promise<boolean>;
   log(message: string): void;
   warn(message: string): void;
 }
@@ -228,6 +244,7 @@ export function createReaper(deps: ReaperDeps): Reaper {
    */
   async function shutdownIfEmpty(pages: OpenPage[] | null, headed: boolean): Promise<void> {
     if (!pages) return;
+    if (!(await deps.shutdownWhenEmpty())) return;
     // "Became empty", not "is empty". A listing cannot tell a running browser
     // with no tabs from no browser at all — both come back as zero pages — so
     // acting on the state alone means deciding to shut down an already-dead

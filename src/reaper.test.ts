@@ -29,6 +29,9 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
     shutdownBrowser: async () => {
       shutdowns.push("browser");
     },
+    // Enabled in the harness so the shutdown tests below still exercise the
+    // behaviour; the shipped default is off (see ReaperDeps.shutdownWhenEmpty).
+    shutdownWhenEmpty: async () => true,
     closeUnboundPage: async (targetId: string) => {
       closedTargets.push(targetId);
       state.pages = state.pages.filter((page) => page.targetId !== targetId);

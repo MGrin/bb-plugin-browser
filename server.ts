@@ -33,6 +33,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Some sites render blank headless. Changing this closes the browser; the next command starts it again in the new mode. The profile directory is untouched, so logins survive.",
       default: false,
     },
+    shutdownWhenEmpty: {
+      type: "boolean",
+      label: "Shut the browser down when it has no pages",
+      description:
+        "Off by default: shutting the browser down also ends the agent-browser daemon that holds each thread's tab label, which makes the next command replace its page instead of finding it. Reclaiming idle RAM is not worth losing a logged-in page.",
+      default: false,
+    },
     idleMinutes: {
       // A string, because bb's setting descriptors are string, boolean,
       // select and project — there is no number. `idleMsFrom` parses it and
@@ -102,6 +109,7 @@ export default async function plugin(bb: BbPluginApi) {
     // call the headed toggle makes, so the remembered address is dropped with
     // the process either way.
     shutdownBrowser: () => pages.shutdownBrowser(defaultProfile),
+    shutdownWhenEmpty: async () => (await settings.get()).shutdownWhenEmpty,
     log: (message) => bb.log.info(message),
     // A failed close means a tab is still open that nothing may reference
     // again — that belongs at warn, not info.
