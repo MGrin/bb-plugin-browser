@@ -153,12 +153,20 @@ export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndp
       // Chromium's modern headless: the same renderer as headed, so a page
       // does not render differently depending on whether anyone is looking.
       ...(wanted === "headless" ? ["--headless=new"] : []),
-      // Load-bearing, not cosmetic. Chromium exits when its last target
-      // closes, so without a tab that nothing ever reaps, the moment the
-      // reaper cleared the last idle agent tab the whole shared browser would
-      // go with it — taking every other thread's session and every login.
-      // This tab is never bound to a thread and never owned, so it survives.
-      // `bb browser tabs` names it, rather than implying a human opened it.
+      // A start page, so a freshly launched browser has something to attach
+      // to rather than presenting zero targets.
+      //
+      // NOT load-bearing, though it looks as if it should be: measured
+      // 2026-08-12, a `--headless=new` browser stays alive and answering with
+      // every one of its tabs closed, so the reaper clearing the last agent
+      // tab does not take the browser with it. Do not add a keep-alive tab on
+      // that theory. (Headed on macOS behaves the same way by platform
+      // convention — an app outlives its last window — but that was not
+      // measured here.)
+      //
+      // This tab is never bound to a thread and never owned, so the reaper
+      // never touches it and it lingers. `bb browser tabs` therefore names it
+      // as the browser's own, rather than implying a human opened it.
       "about:blank",
     ],
     { detached: true, stdio: "ignore" },
