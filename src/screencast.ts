@@ -67,11 +67,22 @@ export interface Screencast {
   stopAll(): void;
 }
 
+/**
+ * How often a watched tab re-asserts the foreground.
+ *
+ * Frequent enough that a stolen foreground costs a second of frozen view
+ * rather than the rest of the session, cheap enough to be invisible: the call
+ * is a no-op when the tab is already in front.
+ */
+const FOREGROUND_INTERVAL_MS = 1000;
+
 interface Cast {
   session: CdpSession;
   subscribers: Set<(frame: string) => void>;
   /** Last frame's reported viewport; null until the first frame arrives. */
   viewport: Viewport | null;
+  /** Keeps this tab in the foreground for as long as anyone is watching. */
+  foreground: ReturnType<typeof setInterval> | null;
 }
 
 export function createScreencast(deps: ScreencastDeps): Screencast {
@@ -91,7 +102,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
   async function startCast(cdpUrl: string): Promise<Cast> {
     const session = await openCdp(cdpUrl);
     try {
-      const cast: Cast = { session, subscribers: new Set(), viewport: null };
+      const cast: Cast = { session, subscribers: new Set(), viewport: null, foreground: null };
       session.on("Page.screencastFrame", (params) => {
         const frame = params as {
           data: string;
@@ -148,6 +159,16 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
         quality: deps.quality,
         maxWidth: deps.maxWidth,
       });
+      // And keep asking. Once is not enough: a headless tab that loses the
+      // foreground stops producing frames ENTIRELY, so the panel freezes
+      // while the page underneath goes on working — you type, the keystroke
+      // lands, and nothing changes on screen. Anything else opening a tab in
+      // this shared browser can take the foreground away, and so can the
+      // browser itself. A no-op when the tab is already in front, and it
+      // stops with the last viewer, so a page nobody watches costs nothing.
+      cast.foreground = setInterval(() => {
+        void session.send("Page.bringToFront").catch(() => {});
+      }, FOREGROUND_INTERVAL_MS);
       return cast;
     } catch (error) {
       // Failed partway through — nobody else knows this session exists, so
@@ -206,6 +227,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     // on record.
     if (casts.get(sessionKey) !== cast) return;
     casts.delete(sessionKey);
+    if (cast.foreground) clearInterval(cast.foreground);
     closeCast(cast);
   }
 

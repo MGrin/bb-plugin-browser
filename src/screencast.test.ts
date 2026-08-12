@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createScreencast } from "./screencast.js";
 import { fakeCdp, type FakeCdp } from "./test-support/fake-cdp.js";
 
@@ -520,5 +520,48 @@ describe("screencast", () => {
     // Still just the cast's own session — dispatchInput must not have
     // opened, and then had to close, a second one.
     expect(server.connectionCount).toBe(1);
+  });
+});
+
+// A headless tab that loses the foreground stops producing frames entirely,
+// so the panel freezes while the page underneath goes on working: you type,
+// the keystroke lands, and nothing changes on screen. Asking once at cast
+// start is not enough — anything else opening a tab in the shared browser can
+// take the foreground away afterwards.
+describe("holding the foreground while someone is watching", () => {
+  it("keeps asking for the foreground, not just once at the start", async () => {
+    vi.useFakeTimers();
+    try {
+      server = await fakeCdp();
+      const screencast = screencastFor();
+      await screencast.subscribe("thr_a", server.url, () => {});
+      const before = server.received.filter((m) => m.method === "Page.bringToFront").length;
+      expect(before).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(3500);
+      const after = server.received.filter((m) => m.method === "Page.bringToFront").length;
+      expect(after).toBeGreaterThan(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops asking once the last viewer leaves", async () => {
+    vi.useFakeTimers();
+    try {
+      server = await fakeCdp();
+      const screencast = screencastFor();
+      const unsubscribe = await screencast.subscribe("thr_a", server.url, () => {});
+      await vi.advanceTimersByTimeAsync(2500);
+      unsubscribe();
+      const settled = server.received.filter((m) => m.method === "Page.bringToFront").length;
+
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(
+        server.received.filter((m) => m.method === "Page.bringToFront").length,
+      ).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
