@@ -94,6 +94,18 @@ export interface ReaperDeps {
   listOpenPages(): Promise<OpenPage[]>;
   /** Closes one page by target id. Must never launch a browser. */
   closeUnboundPage(targetId: string): Promise<void>;
+  /**
+   * Shuts this profile's browser down and forgets its address.
+   *
+   * Called only when the browser has no tabs left at all, so this is the end
+   * of the same job the passes above do: a Chromium with nothing open is pure
+   * resident memory on a laptop, and until this existed it stayed that way
+   * until bb itself went away. Forgetting the address matters as much as the
+   * shutdown — a remembered ephemeral port outlives the process holding it,
+   * and adopting whatever answers there next is how a reaper closes tabs it
+   * does not own.
+   */
+  shutdownBrowser(): Promise<void>;
   log(message: string): void;
   warn(message: string): void;
 }
@@ -189,6 +201,41 @@ export function createReaper(deps: ReaperDeps): Reaper {
     }
   }
 
+  /**
+   * The last step of a sweep: a browser with nothing open should not be
+   * running at all.
+   *
+   * Every guard here is a case where "no tabs" does not mean "nobody is
+   * using it":
+   *
+   * - The listing failed. We do not know what is open, and closing a browser
+   *   on a guess is worse than leaving one running.
+   * - Headed. A human asked for that window. It can legitimately sit with no
+   *   tab this plugin knows about — they closed the last one and are about to
+   *   open another — and shutting it under them would look like a crash.
+   * - Anything held. `watch` is taken for a command's whole duration as well
+   *   as by a panel viewer, so a non-empty `viewers` means work is in flight
+   *   or someone is looking, even if no tab exists yet.
+   *
+   * The remaining race is narrow and self-correcting: a command can arrive
+   * after this check and before the shutdown lands, taking its hold too late
+   * to be seen. What it cannot do is fail — every command ensures its browser
+   * before attaching, so the worst case is one relaunch of a browser that was
+   * about to be free, which is what would have happened anyway had the
+   * command arrived a second later.
+   */
+  async function shutdownIfEmpty(pages: OpenPage[] | null, headed: boolean): Promise<void> {
+    if (!pages || pages.length > 0 || headed || viewers.size > 0) return;
+    try {
+      await deps.shutdownBrowser();
+      deps.log("browser has no pages left — shut it down");
+    } catch (error) {
+      // Not worth a retry loop: the next sweep sees the same empty browser
+      // and tries again in a minute.
+      deps.warn(`could not shut the idle browser down: ${messageOf(error)}`);
+    }
+  }
+
   return {
     touch(sessionKey, now = Date.now()) {
       lastUsed.set(sessionKey, now);
@@ -255,6 +302,8 @@ export function createReaper(deps: ReaperDeps): Reaper {
       // filtered out here also loses its grace period, which is right: it is
       // not being watched go unowned, it is being declined.
       if (pages) await unboundPass(headed ? pages.filter((page) => page.ours) : pages, now);
+
+      await shutdownIfEmpty(pages, headed);
     },
   };
 }

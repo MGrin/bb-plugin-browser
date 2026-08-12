@@ -745,6 +745,11 @@ describe("a CDP connect that never completes", () => {
       graceMs: 60_000,
       headed: async () => false,
       closePage: async () => {},
+      // This test is about a hung listing, not about shutdown: a browser
+      // whose pages cannot be listed must never be shut down on a guess.
+      shutdownBrowser: async () => {
+        throw new Error("must not shut down when the listing never resolved");
+      },
       listOpenPages: async () => {
         const open = await pages.listOpenPages();
         listed.push("ok");

@@ -14,6 +14,7 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
   const closedTargets: string[] = [];
   const logs: string[] = [];
   const warnings: string[] = [];
+  const shutdowns: string[] = [];
   // The browser's tab list, shared with `closeUnboundPage` the way a real
   // browser shares it: closing a page really removes it from the list.
   const state = { pages: [] as OpenPage[] };
@@ -25,6 +26,9 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
       closed.push(sessionKey);
     },
     listOpenPages: async () => state.pages,
+    shutdownBrowser: async () => {
+      shutdowns.push("browser");
+    },
     closeUnboundPage: async (targetId: string) => {
       closedTargets.push(targetId);
       state.pages = state.pages.filter((page) => page.targetId !== targetId);
@@ -33,7 +37,7 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
     warn: (message: string) => warnings.push(message),
     ...overrides,
   });
-  return { closed, closedTargets, logs, warnings, state, reaper };
+  return { closed, closedTargets, logs, warnings, shutdowns, state, reaper };
 }
 
 /**
@@ -569,5 +573,66 @@ describe("runSweeps on abort", () => {
     });
     await runSweeps(controller.signal, { sweep }, { intervalMs: 1, warn: () => {} });
     expect(calls).toBe(1);
+  });
+});
+
+// A Chromium with nothing open is pure resident memory. Until this existed it
+// stayed running until bb itself went away, which on a laptop means all day.
+describe("shutting an empty browser down", () => {
+  it("shuts down once the last page is gone", async () => {
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual(["browser"]);
+  });
+
+  it("leaves a browser that still has a page alone", async () => {
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [{ targetId: "tab-1", url: "https://example.com", sessionKey: "thr_a", ours: true }];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("never shuts down while a window is on screen", async () => {
+    // The human closed their last tab and is about to open another; taking
+    // the window away then would look like a crash.
+    const { reaper, shutdowns, state } = reaperWith({ headed: async () => true });
+    state.pages = [];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("never shuts down while anything is held", async () => {
+    // `watch` is taken for a command's whole duration as well as by a panel
+    // viewer, so a hold means work is in flight even with no tab open yet.
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [];
+    reaper.watch("thr_a");
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+    reaper.unwatch("thr_a");
+    await reaper.sweep(2000);
+    expect(shutdowns).toEqual(["browser"]);
+  });
+
+  it("does not shut down on a guess when the listing failed", async () => {
+    const { reaper, shutdowns } = reaperWith({
+      listOpenPages: async () => {
+        throw new Error("browser is gone");
+      },
+    });
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("warns rather than throwing when the shutdown fails", async () => {
+    const { reaper, warnings, state } = reaperWith({
+      shutdownBrowser: async () => {
+        throw new Error("port busy");
+      },
+    });
+    state.pages = [];
+    await expect(reaper.sweep(1000)).resolves.toBeUndefined();
+    expect(warnings.join(" ")).toMatch(/could not shut the idle browser down/);
   });
 });
