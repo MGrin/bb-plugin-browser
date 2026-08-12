@@ -186,3 +186,58 @@ describe("browser_open's url schema", () => {
     expect(parse(url).success).toBe(true);
   });
 });
+
+// Schema defaults are a safety surface, not a convenience.
+//
+// A mutation sweep flipped each of these with the whole suite still green.
+// The defaults decide what happens when a model omits an argument, which is
+// exactly when nobody is thinking about it: `submit` defaulting to true would
+// press Enter on every fill — posting the comment, sending the message,
+// submitting the form nobody asked to submit — on a surface whose input comes
+// from pages this plugin treats as hostile.
+describe("tool schema defaults", () => {
+  it("does not submit when the model omits `submit`", () => {
+    const { byName } = register();
+    const parsed = byName("browser_type").parameters.parse({
+      selector: "#q",
+      text: "hello",
+    }) as { submit: boolean };
+    expect(parsed.submit).toBe(false);
+  });
+
+  it("still submits when the model asks for it", () => {
+    const { byName } = register();
+    const parsed = byName("browser_type").parameters.parse({
+      selector: "#q",
+      text: "hello",
+      submit: true,
+    }) as { submit: boolean };
+    expect(parsed.submit).toBe(true);
+  });
+
+  it("snapshots the interactive tree when the model omits `interactive`", () => {
+    const { byName } = register();
+    const parsed = byName("browser_snapshot").parameters.parse({}) as {
+      interactive: boolean;
+    };
+    expect(parsed.interactive).toBe(true);
+  });
+
+  it("passes the parsed default through to the operation", async () => {
+    const { byName, ctx, operations } = register();
+    const snapshot = byName("browser_snapshot");
+    await snapshot.execute(snapshot.parameters.parse({}), ctx("thr_a"));
+    expect(operations.snapshot).toHaveBeenCalledWith("key-for-thr_a", true);
+  });
+});
+
+describe("tool schema required arguments", () => {
+  it.each([
+    ["browser_click", { selector: "" }],
+    ["browser_type", { selector: "", text: "hi" }],
+    ["browser_eval", { expression: "" }],
+  ])("%s rejects an empty required string", (name, params) => {
+    const { byName } = register();
+    expect(byName(name).parameters.safeParse(params).success).toBe(false);
+  });
+});

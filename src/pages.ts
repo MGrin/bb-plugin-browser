@@ -24,11 +24,13 @@ import {
 } from "./browser-endpoint.js";
 import {
   bindingKey,
+  createdKey,
   markerUrl,
   originKey,
   withoutPrefix,
   type Binding,
   type BrowserPointer,
+  type CreatedTarget,
   type PageRegistry,
 } from "./page-registry.js";
 
@@ -158,6 +160,17 @@ export function createPages(deps: PagesDeps): Pages {
       tab: TAB_LABEL,
     };
     await deps.kv.set(bindingKey(sessionKey), binding);
+    // And that WE opened this tab, keyed by target rather than by session:
+    // a binding is lost routinely (a rebind, a thread teardown, a forget),
+    // and the page it named is then indistinguishable from a tab the human
+    // opened unless something outlives the binding to say otherwise. That
+    // record is what lets the reaper clear its own orphans while the browser
+    // is headed instead of suspending itself and leaving them for a headless
+    // relaunch that restores them anyway. The registry prunes these when the
+    // browser no longer has the target, so the store stays bounded by the
+    // number of open tabs.
+    const ownership: CreatedTarget = { profile, at: Date.now() };
+    await deps.kv.set(createdKey(binding.targetId), ownership);
     // Remembered per profile as well as per binding: the reaper has to be
     // able to find this browser after every binding for it is gone, which is
     // exactly the state a restart leaves behind together with the tabs it

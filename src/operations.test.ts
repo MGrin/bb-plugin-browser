@@ -234,6 +234,29 @@ describe("operations", () => {
     expect(shot.base64).toBe(png.toString("base64"));
   });
 
+  it("cleans up the screenshot temp file after a successful capture", async () => {
+    // The failure case below cannot prove this on its own: when the command
+    // fails the fake never writes the file, so the existence check passes
+    // whether or not anything cleans up. Only the success path — where a PNG
+    // really lands on disk — can tell "removed it" from "never created it".
+    // Without this, every screenshot leaks a PNG of page content into tmpdir
+    // for the life of the machine.
+    let path = "";
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const ops = opsWith(async ({ argv }) => {
+      if (argv[0] === "screenshot") {
+        path = argv[1];
+        await import("node:fs/promises").then((fs) => fs.writeFile(argv[1], png));
+      }
+      return { stdout: "ok", stderr: "", code: 0 };
+    });
+    const shot = await ops.operations.screenshot("thr_a");
+    expect(shot.base64).toBe(png.toString("base64"));
+    const { existsSync } = await import("node:fs");
+    expect(path).not.toBe("");
+    expect(existsSync(path)).toBe(false);
+  });
+
   it("cleans up the screenshot temp file even when the command fails", async () => {
     let path = "";
     const ops = opsWith(async ({ argv }) => {

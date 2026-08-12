@@ -94,6 +94,20 @@ export interface OpenPage {
   url: string;
   /** The session key whose binding names this target, or null for nobody's. */
   sessionKey: string | null;
+  /**
+   * Whether THIS PLUGIN opened this tab, which is a different question from
+   * whether anyone is bound to it and outlives the answer to that one. A
+   * binding is lost routinely — a rebind, a teardown, a `forget` — and the
+   * page it named is then indistinguishable from a tab the human opened
+   * unless something remembers who created it. That is what makes the
+   * reaper able to clear its own debris while the browser is headed without
+   * ever reaching for a tab that might be somebody's login.
+   *
+   * False for a page created before this record existed, which is the safe
+   * direction: the worst case is one plugin tab that only the idle pass can
+   * close, and the next page a session creates is recorded properly.
+   */
+  ours: boolean;
 }
 
 export const bindingKey = (sessionKey: string) => `page:${sessionKey}`;
@@ -104,6 +118,37 @@ export const bindingKey = (sessionKey: string) => `page:${sessionKey}`;
  * all, and the debris would be unreachable forever.
  */
 export const originKey = (profile: string) => `origin:${profile}`;
+/**
+ * That this plugin, and not the human at the keyboard, opened this tab.
+ *
+ * Keyed by target id rather than by session key, because the whole point is
+ * to outlive the binding: a page whose session was torn down, rebound, or
+ * forgotten is still a page this plugin opened, and while the browser is
+ * headed that is the only thing separating "our debris" from "the tab they
+ * are logging into".
+ */
+export const createdKey = (targetId: string) => `created:${targetId}`;
+
+/** What is remembered about a tab this plugin opened. */
+export interface CreatedTarget {
+  profile: string;
+  /** When it was recorded, for the pruning grace below. */
+  at: number;
+}
+
+/**
+ * How long a `created:` row outlives the target it names before pruning may
+ * remove it.
+ *
+ * Rows are deleted as soon as their target is gone from the browser, which is
+ * what keeps this store bounded by the number of open tabs. The grace exists
+ * for one race only: `pages.createPage` opens the tab and writes this row
+ * afterwards, so a listing taken before the tab existed could otherwise prune
+ * a row written after that listing began — permanently disowning a live page.
+ * Anything comfortably longer than one create is enough; five minutes is
+ * absurdly generous and costs a handful of rows.
+ */
+export const CREATED_RECORD_GRACE_MS = 5 * 60_000;
 
 /**
  * bb's `kv.list` returns full keys; this tolerates either form so a host that
@@ -199,7 +244,7 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
    * existed — is likewise treated as dead rather than trusted, and the next
    * page creation replaces it.
    */
-  async function reachableBrowser(): Promise<string | null> {
+  async function reachableBrowser(): Promise<{ url: string; profile: string } | null> {
     for (const storedKey of await deps.kv.list("origin:")) {
       const profile = withoutPrefix("origin:", storedKey);
       // Partial, deliberately: a row written before this check existed
@@ -218,9 +263,46 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
         );
         continue;
       }
-      return browserUrl;
+      return { url: browserUrl, profile };
     }
     return null;
+  }
+
+  /**
+   * The targets this plugin opened, out of the ones the browser still has —
+   * and, in the same pass, the pruning that keeps the record bounded.
+   *
+   * Bounded matters: a row is written for every page ever created, and this
+   * plugin creates one per thread per rebind, forever. So a row whose target
+   * the browser no longer has is deleted here, which caps the store at the
+   * open tabs plus whatever was created in the last few minutes. The profile
+   * check is what stops a second profile's browser (a future setting; one
+   * today) from pruning rows belonging to a browser it cannot see.
+   */
+  async function ourTargets(
+    profile: string,
+    present: Set<string>,
+    now: number,
+  ): Promise<Set<string>> {
+    const ours = new Set<string>();
+    for (const storedKey of await deps.kv.list("created:")) {
+      const targetId = withoutPrefix("created:", storedKey);
+      const record = await deps.kv.get<Partial<CreatedTarget>>(createdKey(targetId));
+      if (!record) continue;
+      if (present.has(targetId)) {
+        ours.add(targetId);
+        continue;
+      }
+      // Gone from the browser: prune it, unless it is young enough that this
+      // listing may simply predate the page it names (see the grace above).
+      // A row with no timestamp is from no version that ever shipped one, so
+      // there is nothing to wait for.
+      const at = typeof record.at === "number" ? record.at : 0;
+      if (record.profile === profile && now - at >= CREATED_RECORD_GRACE_MS) {
+        await deps.kv.delete(createdKey(targetId));
+      }
+    }
+    return ours;
   }
 
   async function existingPageInfo(
@@ -252,17 +334,24 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
 
     async listOpenPages() {
       const bindings = await allBindings();
-      const browserUrl = await reachableBrowser();
-      if (!browserUrl) return [];
+      const browser = await reachableBrowser();
+      if (!browser) return [];
       const owner = new Map(
         bindings.map(({ sessionKey, binding }) => [binding.targetId, sessionKey]),
       );
-      return (await listPageTargets(browserUrl, deps.cdp)).map((target) => ({
+      const targets = await listPageTargets(browser.url, deps.cdp);
+      const ours = await ourTargets(
+        browser.profile,
+        new Set(targets.map((target) => target.targetId)),
+        Date.now(),
+      );
+      return targets.map((target) => ({
         targetId: target.targetId,
         // Same hidden marker as existingPageInfo: what gets logged when a
         // page is reaped should be where the page is, not how it was found.
         url: isMarker(target.url) ? "about:blank" : target.url,
         sessionKey: owner.get(target.targetId) ?? null,
+        ours: ours.has(target.targetId),
       }));
     },
 
@@ -275,10 +364,14 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
       if (owner) {
         throw new Error(`refusing to close ${targetId}: ${owner.sessionKey} is bound to it`);
       }
-      const browserUrl = await reachableBrowser();
+      const browser = await reachableBrowser();
       // No browser, no page: there is nothing to close and nothing to report.
-      if (!browserUrl) return;
-      await closeTarget(browserUrl, targetId, deps.cdp);
+      if (!browser) return;
+      await closeTarget(browser.url, targetId, deps.cdp);
+      // Only after the close succeeded — a row dropped for a tab that is still
+      // open would disown a page this plugin made, and while headed that means
+      // never trying again.
+      await deps.kv.delete(createdKey(targetId));
     },
 
     async closePage(sessionKey) {
@@ -315,6 +408,7 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
         deps.log(`closePage: ${bound.targetId} already gone (${error.message})`);
       });
       await deps.kv.delete(bindingKey(sessionKey));
+      await deps.kv.delete(createdKey(bound.targetId));
     },
 
     async forget(sessionKey) {

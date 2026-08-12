@@ -73,3 +73,17 @@ describe("browser-endpoint", () => {
     expect(browserIdOf("ws://127.0.0.1:9222/devtools/page/t1")).toBeNull();
   });
 });
+
+describe("httpOriginOf", () => {
+  it("probes a ws:// endpoint over http", () => {
+    expect(httpOriginOf("ws://127.0.0.1:9222/devtools/browser/abc")).toBe("http://127.0.0.1:9222");
+  });
+
+  it("probes a wss:// endpoint over https, not plaintext", () => {
+    // A remote CDP provider is reachable only over TLS; probing it on http
+    // never resolves, and the failure looks exactly like "browser is gone".
+    expect(httpOriginOf("wss://remote.example:443/devtools/browser/abc")).toBe(
+      "https://remote.example",
+    );
+  });
+});

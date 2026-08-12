@@ -36,11 +36,22 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
   return { closed, closedTargets, logs, warnings, state, reaper };
 }
 
-const page = (targetId: string, sessionKey: string | null = null): OpenPage => ({
-  targetId,
-  url: "about:blank",
-  sessionKey,
-});
+/**
+ * A page in the browser. `ours` defaults to false — a tab this plugin did
+ * NOT open — because that is the conservative default for every test that
+ * does not care, and it keeps the headless tests honest: they must still
+ * close debris nobody created through this plugin, which is exactly what a
+ * relaunch's restored tabs are.
+ */
+const page = (
+  targetId: string,
+  sessionKey: string | null = null,
+  ours = false,
+): OpenPage => ({ targetId, url: "about:blank", sessionKey, ours });
+
+/** A page this plugin opened, whoever is (or is no longer) bound to it. */
+const ourPage = (targetId: string, sessionKey: string | null = null): OpenPage =>
+  page(targetId, sessionKey, true);
 
 describe("reaper: idle pages", () => {
   it("closes a page idle past the timeout", async () => {
@@ -333,6 +344,44 @@ describe("reaper: the human's own tabs, while the browser is headed", () => {
     expect(closed).toEqual(["thr_a"]);
   });
 
+  // The half the blanket suspension got wrong. A page this plugin opened and
+  // then lost the binding for was unreapable until headless returned — and
+  // toggling headed relaunches Chromium, which RESTORES that debris with
+  // fresh ids. "Headed → lose a binding → toggle twice" carried tabs forward
+  // forever. Our own orphans go in both modes; nothing else is touched while
+  // the window is up.
+  it("still closes an orphan it opened itself while the window is up", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [ourPage("a-page-we-opened-and-lost")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["a-page-we-opened-and-lost"]);
+  });
+
+  it("tells its own orphan apart from the human's tab in the same sweep", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("the-humans-login-tab"), ourPage("ours")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["ours"]);
+  });
+
+  // Headless there is no window and therefore no human tab, and a restored
+  // tab carries a fresh target id no record of ours could ever name — so the
+  // pass must still close pages it cannot claim. This is the measured case
+  // the whole module exists for: 21 leftover tabs came back after one plugin
+  // reload, and not one of them was recognisable as ours.
+  it("closes a tab it cannot claim once the window is gone", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => false });
+    state.pages = [page("restored-by-chromium")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["restored-by-chromium"]);
+  });
+
   it("resumes closing unbound tabs once the window is gone", async () => {
     let headed = true;
     const { closedTargets, state, reaper } = reaperWith({ headed: async () => headed });
@@ -490,5 +539,35 @@ describe("thread teardown", () => {
     await expect(teardown({ thread: { id: "thr_a" } })).resolves.toBeUndefined();
     expect(closed).toEqual([]);
     expect(warnings.join("\n")).toContain("thread vanished");
+  });
+});
+
+// Shutdown ordering, which the sweep loop's own tests did not pin.
+//
+// A mutation that deleted the post-sleep abort check left the suite green.
+// The consequence is one extra full sweep running *during* teardown — the
+// plugin is disposing, the browser may already be going away, and the sweep
+// closes pages and reaches for a CDP endpoint on the way out.
+describe("runSweeps on abort", () => {
+  it("does not sweep again when the signal aborts during the sleep", async () => {
+    const controller = new AbortController();
+    const sweep = vi.fn(async () => {});
+    const done = runSweeps(controller.signal, { sweep }, { intervalMs: 50, warn: () => {} });
+    // Abort while the loop is parked in its sleep, which is where a plugin
+    // reload or a bb shutdown actually lands.
+    controller.abort();
+    await done;
+    expect(sweep).not.toHaveBeenCalled();
+  });
+
+  it("stops sweeping once aborted, rather than running one last pass", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const sweep = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) controller.abort();
+    });
+    await runSweeps(controller.signal, { sweep }, { intervalMs: 1, warn: () => {} });
+    expect(calls).toBe(1);
   });
 });

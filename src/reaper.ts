@@ -31,6 +31,12 @@ export interface OpenPage {
   url: string;
   /** The session key whose binding names this target, or null for nobody's. */
   sessionKey: string | null;
+  /**
+   * Whether this plugin opened the tab — recorded when it was created and
+   * kept until the browser no longer has it, so it survives the binding
+   * being lost. This is what the headed pass is allowed to act on.
+   */
+  ours: boolean;
 }
 
 export interface ReaperDeps {
@@ -54,26 +60,32 @@ export interface ReaperDeps {
    * Whether this profile's browser is showing a window, resolved per sweep
    * like `idleMs`.
    *
-   * It gates the UNBOUND pass, and only that pass. Headed mode exists for
+   * It narrows the UNBOUND pass, and only that pass. Headed mode exists for
    * exactly one reason: a human has to use this browser themselves, to log
    * into the sites the agent then works in. A tab they open is a tab no
-   * binding names, which is indistinguishable — to this module, and to the
-   * browser — from a tab Chromium restored on relaunch. So while the window
-   * is up, the unbound pass would close the human's own tab out from under
-   * them in one or two sweeps, i.e. inside 60-120 seconds, mid-login.
+   * binding names, so an unbound pass that closes anything unowned would
+   * close their own tab out from under them in one or two sweeps — inside
+   * 60-120 seconds, mid-login.
    *
-   * The alternatives were considered and rejected. "Only reap targets the
-   * plugin created" cannot work: Chrome mints fresh target ids when it
-   * restores tabs, so the restored debris this pass exists to clear is
-   * precisely what it could never recognise. A longer grace period only
-   * moves the deadline — the requirement is that a human can open a tab,
-   * walk away, and still find it there, and no finite grace satisfies that.
+   * It used to suspend the pass outright, and that was not self-clearing: a
+   * page this plugin opened and then lost the binding for was unreapable
+   * until headless returned, and toggling headed relaunches Chromium, which
+   * RESTORES that debris. "Headed → lose a binding → toggle twice" carried
+   * tabs forward forever.
    *
-   * Skipping the pass costs debris accumulating while headed, which is
-   * bounded (headed is opt-in and deliberate), visible (there is a window
-   * on screen), and self-clearing: switching back to headless closes the
-   * browser outright. The idle pass keeps running throughout, so pages this
-   * plugin does own are still reaped either way.
+   * So the pass now runs in both modes, over different sets:
+   *
+   *   headless — every unbound page, including ones this plugin did not
+   *              open. Chromium mints fresh target ids when it restores
+   *              tabs, so restored debris can never be recognised as ours,
+   *              and it is exactly what this pass exists to clear (measured:
+   *              21 leftover tabs came back after one plugin reload). There
+   *              is no window on screen and therefore no human tab to hit.
+   *   headed   — only pages this plugin opened, which `OpenPage.ours`
+   *              records at creation and keeps past the binding being lost.
+   *              The human's tabs are untouched however long they sit there,
+   *              and our own orphans still go, so the debris clears itself
+   *              without waiting for a mode change.
    */
   headed(): Promise<boolean>;
   /** Closes the tab and drops the binding. Rejects if the tab survived. */
@@ -223,28 +235,26 @@ export function createReaper(deps: ReaperDeps): Reaper {
 
       await idlePass(now);
 
-      // The human's browser is on screen and their tabs are, by
-      // construction, unbound — so the unbound pass is off entirely while
-      // headed. Their grace periods are dropped rather than paused: coming
-      // back to headless closes the browser anyway, and a tab that outlives
-      // that has earned a fresh clock.
+      // The human's browser is on screen and their tabs are, by construction,
+      // unbound — so while headed the unbound pass sees only the pages this
+      // plugin opened. Not "no pass at all", which left our own orphans for a
+      // headless relaunch that restores them; and not "everything", which
+      // closes their login tab inside two minutes. See ReaperDeps.headed.
       const headed = await deps.headed();
       if (headed !== lastHeaded) {
         lastHeaded = headed;
         deps.log(
           headed
-            ? "browser is headed — leaving tabs nobody is bound to alone, they may be yours"
-            : "browser is headless — resuming closing tabs nobody is bound to",
+            ? "browser is headed — closing only tabs this plugin opened, the rest may be yours"
+            : "browser is headless — resuming closing every tab nobody is bound to",
         );
-      }
-      if (headed) {
-        unboundSince.clear();
-        return;
       }
 
       // After the idle pass, so a page it just closed is already gone from
-      // the browser rather than looking briefly like an orphan.
-      if (pages) await unboundPass(pages, now);
+      // the browser rather than looking briefly like an orphan. A page
+      // filtered out here also loses its grace period, which is right: it is
+      // not being watched go unowned, it is being declined.
+      if (pages) await unboundPass(headed ? pages.filter((page) => page.ours) : pages, now);
     },
   };
 }

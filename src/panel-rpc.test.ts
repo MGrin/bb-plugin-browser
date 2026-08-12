@@ -145,3 +145,37 @@ describe("panel rpc handlers", () => {
     expect(dispatchInput).not.toHaveBeenCalled();
   });
 });
+
+// The "no key smuggling" rule is the only guarantee the panel boundary
+// actually makes, and it was tested on `view` alone — so two thirds of it
+// could be deleted with the suite still green. `navigate` matters most: it is
+// the one method that can create a page.
+describe("panelRpcContract strictness", () => {
+  const extras = [
+    { field: "sessionKey", value: "thr_someone_else" },
+    { field: "profile", value: "main" },
+  ];
+
+  it.each(extras)("view refuses an extra $field", ({ field, value }) => {
+    const parsed = panelRpcContract.view.input.safeParse({ threadId: "thr_a", [field]: value });
+    expect(parsed.success).toBe(false);
+  });
+
+  it.each(extras)("navigate refuses an extra $field", ({ field, value }) => {
+    const parsed = panelRpcContract.navigate.input.safeParse({
+      threadId: "thr_a",
+      url: "https://example.com",
+      [field]: value,
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it.each(extras)("input refuses an extra $field", ({ field, value }) => {
+    const parsed = panelRpcContract.input.input.safeParse({
+      threadId: "thr_a",
+      event: { kind: "mouse", type: "mousePressed", x: 1, y: 2, button: "left", clickCount: 1 },
+      [field]: value,
+    });
+    expect(parsed.success).toBe(false);
+  });
+});
