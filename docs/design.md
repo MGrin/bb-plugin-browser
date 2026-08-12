@@ -1,3 +1,8 @@
+> **SUPERSEDED.** This describes v1, which streamed the browser into a bb
+> panel. That approach was abandoned after live use — see `design-v2.md`
+> for what exists now and why. Kept because the failures documented here
+> are the reasoning behind v2, not because any of it still runs.
+
 # bb-plugin-browser — design
 
 **Status:** built. This document describes the plugin as it exists on

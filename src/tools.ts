@@ -4,10 +4,10 @@
 // parameter, so one thread cannot address another thread's page.
 import { z } from "zod";
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { ALLOWED_SCHEMES, assertOpenableUrl, type Operations } from "./operations.js";
+import { ALLOWED_SCHEMES, assertOpenableUrl, type Actions } from "./actions.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
-/** The schema's view of the same rule Operations enforces by throwing. */
+/** The schema's view of the same rule Actions enforces by throwing. */
 function isOpenableUrl(value: string): boolean {
   try {
     assertOpenableUrl(value);
@@ -23,6 +23,7 @@ const UNTRUSTED =
 
 /** Every tool this module registers, in the order it registers them. */
 export const TOOL_NAMES = [
+  "browser_show",
   "browser_open",
   "browser_read",
   "browser_snapshot",
@@ -35,9 +36,26 @@ export const TOOL_NAMES = [
 
 export function registerTools(
   bb: BbPluginApi,
-  operations: Operations,
+  operations: Actions,
   resolveSessionKey: SessionKeyResolver,
+  mode: { show(): Promise<string> },
 ): void {
+  // The one tool that is not about a page. An agent cannot pass a login wall,
+  // solve a CAPTCHA, or decide whether a design looks right — this is how it
+  // hands those to the human instead of guessing or giving up.
+  bb.agents.registerTool({
+    name: "browser_show",
+    description:
+      "Bring the browser on screen so the user can act on the page themselves — a login, " +
+      "a CAPTCHA, a confirmation you should not click, or anything you want them to look at. " +
+      "The browser is headless by default; this is how you ask for a human. Tell them what " +
+      "you need them to do, because the window appearing does not explain itself. " +
+      "Switching modes relaunches the browser: pages are reopened where they were, but " +
+      "anything typed and not submitted is lost, so do not call this mid-form.",
+    parameters: z.object({}),
+    execute: async () => mode.show(),
+  });
+
   const tool = <Schema extends z.ZodType>(
     name: string,
     description: string,
@@ -53,7 +71,7 @@ export function registerTools(
 
   // http/https only. z.url() alone accepts file://, javascript: and data:,
   // and `open` + `read` on a file:// url is a local-file reader — reachable
-  // by injection from any page the agent is already reading. Operations
+  // by injection from any page the agent is already reading. Actions
   // enforces the same rule, so this schema is the message to the model, not
   // the security boundary.
   tool(
