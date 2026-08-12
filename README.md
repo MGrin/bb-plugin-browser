@@ -154,7 +154,7 @@ Three things a script cannot check, in order of what is most worth your time:
 ## Development
 
 ```sh
-npm test          # 327 tests, no live browser touched
+npm test          # 329 tests, no live browser touched
 npm run typecheck
 bb plugin types   # refresh types/ from the running bb
 ```

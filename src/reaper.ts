@@ -139,6 +139,8 @@ export function idleMsFrom(raw: string | undefined): number {
 
 export function createReaper(deps: ReaperDeps): Reaper {
   const lastUsed = new Map<string, number>();
+  /** Whether the last sweep saw any page, so "became empty" can be detected. */
+  let sawPages = false;
   const viewers = new Map<string, number>();
   // When each currently-unbound target was first seen unbound. Not "when it
   // was created": this process may only have started a moment ago, and the
@@ -225,7 +227,15 @@ export function createReaper(deps: ReaperDeps): Reaper {
    * command arrived a second later.
    */
   async function shutdownIfEmpty(pages: OpenPage[] | null, headed: boolean): Promise<void> {
-    if (!pages || pages.length > 0 || headed || viewers.size > 0) return;
+    if (!pages) return;
+    // "Became empty", not "is empty". A listing cannot tell a running browser
+    // with no tabs from no browser at all — both come back as zero pages — so
+    // acting on the state alone means deciding to shut down an already-dead
+    // browser once a minute, forever, and saying so in the log each time. A
+    // transition happens once.
+    const wasOccupied = sawPages;
+    sawPages = pages.length > 0;
+    if (pages.length > 0 || !wasOccupied || headed || viewers.size > 0) return;
     try {
       await deps.shutdownBrowser();
       deps.log("browser has no pages left — shut it down");

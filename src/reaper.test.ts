@@ -579,60 +579,90 @@ describe("runSweeps on abort", () => {
 // A Chromium with nothing open is pure resident memory. Until this existed it
 // stayed running until bb itself went away, which on a laptop means all day.
 describe("shutting an empty browser down", () => {
+  const onePage = (sessionKey: string | null = "thr_a") => [
+    { targetId: "tab-1", url: "https://example.com", sessionKey, ours: true },
+  ];
+
+  /** A sweep that sees a page, so the next empty sweep is a transition. */
+  async function occupyThenEmpty(harness: ReturnType<typeof reaperWith>) {
+    harness.state.pages = onePage();
+    await harness.reaper.sweep(1000);
+    harness.state.pages = [];
+  }
+
   it("shuts down once the last page is gone", async () => {
-    const { reaper, shutdowns, state } = reaperWith();
-    state.pages = [];
-    await reaper.sweep(1000);
-    expect(shutdowns).toEqual(["browser"]);
+    const harness = reaperWith();
+    await occupyThenEmpty(harness);
+    await harness.reaper.sweep(2000);
+    expect(harness.shutdowns).toEqual(["browser"]);
+  });
+
+  // A listing cannot tell a running browser with no tabs from no browser at
+  // all: both are zero pages. Acting on the state rather than the transition
+  // means deciding to shut down an already-dead browser once a minute for the
+  // life of the plugin, and saying so in the log each time.
+  it("does not shut down a browser that was already empty", async () => {
+    const harness = reaperWith();
+    harness.state.pages = [];
+    await harness.reaper.sweep(1000);
+    await harness.reaper.sweep(2000);
+    expect(harness.shutdowns).toEqual([]);
+  });
+
+  it("shuts down once, not once per sweep", async () => {
+    const harness = reaperWith();
+    await occupyThenEmpty(harness);
+    await harness.reaper.sweep(2000);
+    await harness.reaper.sweep(3000);
+    await harness.reaper.sweep(4000);
+    expect(harness.shutdowns).toEqual(["browser"]);
   });
 
   it("leaves a browser that still has a page alone", async () => {
-    const { reaper, shutdowns, state } = reaperWith();
-    state.pages = [{ targetId: "tab-1", url: "https://example.com", sessionKey: "thr_a", ours: true }];
-    await reaper.sweep(1000);
-    expect(shutdowns).toEqual([]);
+    const harness = reaperWith();
+    harness.state.pages = onePage();
+    await harness.reaper.sweep(1000);
+    expect(harness.shutdowns).toEqual([]);
   });
 
   it("never shuts down while a window is on screen", async () => {
     // The human closed their last tab and is about to open another; taking
     // the window away then would look like a crash.
-    const { reaper, shutdowns, state } = reaperWith({ headed: async () => true });
-    state.pages = [];
-    await reaper.sweep(1000);
-    expect(shutdowns).toEqual([]);
+    const harness = reaperWith({ headed: async () => true });
+    await occupyThenEmpty(harness);
+    await harness.reaper.sweep(2000);
+    expect(harness.shutdowns).toEqual([]);
   });
 
   it("never shuts down while anything is held", async () => {
     // `watch` is taken for a command's whole duration as well as by a panel
     // viewer, so a hold means work is in flight even with no tab open yet.
-    const { reaper, shutdowns, state } = reaperWith();
-    state.pages = [];
-    reaper.watch("thr_a");
-    await reaper.sweep(1000);
-    expect(shutdowns).toEqual([]);
-    reaper.unwatch("thr_a");
-    await reaper.sweep(2000);
-    expect(shutdowns).toEqual(["browser"]);
+    const harness = reaperWith();
+    await occupyThenEmpty(harness);
+    harness.reaper.watch("thr_b");
+    await harness.reaper.sweep(2000);
+    expect(harness.shutdowns).toEqual([]);
   });
 
   it("does not shut down on a guess when the listing failed", async () => {
-    const { reaper, shutdowns } = reaperWith({
+    const harness = reaperWith({
       listOpenPages: async () => {
         throw new Error("browser is gone");
       },
     });
-    await reaper.sweep(1000);
-    expect(shutdowns).toEqual([]);
+    await harness.reaper.sweep(1000);
+    await harness.reaper.sweep(2000);
+    expect(harness.shutdowns).toEqual([]);
   });
 
   it("warns rather than throwing when the shutdown fails", async () => {
-    const { reaper, warnings, state } = reaperWith({
+    const harness = reaperWith({
       shutdownBrowser: async () => {
         throw new Error("port busy");
       },
     });
-    state.pages = [];
-    await expect(reaper.sweep(1000)).resolves.toBeUndefined();
-    expect(warnings.join(" ")).toMatch(/could not shut the idle browser down/);
+    await occupyThenEmpty(harness);
+    await expect(harness.reaper.sweep(2000)).resolves.toBeUndefined();
+    expect(harness.warnings.join(" ")).toMatch(/could not shut the idle browser down/);
   });
 });
