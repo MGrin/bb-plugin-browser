@@ -47,10 +47,14 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
 
   // The opening boundary rides along with the first frame rather than being
   // enqueued when the stream starts: an enqueue before anyone has read
-  // consumes the default one-chunk high-water mark, and the desiredSize
-  // guard below would then drop the very first frame — which on a static
-  // page is the only frame there will ever be.
+  // consumes the default one-chunk high-water mark, and the first frame —
+  // which on a static page is the only frame there will ever be — would then
+  // be the one left waiting.
   let firstFrame = true;
+
+  // The newest frame not yet handed to the consumer. At most one: a live view
+  // wants the latest picture, never a queue of stale ones.
+  let pending: Buffer | null = null;
 
   function stop(): void {
     if (stopped) return;
@@ -58,58 +62,75 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
     unsub();
   }
 
+  /**
+   * Hand the newest frame over if the consumer has room for it.
+   *
+   * Called both when a frame arrives and from the stream's own `pull`, which
+   * is what makes this safe on a page that goes quiet. The previous version
+   * DISCARDED any frame arriving while `desiredSize <= 0` — and a default
+   * one-chunk high-water mark is in exactly that state the instant after any
+   * frame is enqueued. On a continuously repainting page that is merely
+   * lossy. On a page that repaints once and settles it is fatal: click a
+   * button, the post-click repaint arrives while the consumer has not pulled,
+   * it is thrown away, the page then goes still and emits nothing further —
+   * and the view sits on a pre-click image forever while the stream, the cast
+   * and the page are all perfectly healthy. That is the "it froze completely"
+   * this fixes.
+   *
+   * Holding one frame instead of discarding it keeps the memory bound the
+   * same (one frame, never a backlog, so a slow phone still cannot lag the
+   * Mac or the other viewers sharing this cast) while making starvation
+   * impossible.
+   */
+  function flush(): void {
+    const controller = controllerRef;
+    if (!controller || stopped || !pending) return;
+    if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
+
+    const frame = pending;
+    pending = null;
+    try {
+      // One enqueue per frame: header, body, and the boundary that CLOSES
+      // this part, all written together so a frame is either on the wire
+      // whole or not at all — nothing here can leave a dangling header
+      // with no body.
+      //
+      // The trailing boundary is what makes a single frame visible. A
+      // browser's multipart parser paints a part when it sees the next
+      // boundary, not when Content-Length bytes arrive, and a page that
+      // renders once and then holds still produces exactly one frame — so
+      // writing the boundary only ahead of the *next* frame leaves an
+      // <img> blank forever on a static page while the stream looks
+      // healthy. Writing it after each frame instead costs 18 bytes.
+      const opening = firstFrame ? `--${BOUNDARY}\r\n` : "";
+      firstFrame = false;
+      controller.enqueue(
+        Buffer.concat([
+          Buffer.from(
+            `${opening}Content-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
+            "binary",
+          ),
+          frame,
+          Buffer.from(`\r\n--${BOUNDARY}\r\n`, "binary"),
+        ]),
+      );
+    } catch {
+      // enqueue throws once the client is gone and the controller has
+      // been errored/closed out from under us by something other than
+      // our own cancel() below (some runtimes never call cancel() for
+      // that case — a dropped socket mid-write surfaces only here).
+      // Release the cast's reference right here instead of waiting for a
+      // cancel() that may not come.
+      stop();
+    }
+  }
+
   try {
     unsub = await subscribe((jpegBase64) => {
-      const controller = controllerRef;
-      if (!controller || stopped) return;
-
-      // The honest backpressure signal on a default ReadableStream
-      // controller is desiredSize: at or below zero means the consumer
-      // has not drained what's already queued. `enqueue` itself has no
-      // opinion — it accepts chunks regardless of whether anyone is
-      // reading, so a "wrote last time" flag would let an unbounded
-      // backlog build the instant the client can't keep up. A stale frame
-      // is worthless to a live view, so the fix here is to drop it, not
-      // buffer it: memory for a slow viewer belongs in that viewer's own
-      // pipe, never in this process, and never at the expense of every
-      // other viewer sharing this session's cast.
-      if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
-
-      const frame = Buffer.from(jpegBase64, "base64");
-      try {
-        // One enqueue per frame: header, body, and the boundary that CLOSES
-        // this part, all written together so a frame is either on the wire
-        // whole or not at all — nothing here can leave a dangling header
-        // with no body.
-        //
-        // The trailing boundary is what makes a single frame visible. A
-        // browser's multipart parser paints a part when it sees the next
-        // boundary, not when Content-Length bytes arrive, and a page that
-        // renders once and then holds still produces exactly one frame — so
-        // writing the boundary only ahead of the *next* frame leaves an
-        // <img> blank forever on a static page while the stream looks
-        // healthy. Writing it after each frame instead costs 18 bytes.
-        const opening = firstFrame ? `--${BOUNDARY}\r\n` : "";
-        firstFrame = false;
-        controller.enqueue(
-          Buffer.concat([
-            Buffer.from(
-              `${opening}Content-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
-              "binary",
-            ),
-            frame,
-            Buffer.from(`\r\n--${BOUNDARY}\r\n`, "binary"),
-          ]),
-        );
-      } catch {
-        // enqueue throws once the client is gone and the controller has
-        // been errored/closed out from under us by something other than
-        // our own cancel() below (some runtimes never call cancel() for
-        // that case — a dropped socket mid-write surfaces only here).
-        // Release the cast's reference right here instead of waiting for a
-        // cancel() that may not come.
-        stop();
-      }
+      if (stopped) return;
+      // Newest wins: an older frame nobody has taken yet is worthless.
+      pending = Buffer.from(jpegBase64, "base64");
+      flush();
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -122,6 +143,13 @@ export async function mjpegResponse(subscribe: FrameSource): Promise<Response> {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
+    },
+    // The other half of latest-frame-wins: when the consumer drains, hand it
+    // whatever the newest frame is. Without this, a frame that arrived while
+    // the queue was full would sit unsent until the page happened to repaint
+    // again — which on a settled page is never.
+    pull() {
+      flush();
     },
     cancel() {
       stop();

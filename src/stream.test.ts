@@ -75,31 +75,80 @@ describe("mjpegResponse", () => {
   // never reads and then asserting on how much got RETAINED is the only
   // version of this test a zero-backpressure implementation can't also
   // pass: the default 1-chunk high-water mark means the first frame's three
-  // enqueues (header, body, trailer) fill it and push desiredSize negative,
-  // so every one of the following 499 frames must be dropped, not queued.
-  it("drops frames instead of queueing them for a slow client", async () => {
+  // A live view wants the newest picture and never a queue of stale ones, so
+  // frames are COALESCED rather than buffered — but coalescing must not mean
+  // discarding. The version this replaced dropped any frame arriving while
+  // the consumer had not drained, which on a page that repaints once and then
+  // settles threw away the only frame there would ever be.
+  it("keeps only the newest frame, never a backlog", async () => {
     let push: (frame: string) => void = () => {};
-    const bigFrame = Buffer.alloc(100_000, 0xab).toString("base64");
+    const big = (byte: number) => Buffer.alloc(100_000, byte).toString("base64");
     const response = await mjpegResponse(async (onFrame) => {
       push = onFrame;
       return () => {};
     });
     const reader = response.body!.getReader();
 
-    for (let index = 0; index < 500; index++) push(bigFrame);
+    for (let index = 0; index < 500; index++) push(big(0xab));
 
-    // Exactly the first frame — one enqueue — should have made it into the
-    // stream's internal queue; drain it.
-    expect((await reader.read()).value).toBeDefined();
+    // One frame is in flight; the other 499 collapsed into a single pending
+    // slot rather than a 50 MB queue.
+    const first = (await reader.read()).value;
+    expect(first).toBeDefined();
+    const second = (await reader.read()).value;
+    expect(second).toBeDefined();
 
-    // A second read must NOT resolve promptly. If backpressure were not
-    // honored, all 500 frames would already be sitting in the
-    // queue and this would return immediately instead of timing out.
-    const outcome = await Promise.race([
+    // Two reads, not 500 frames' worth of buffered bytes.
+    const third = await Promise.race([
       reader.read().then(() => "resolved" as const),
-      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 50)),
+      new Promise<"idle">((resolve) => setTimeout(() => resolve("idle"), 50)),
     ]);
-    expect(outcome).toBe("timeout");
+    expect(third).toBe("idle");
+    await reader.cancel();
+  });
+
+  // The bug this exists for: a frame that arrives while the consumer has not
+  // drained must be delivered when it does drain — not thrown away and left
+  // to a repaint that never comes. This is the "clicked a button and the
+  // image froze completely" case.
+  it("delivers a frame that arrived while the consumer was busy", async () => {
+    let push: (frame: string) => void = () => {};
+    const response = await mjpegResponse(async (onFrame) => {
+      push = onFrame;
+      return () => {};
+    });
+    const reader = response.body!.getReader();
+
+    // Frame 1 fills the one-chunk high-water mark.
+    push(Buffer.from("FIRST").toString("base64"));
+    // Frame 2 arrives with no room — the old code discarded it here.
+    push(Buffer.from("SECOND").toString("base64"));
+
+    const first = Buffer.from((await reader.read()).value!).toString("binary");
+    expect(first).toContain("FIRST");
+
+    // And now the page goes silent: nothing more is ever pushed. The second
+    // frame must still arrive.
+    const second = Buffer.from((await reader.read()).value!).toString("binary");
+    expect(second).toContain("SECOND");
+    await reader.cancel();
+  });
+
+  it("coalesces to the LATEST frame when several arrive while busy", async () => {
+    let push: (frame: string) => void = () => {};
+    const response = await mjpegResponse(async (onFrame) => {
+      push = onFrame;
+      return () => {};
+    });
+    const reader = response.body!.getReader();
+
+    push(Buffer.from("FIRST").toString("base64"));
+    push(Buffer.from("STALE").toString("base64"));
+    push(Buffer.from("NEWEST").toString("base64"));
+
+    expect(Buffer.from((await reader.read()).value!).toString("binary")).toContain("FIRST");
+    // Not STALE: an intermediate frame nobody took is worthless.
+    expect(Buffer.from((await reader.read()).value!).toString("binary")).toContain("NEWEST");
     await reader.cancel();
   });
 
