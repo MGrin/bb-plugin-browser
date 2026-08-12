@@ -82,6 +82,11 @@ it over CDP, so **this is where you log in** — including from a phone, since
 the stream is a plain token-authed HTTP route and works over a Cloudflare
 tunnel.
 
+An agent opens the panel for you by putting `::browser{}` on its own line in a
+message — for a login wall, a CAPTCHA, or anything it wants you to watch. No
+hunting through a menu. `::browser{auto="false"}` offers the button without
+taking over the screen.
+
 The address bar navigates (a missing scheme becomes `https`). **Reload**
 reloads the *view* — it reconnects the stream — not the page. When the thread
 has no page open, the panel says so and waits; input is refused rather than

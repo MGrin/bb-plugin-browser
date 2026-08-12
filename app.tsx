@@ -14,8 +14,11 @@
 //  - The panel names a thread, never a session key. The server derives the
 //    key; see src/panel-rpc.ts.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { definePluginApp, useRpc } from "@bb/plugin-sdk/app";
-import type { PluginThreadPanelProps } from "@bb/plugin-sdk/app";
+import { definePluginApp, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import type {
+  PluginMessageDirectiveProps,
+  PluginThreadPanelProps,
+} from "@bb/plugin-sdk/app";
 import { toPageCoordinates } from "./src/panel-geometry.js";
 import type { PanelView, panelRpcContract } from "./src/panel-rpc.js";
 
@@ -237,6 +240,52 @@ function BrowserPanel({ threadId }: PluginThreadPanelProps) {
   );
 }
 
+/**
+ * `::browser{}` on its own line in an agent's message: opens the Browser panel.
+ *
+ * The panel is where a human logs in, solves a CAPTCHA, or watches what an
+ * agent is doing — and every one of those is a moment the agent knows about
+ * and the human does not. Making them go and find a menu entry is the
+ * difference between a feature that gets used and one that gets explained.
+ *
+ * Opened once per mounted directive, not once per render: a chat message
+ * re-renders whenever it scrolls back into view, and a panel that reopened
+ * itself every time the user scrolled would be indistinguishable from a bug.
+ * If the surface has no side panel — a narrow window, a phone — `openThreadPanel`
+ * returns false and the button below is the fallback rather than a dead end.
+ */
+function OpenBrowserPanel({ attributes }: PluginMessageDirectiveProps) {
+  const navigate = useBbNavigate();
+  const opened = useRef(false);
+  const [failed, setFailed] = useState(false);
+
+  const open = useCallback(() => {
+    const accepted = navigate.openThreadPanel({ actionId: "browser" });
+    setFailed(!accepted);
+    return accepted;
+  }, [navigate]);
+
+  useEffect(() => {
+    if (opened.current) return;
+    opened.current = true;
+    // `auto="false"` lets an agent offer the panel without taking over the
+    // screen — a mention in passing, rather than "look at this now".
+    if (attributes.auto === "false") return;
+    open();
+  }, [attributes.auto, open]);
+
+  return (
+    <button
+      type="button"
+      onClick={open}
+      className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+    >
+      <span aria-hidden>🌐</span>
+      {failed ? "Open the Browser panel" : "Browser panel"}
+    </button>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.threadPanelAction({
     id: "browser",
@@ -246,5 +295,10 @@ export default definePluginApp((app) => {
     // fills whatever is left.
     layout: "flush",
     component: BrowserPanel,
+  });
+
+  app.slots.messageDirective({
+    id: "browser",
+    component: OpenBrowserPanel,
   });
 });

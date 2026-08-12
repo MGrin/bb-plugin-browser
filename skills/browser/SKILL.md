@@ -53,8 +53,25 @@ The browser is signed in, so a wrong click is a real action on a real account.
 ## Handing over to the human
 
 The thread's **Browser** panel streams your page live and forwards the user's
-clicks and keys, so "log in for me" is a real answer. Two things to tell them
-straight:
+clicks and keys, so "log in for me" is a real answer.
+
+**Open it for them — do not describe where it is.** Put this on a line of its
+own in your message and the panel opens itself:
+
+```
+::browser{}
+```
+
+Use it the moment you need their eyes or hands: a login wall, a CAPTCHA, a
+confirmation you should not click yourself, or "watch this happen". Telling
+someone to find a menu entry is the difference between a handover that works
+and one you have to explain twice. It must be alone on its line — mid-sentence
+it stays literal text.
+
+`::browser{auto="false"}` renders the button without taking over their screen,
+for when you are mentioning the panel rather than asking for it.
+
+Two things to tell them straight:
 
 - The panel only accepts input while it is showing a live view. If their page
   has closed, the panel says so and their clicks go nowhere until they hit
