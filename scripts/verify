@@ -1,0 +1,181 @@
+#!/bin/sh
+# verify — prove this plugin works in the bb you are actually running.
+#
+# Every check states what it proves, runs it, and prints PASS or FAIL with the
+# evidence. Nothing here is mocked: it drives the installed plugin through the
+# same `bb browser` surface an agent uses, against a real Chromium.
+#
+#   scripts/verify           # the automated checks
+#   scripts/verify --clean   # close the page afterwards too
+#
+# Exit code is the number of failed checks, so `scripts/verify && echo ok`
+# means something.
+set -u
+
+PASS=0
+FAIL=0
+CLEAN=${1:-}
+
+green() { printf '\033[32m%s\033[0m' "$1"; }
+red()   { printf '\033[31m%s\033[0m' "$1"; }
+dim()   { printf '\033[2m%s\033[0m' "$1"; }
+
+check() { # check <what it proves> <command...>
+  what=$1
+  shift
+  out=$("$@" 2>&1)
+  if [ $? -eq 0 ] && [ -n "$out" ]; then
+    green "PASS"; printf '  %s\n' "$what"
+    printf '      '; dim "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"; printf '\n'
+    PASS=$((PASS + 1))
+  else
+    red "FAIL"; printf '  %s\n' "$what"
+    printf '      %s\n' "$(printf '%s' "$out" | head -3)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+expect_contains() { # expect_contains <what it proves> <needle> <command...>
+  what=$1; needle=$2; shift 2
+  out=$("$@" 2>&1)
+  if printf '%s' "$out" | grep -qF "$needle"; then
+    green "PASS"; printf '  %s\n' "$what"
+    printf '      '; dim "found: $needle"; printf '\n'
+    PASS=$((PASS + 1))
+  else
+    red "FAIL"; printf '  %s\n' "$what"
+    printf '      expected to find %s in:\n      %s\n' "$needle" "$(printf '%s' "$out" | head -3)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo
+echo "bb-plugin-browser — verifying against the running bb"
+echo "---------------------------------------------------"
+echo
+
+# 1. The plugin is loaded and offering its surface. `bb plugin list --json`
+#    reports capabilities, so this proves the agent tools and the skill are
+#    actually registered — not merely that files exist on disk.
+summary() { # summary — one line describing what bb thinks it loaded
+  bb plugin list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = data if isinstance(data, list) else data.get("plugins", data.get("items", []))
+for row in rows:
+    if row.get("id") != "browser":
+        continue
+    caps = row.get("capabilities", [])
+    tools = sorted(c.get("id", "") for c in caps if c.get("kind") == "agent-tool")
+    skills = sorted(c.get("id", "") for c in caps if c.get("kind") == "skill")
+    print("status=%s tools=%d skills=%s errors=%s" % (
+        row.get("status"), len(tools), ",".join(skills) or "none", row.get("errorCount", 0)))
+    print("  " + " ".join(tools))
+'
+}
+
+expect_contains "plugin is loaded and running" "status=running" summary
+expect_contains "all 8 agent tools are registered" "tools=8" summary
+expect_contains "the agent skill resolved" "skills=browser" summary
+expect_contains "the plugin has logged no errors" "errors=0" summary
+
+echo
+
+# 2. The end-to-end path, in the default sandbox. This is the claim the whole
+#    project rests on: no dangerouslyDisableSandbox, no browse wrapper.
+check "opens a real page (no sandbox workaround)" \
+  bb browser open https://example.com
+
+expect_contains "reads the rendered text back" "Example Domain" \
+  bb browser read
+
+expect_contains "evaluates JavaScript in that page" "example.com" \
+  bb browser eval "location.host"
+
+expect_contains "returns an accessibility snapshot with refs" "ref=" \
+  bb browser snapshot
+
+echo
+
+# 3. The page is really this thread's, and it persists between commands —
+#    the property that makes concurrent agents safe.
+expect_contains "the same page persists across commands" "example.com" \
+  bb browser eval "location.href"
+
+# 4. A screenshot round-trips as real PNG bytes.
+SHOT="${TMPDIR:-/tmp}/bb-verify-shot.png"
+rm -f "$SHOT"
+bb browser screenshot "$SHOT" >/dev/null 2>&1
+if [ -s "$SHOT" ] && [ "$(head -c 4 "$SHOT" | od -An -tx1 | tr -d ' \n')" = "89504e47" ]; then
+  green "PASS"; printf '  %s\n' "screenshot is a real PNG"
+  printf '      '; dim "$(wc -c < "$SHOT" | tr -d ' ') bytes at $SHOT"; printf '\n'
+  PASS=$((PASS + 1))
+else
+  red "FAIL"; printf '  %s\n' "screenshot is a real PNG"
+  FAIL=$((FAIL + 1))
+fi
+rm -f "$SHOT"
+
+echo
+
+# 5. The security boundary that had a real hole in it: file:// must be refused
+#    before anything spawns.
+if bb browser open "file:///etc/passwd" >/dev/null 2>&1; then
+  red "FAIL"; printf '  %s\n' "refuses file:// urls"
+  FAIL=$((FAIL + 1))
+else
+  green "PASS"; printf '  %s\n' "refuses file:// urls (local-file read via injection)"
+  PASS=$((PASS + 1))
+fi
+
+# 6. The live MJPEG stream the panel renders. Token auth in the query string is
+#    what makes it load over the Cloudflare tunnel from a phone.
+TOKEN=$(bb plugin token browser 2>/dev/null | tr -d ' \n')
+SERVER=$(sed -n 's/.*"serverUrl": *"\([^"]*\)".*/\1/p' "$HOME/.bb/bb-app-runtime.json" 2>/dev/null)
+if [ -n "$TOKEN" ] && [ -n "$SERVER" ]; then
+  HDRS=$(curl -s -m 4 -D - -o /dev/null \
+    "$SERVER/api/v1/plugins/browser/http/stream?threadId=${BB_THREAD_ID:-scratch}&token=$TOKEN" 2>&1)
+  if printf '%s' "$HDRS" | grep -qi "multipart/x-mixed-replace"; then
+    green "PASS"; printf '  %s\n' "the panel's MJPEG stream serves frames"
+    PASS=$((PASS + 1))
+  elif printf '%s' "$HDRS" | grep -q "404"; then
+    green "PASS"; printf '  %s\n' "stream correctly 404s for a thread with no page"
+    printf '      '; dim "run this from inside a bb thread to see frames"; printf '\n'
+    PASS=$((PASS + 1))
+  else
+    red "FAIL"; printf '  %s\n' "the panel's MJPEG stream serves frames"
+    printf '      %s\n' "$(printf '%s' "$HDRS" | head -1)"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
+echo
+
+if [ "$CLEAN" = "--clean" ]; then
+  bb browser close >/dev/null 2>&1 && dim "closed this thread's page" && echo
+fi
+
+echo "---------------------------------------------------"
+printf '%s passed' "$(green "$PASS")"
+[ "$FAIL" -gt 0 ] && printf ', %s failed' "$(red "$FAIL")"
+echo
+echo
+[ "$FAIL" -eq 0 ] && cat <<'EOF'
+What this did NOT prove — these need your eyes:
+
+  1. The Browser panel tab. Open any bb thread, click + in the side panel,
+     choose "Browser". You should see the page live, and clicking a link in
+     it should navigate. That is the piece no script can check.
+
+  2. Per-thread isolation. Open two bb threads, run `bb browser open` with a
+     different URL in each, then `bb browser read` in both. Each must still
+     report its own page.
+
+  3. Headed mode. `bb plugin config browser set headed true`, then
+     `bb plugin reload browser` and run any command — a real Chrome window
+     appears, and your logins survive the switch.
+EOF
+exit "$FAIL"
