@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BRAVE_BINARY, runningPort, startOrAttach } from "./brave.js";
+import { createActions } from "./actions.js";
 import { createTabs, ownedKey, tabKey, type Tabs } from "./tabs.js";
 import { memoryKv } from "./test-support/memory-kv.js";
 
@@ -154,5 +155,104 @@ suite("a real Brave, driven the way agents will drive it", () => {
     expect(await kv.get(tabKey("thr_close"))).toBeUndefined();
     expect(await kv.get(ownedKey(tab.targetId))).toBeUndefined();
     await expect(tabs.closeTab("thr_close")).resolves.toBeUndefined();
+  }, 60_000);
+});
+
+// The Phase 1 gate: the ACTION surface agents actually call, driven by two
+// threads at the same time. The v1 binding bug was invisible to every unit
+// test and to single-threaded live use — it only appeared when two threads
+// wanted a page at once, which is the normal case for a fleet.
+suite("the action surface, under two threads at once", () => {
+  let profileDir = "";
+  let endpoint = "";
+  let browser: Browser | null = null;
+  let actions: ReturnType<typeof createActions>;
+  const noteworthy: string[] = [];
+
+  const connect = async () => {
+    if (!browser || !browser.isConnected()) browser = await chromium.connectOverCDP(endpoint);
+    return browser;
+  };
+
+  beforeAll(async () => {
+    profileDir = await mkdtemp(join(tmpdir(), "bb-brave-actions-"));
+    endpoint = (await startOrAttach({ profileDir, log: () => {} })).httpEndpoint;
+    const tabs = createTabs({ browser: connect, kv: memoryKv(), log: () => {} });
+    actions = createActions({
+      tabs,
+      activity: {
+        touch: (key) => noteworthy.push(`touch ${key}`),
+        watch: (key) => noteworthy.push(`watch ${key}`),
+        unwatch: (key) => noteworthy.push(`unwatch ${key}`),
+        forget: (key) => noteworthy.push(`forget ${key}`),
+      },
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await browser?.close().catch(() => {});
+    const port = await runningPort(profileDir).catch(() => null);
+    if (port) {
+      await fetch(`http://127.0.0.1:${port}/json/version`)
+        .then(async (response) => {
+          const { webSocketDebuggerUrl } = (await response.json()) as { webSocketDebuggerUrl: string };
+          const socket = new WebSocket(webSocketDebuggerUrl);
+          await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+          socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+          socket.close();
+        })
+        .catch(() => {});
+    }
+    await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  }, 30_000);
+
+  it("two threads open, read and evaluate concurrently without colliding", async () => {
+    await Promise.all([
+      actions.open("thr_one", "https://example.com/"),
+      actions.open("thr_two", "https://example.org/"),
+    ]);
+
+    const [oneHost, twoHost] = await Promise.all([
+      actions.evaluate("thr_one", "location.host"),
+      actions.evaluate("thr_two", "location.host"),
+    ]);
+    expect(oneHost).toContain("example.com");
+    expect(twoHost).toContain("example.org");
+
+    const [oneText, twoText] = await Promise.all([
+      actions.read("thr_one"),
+      actions.read("thr_two"),
+    ]);
+    expect(oneText).toContain("Example Domain");
+    expect(twoText).toContain("Example Domain");
+
+    // And one navigating does not drag the other along.
+    await actions.open("thr_two", "https://www.iana.org/help/example-domains");
+    expect(await actions.evaluate("thr_one", "location.host")).toContain("example.com");
+  }, 90_000);
+
+  it("snapshots something a model can click by", async () => {
+    await actions.open("thr_snap", "https://example.com/");
+    const snapshot = await actions.snapshot("thr_snap", true);
+    expect(snapshot).toMatch(/link|button/);
+  }, 60_000);
+
+  it("screenshots real PNG bytes", async () => {
+    await actions.open("thr_shot", "https://example.com/");
+    const shot = await actions.screenshot("thr_shot");
+    expect(Buffer.from(shot.base64, "base64").subarray(0, 4).toString("hex")).toBe("89504e47");
+  }, 60_000);
+
+  it("refuses file:// before it opens anything", async () => {
+    await expect(actions.open("thr_evil", "file:///etc/passwd")).rejects.toThrow(/only opens/);
+  }, 60_000);
+
+  it("holds the tab for the whole command, not just at the end", async () => {
+    noteworthy.length = 0;
+    await actions.read("thr_one");
+    // watch before the work, unwatch after: a command that outlives the idle
+    // timeout must not have its tab reaped mid-flight.
+    expect(noteworthy[0]).toBe("watch thr_one");
+    expect(noteworthy.at(-1)).toBe("unwatch thr_one");
   }, 60_000);
 });
