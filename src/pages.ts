@@ -58,6 +58,18 @@ export interface PagesDeps {
    */
   registry: PageRegistry;
   log: (message: string) => void;
+  /**
+   * Called whenever a session's page appears or goes away.
+   *
+   * The panel fetches its state on mount and never polls — deliberately, so a
+   * forgotten open panel cannot keep a browser encoding frames for nobody.
+   * The cost is that a panel opened before its thread had a page sits on
+   * "no page open" forever, with nothing able to tell it otherwise: three
+   * separate times in testing the panel was the only thing in the system that
+   * did not know a page existed. This is that missing signal, and it costs one
+   * broadcast per create or close rather than a timer.
+   */
+  onPageChanged?: (sessionKey: string) => void;
   /** See PageRegistryDeps.cdp — a test's way to shorten the connect timeout. */
   cdp?: CdpOptions;
 }
@@ -255,6 +267,7 @@ export function createPages(deps: PagesDeps): Pages {
       await deps.kv.set(originKey(profile), pointer);
     }
     deps.log(`created page ${created.targetId} for ${sessionKey} on ${profile}`);
+    deps.onPageChanged?.(sessionKey);
     return { cdpUrl: pageUrl(browserWsUrl, created.targetId), browserWsUrl, tab: TAB_LABEL };
   }
 

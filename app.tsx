@@ -14,7 +14,7 @@
 //  - The panel names a thread, never a session key. The server derives the
 //    key; see src/panel-rpc.ts.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { definePluginApp, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type {
   PluginMessageDirectiveProps,
   PluginThreadPanelProps,
@@ -76,6 +76,16 @@ function BrowserPanel({ threadId }: PluginThreadPanelProps) {
       mounted.current = false;
     };
   }, [load]);
+
+  // The panel does not poll, so without a push it believes whatever was true
+  // when it mounted — which is how it kept insisting "no page open" while the
+  // thread had one, three separate times in live testing. The backend
+  // broadcasts on every create and close; this is the panel finally listening.
+  useRealtime("page-changed", () => {
+    viewportSynced.current = false;
+    setAttempt((previous) => previous + 1);
+    void load({ syncAddress: true });
+  });
 
   const reload = useCallback(() => {
     setNotice(null);
@@ -208,6 +218,10 @@ function BrowserPanel({ threadId }: PluginThreadPanelProps) {
             src={streamSrc}
             alt="Live page"
             tabIndex={0}
+            // Focused as soon as it mounts. Keystrokes only reach a focused
+            // element, and "click the picture once before typing works" is
+            // not something anyone guesses — it read as broken input.
+            autoFocus
             draggable={false}
             // Width-fit with a natural height, never object-contain: the
             // click mapping assumes the element's rect IS the drawn image,

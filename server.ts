@@ -69,9 +69,16 @@ export default async function plugin(bb: BbPluginApi) {
   // path, the reaper, the thread teardown — takes THIS, and it has no
   // access to `engine` to do either with. `pages` adds the create/bind
   // half on top for the callers that are allowed to.
+  // One broadcast whenever a page appears or goes away, so an open panel can
+  // stop believing whatever was true when it mounted. The panel refetches on
+  // it rather than polling.
+  const announcePageChange = (sessionKey: string) =>
+    bb.realtime.publish("page-changed", { sessionKey });
+
   const registry = createPageRegistry({
     kv: bb.storage.kv,
     log: (message) => bb.log.info(message),
+    onPageChanged: announcePageChange,
   });
 
   const pages = createPages({
@@ -79,6 +86,7 @@ export default async function plugin(bb: BbPluginApi) {
     kv: bb.storage.kv,
     registry,
     log: (message) => bb.log.info(message),
+    onPageChanged: announcePageChange,
   });
 
   const resolveSessionKey = createSessionKeyResolver(bb);

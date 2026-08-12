@@ -46,6 +46,8 @@ export interface RegistryKv {
 export interface PageRegistryDeps {
   kv: RegistryKv;
   log: (message: string) => void;
+  /** See PagesDeps.onPageChanged — the panel's only way to learn a page went. */
+  onPageChanged?: (sessionKey: string) => void;
   /**
    * CDP client tuning — in practice only the connect timeout, and in
    * practice only ever set by a test, since production takes the defaults.
@@ -386,6 +388,7 @@ export function createPageRegistry(deps: PageRegistryDeps): PageRegistry {
           `closePage: ${sessionKey} has no recorded origin, clearing binding without probing`,
         );
         await deps.kv.delete(bindingKey(sessionKey));
+        deps.onPageChanged?.(sessionKey);
         return;
       }
 
