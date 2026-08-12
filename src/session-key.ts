@@ -27,12 +27,24 @@ export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
     let root = threadId;
     while (!seen.includes(current)) {
       seen.push(current);
-      let thread: { parentThreadId: string | null; childOrigin: string | null };
+      let thread: { parentThreadId: string | null; childOrigin: string | null } | null;
       try {
         thread = await bb.sdk.threads.get({ threadId: current });
       } catch {
         seen.pop(); // A failed fetch must not be cached — it may be transient.
         break; // An unreadable thread means root stays at the last node we could read.
+      }
+      // A host that ANSWERS with null — the ordinary shape of a `thread.deleted`
+      // event for a row the host has already removed — is not a thread with no
+      // parent. Reading `.childOrigin` off it throws a TypeError out of the
+      // resolver, and the caller that matters is the thread teardown: it would
+      // only warn, and the page would be left to the idle reaper half an hour
+      // later. So null is an unreadable thread, handled exactly like a throw —
+      // the walk stops, nothing is cached, and a deleted thread still resolves
+      // to its own id, which is what makes the teardown close ITS page.
+      if (!thread) {
+        seen.pop();
+        break;
       }
       root = current; // This node was successfully read, so it's a valid stopping point.
       if (thread.childOrigin === "fork") break;

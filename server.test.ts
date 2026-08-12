@@ -81,11 +81,10 @@ function fakeBb() {
       system: { config: async () => ({ dataDir }) },
       plugins: { token: async () => ({ token: "tok" }) },
       // A thread with no parent, so the session key resolves to the thread
-      // itself. (Note for whoever touches session-key.ts next: it reads
-      // `.childOrigin` off whatever this returns, so a host that answered
-      // null — a thread.deleted event for a row that is already gone —
-      // would throw out of the resolver and the teardown would only warn.
-      // Out of scope here; recorded in the fix report.)
+      // itself. (A host answering `null` here — a thread.deleted event for a
+      // row already gone — used to throw a TypeError out of the resolver;
+      // session-key.ts now treats it as an unreadable thread, covered in
+      // src/session-key.test.ts.)
       threads: { get: async () => ({ parentThreadId: null, childOrigin: null }) },
     },
     http: {
