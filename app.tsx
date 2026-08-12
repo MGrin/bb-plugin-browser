@@ -155,7 +155,23 @@ function BrowserPanel({ threadId }: PluginThreadPanelProps) {
     [send],
   );
 
-  const streamSrc = view?.page
+  // A stream held while nobody is looking is not just wasted frames: an <img>
+  // on a multipart response holds one of the browser's SIX connections to
+  // bb's own origin for as long as it is attached, and reconnects that have
+  // not finished closing hold more. Starve that pool and bb's own API calls
+  // queue behind it — the whole app goes sluggish, which is exactly what
+  // happened in testing and needed a restart to clear. So the stream exists
+  // only while this tab is actually on screen.
+  const [visible, setVisible] = useState(() =>
+    typeof document === "undefined" ? true : !document.hidden,
+  );
+  useEffect(() => {
+    const onVisibility = () => setVisible(!document.hidden);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  const streamSrc = visible && view?.page
     ? `${view.streamPath}?threadId=${encodeURIComponent(threadId)}&token=${encodeURIComponent(
         view.token,
       )}&attempt=${attempt}`
