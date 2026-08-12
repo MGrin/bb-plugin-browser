@@ -1,8 +1,8 @@
-// bb-plugin-browser — one real Brave, shared by every agent.
+// bb-plugin-browser — one real browser, shared by every agent.
 //
 // Wiring only; the decisions live under src/. The shape:
 //
-//   Brave (real app, dedicated profile, its own window)
+//   A Chromium-family browser (real app, dedicated profile, its own window)
 //     └── Playwright over CDP
 //           └── one tab per thread, named by CDP targetId
 //                 └── the eight tools and `bb browser`
@@ -19,7 +19,9 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Browser } from "playwright-core";
 import { chromium } from "./src/playwright-runtime.js";
 import { createActions } from "./src/actions.js";
-import { currentMode, quit as quitBrowser, startOrAttach, type BrowserMode } from "./src/brave.js";
+import { detect } from "./src/browsers.js";
+import { currentMode, quit as quitBrowser, startOrAttach, type BrowserMode } from "./src/launch.js";
+import { profileDirIn } from "./src/profile.js";
 import { createModeSwitch } from "./src/mode.js";
 import { registerCli } from "./src/cli.js";
 import { createReaper2, DEFAULT_IDLE_MINUTES, idleMsFrom } from "./src/reaper2.js";
@@ -41,11 +43,20 @@ export default async function plugin(bb: BbPluginApi) {
         "A tab no thread has used for this long is closed. Only tabs this plugin opened are ever closed — a tab you open yourself is left alone however long it sits there.",
       default: String(DEFAULT_IDLE_MINUTES),
     },
+    browserPath: {
+      type: "string",
+      label: "Browser binary",
+      description:
+        "Path to the Chromium-family browser to drive — Brave, Chrome, Chromium, Edge, Vivaldi or Opera. Leave empty to use whichever is installed. Firefox and Safari cannot be used: they do not speak the DevTools Protocol. Takes effect the next time the browser starts (`bb browser quit` to apply now).",
+      default: "",
+    },
   });
 
   /** The agents' profile. Never the human's — see docs/design-v2.md. */
-  const profileDir = async () =>
-    `${(await bb.sdk.system.config()).dataDir}/plugins/browser/brave-agents`;
+  const profileDir = async () => profileDirIn((await bb.sdk.system.config()).dataDir);
+
+  /** The configured binary, or undefined to let detection choose. */
+  const configuredBinary = async () => (await settings.get()).browserPath?.trim() || undefined;
 
   let browser: Browser | null = null;
   /** One connect at a time; a burst of commands must not open several. */
@@ -68,6 +79,7 @@ export default async function plugin(bb: BbPluginApi) {
     connecting = (async () => {
       const endpoint = await startOrAttach({
         profileDir: await profileDir(),
+        binary: await configuredBinary(),
         mode: launchMode,
         log: (message) => bb.log.info(message),
       });
@@ -136,6 +148,17 @@ export default async function plugin(bb: BbPluginApi) {
     show: () => mode.show(),
     hide: () => mode.hide(),
     current: () => mode.current(),
+    // Worth a line of its own in `status`: on a machine with several browsers
+    // installed, "which one am I logged into" is the question behind most of
+    // the confusing answers this plugin can give.
+    describe: async () => {
+      const configured = await configuredBinary();
+      if (configured) return `${configured} (configured)`;
+      const found = detect();
+      return found
+        ? `${found.name} — ${found.path} (detected)`
+        : "no Chromium-family browser found — set the browserPath setting";
+    },
   });
   bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 

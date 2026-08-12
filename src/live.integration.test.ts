@@ -1,4 +1,4 @@
-// The four tests v1 did not have, against a real Brave.
+// The four tests v1 did not have, against a real browser.
 //
 // v1 shipped 335 unit tests and none of them crossed a boundary that mattered:
 // not time, not a reconnect, not a second thread, not a human's tab. A defect
@@ -10,26 +10,43 @@
 //
 //   npm run test:live
 //
-// Skipped automatically when Brave is not installed, so the normal suite stays
-// runnable anywhere.
-import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+// Skipped automatically when no Chromium-family browser is installed, so the
+// normal suite stays runnable anywhere.
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { BRAVE_BINARY, runningPort, startOrAttach } from "./brave.js";
+import { detect } from "./browsers.js";
+import { runningPort, startOrAttach } from "./launch.js";
 import { createActions } from "./actions.js";
 import { createTabs, ownedKey, tabKey, type Tabs } from "./tabs.js";
 import { memoryKv } from "./test-support/memory-kv.js";
 
-const haveBrave = existsSync(BRAVE_BINARY);
-const suite = haveBrave ? describe : describe.skip;
+// Whatever this machine has — the suite is about the plugin's behaviour, not
+// about one vendor's browser.
+const suite = detect() ? describe : describe.skip;
+
+/**
+ * Where the throwaway profiles go.
+ *
+ * The temp directory by default, and overridable because Chromium needs to
+ * create a ProcessSingleton SOCKET inside its user-data-dir: under a sandbox
+ * that permits writes to the temp directory but not sockets in it, the browser
+ * aborts at startup with "Failed to create socket directory" rather than
+ * anything about the plugin. Point this at a directory the sandbox allows.
+ */
+const profileRoot = process.env.BB_BROWSER_TEST_PROFILE_ROOT ?? tmpdir();
+
+async function throwawayProfile(prefix: string): Promise<string> {
+  await mkdir(profileRoot, { recursive: true });
+  return mkdtemp(join(profileRoot, prefix));
+}
 
 /** A sweep interval's worth of waiting, without waiting a real minute. */
 const ACROSS_TIME_MS = 3_000;
 
-suite("a real Brave, driven the way agents will drive it", () => {
+suite("a real browser, driven the way agents will drive it", () => {
   let profileDir = "";
   let endpoint = "";
   let browser: Browser | null = null;
@@ -44,7 +61,7 @@ suite("a real Brave, driven the way agents will drive it", () => {
   };
 
   beforeAll(async () => {
-    profileDir = await mkdtemp(join(tmpdir(), "bb-brave-live-"));
+    profileDir = await throwawayProfile("bb-browser-live-");
     const started = await startOrAttach({ profileDir, log: () => {} });
     endpoint = started.httpEndpoint;
     kv = memoryKv();
@@ -175,7 +192,7 @@ suite("the action surface, under two threads at once", () => {
   };
 
   beforeAll(async () => {
-    profileDir = await mkdtemp(join(tmpdir(), "bb-brave-actions-"));
+    profileDir = await throwawayProfile("bb-browser-actions-");
     endpoint = (await startOrAttach({ profileDir, log: () => {} })).httpEndpoint;
     const tabs = createTabs({ browser: connect, kv: memoryKv(), log: () => {} });
     actions = createActions({

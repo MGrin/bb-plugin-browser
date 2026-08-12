@@ -1,15 +1,28 @@
 {
   "name": "bb-plugin-browser",
   "version": "0.1.0",
+  "description": "A real browser for bb's agents: one Chromium-family browser, one tab per thread, headless by default.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MGrin/bb-plugin-browser.git"
+  },
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "browser",
+    "playwright",
+    "cdp",
+    "agents"
+  ],
   "type": "module",
-  "private": true,
   "engines": {
     "bb": ">=0.36",
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
     "name": "Browser",
-    "description": "One real Brave shared by every agent: a tab per thread, and a window you can take over.",
+    "description": "One real browser shared by every agent: a tab per thread, and a window you can take over.",
     "branding": {
       "icon": "Globe"
     },

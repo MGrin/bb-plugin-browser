@@ -1,8 +1,17 @@
-# bb-plugin-browser v2 — one real Brave, N agents, no view to stream
+# bb-plugin-browser v2 — one real browser, N agents, no view to stream
 
-**Status:** proposed, awaiting approval
+**Status:** implemented
 **Date:** 2026-08-12
 **Supersedes:** the streamed-panel architecture in `docs/design.md`
+
+> **Amended 2026-08-12 — any Chromium, not only Brave.** This document says
+> "Brave" throughout because Brave is what it was designed and measured
+> against, and that record is left as it was written. The shipped plugin drives
+> **any Chromium-family browser** — Brave, Chrome, Chromium, Edge, Vivaldi,
+> Opera — because every mechanism below is CDP and none of it is vendor-
+> specific. `src/browsers.ts` detects the first one installed; the plugin's
+> `browserPath` setting pins a specific binary. Firefox and Safari remain
+> impossible: no CDP. Read "Brave" below as "the detected browser".
 
 One dedicated Brave profile on the host, driven over CDP. Every thread gets its
 own tab. The window is real, so a human takes over by using it.
@@ -30,7 +39,7 @@ Removing the panel removes them outright rather than patching them.
 bb plugin ──Playwright connectOverCDP──> Brave (dedicated profile, own window)
                                           ├── tab: thread A   ← agent A drives
                                           ├── tab: thread B   ← agent B drives
-                                          └── tab: whatever mgrin opens
+                                          └── tab: whatever the user opens
 ```
 
 - **One browser**, launched by the plugin: the real `/Applications/Brave Browser.app`
@@ -82,7 +91,7 @@ Verified: real Brave answers CDP as `Chrome/151.0.7922.108`, non-headless, no
     - /url: https://iana.org/domains/example
 ```
 
-A dedicated profile rather than mgrin's own: driving his everyday browser would
+A dedicated profile rather than the user's own: driving their everyday browser would
 mean running it with remote debugging permanently, which hands every local
 process control of all his browsing. The dedicated profile is the same real
 Brave, its own window, logged in once.
@@ -94,7 +103,7 @@ and use it. A verified consequence: a human tab opened in that window coexists
 with agent tabs and does not disturb them.
 
 Etiquette, enforced in code: **the plugin only ever closes tabs it opened.** A
-tab mgrin opens is never reaped, however idle it looks.
+tab the user opens is never reaped, however idle it looks.
 
 ## Lifecycle, and the rule v1 got wrong
 
@@ -106,7 +115,7 @@ v2 leaves it running and *reattaches* — the targetIds are still valid.
 - An idle reaper closes tabs this plugin opened that no thread has used for
   `idleMinutes`, and never touches a tab it did not open.
 - Thread archived or deleted → close that thread's tab.
-- The browser is shut down only when mgrin asks for it (`bb browser quit`).
+- The browser is shut down only when the user asks for it (`bb browser quit`).
 
 ## What survives from v1
 
@@ -155,7 +164,7 @@ unit tests against a fake. The fakes are what let v1's defects through.
 
 ## Open questions
 
-- **Login maintenance.** The dedicated profile needs mgrin to log into the sites
+- **Login maintenance.** The dedicated profile needs the user to log into the sites
   agents use, once, in that window. Worth doing deliberately rather than
   discovering per site.
 - **Remote debugging exposure.** The port is localhost-only, but any local

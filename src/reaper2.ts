@@ -4,7 +4,7 @@
 //
 //   1. Only tabs THIS PLUGIN opened are ever closed. v1's reaper closed
 //      anything no binding named, which in a real window is precisely the tab
-//      a human opened to log in — it closed one out from under mgrin inside
+//      a human opened to log in — it closed one out from under a user inside
 //      two minutes.
 //   2. The browser is never shut down. v1 shut it down when it looked empty,
 //      which ended the process holding every thread's handle on its page and

@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { runCli } from "./cli.js";
+import { runCli, tabLabel } from "./cli.js";
 
 function fakeOperations() {
   return {
@@ -139,5 +139,79 @@ describe("runCli usage errors", () => {
     const result = await runCli(operations, "thr_a", ["click", ""]);
     expect(result.exitCode).toBe(1);
     expect(operations.click).not.toHaveBeenCalled();
+  });
+});
+
+// The listing bug a thread reported on 2026-08-12: it ran `browser_open`,
+// its page loaded, and `bb browser tabs` then showed BOTH its own bound row
+// and a row labelled "yours" on about:blank. Nothing was wrong with the
+// driving — `eval` hit the right page — but "yours" is the most authoritative
+// label in that output, and it was attached to the browser's own startup tab.
+// The reasonable reading, "my navigation failed", was exactly backwards.
+describe("tabLabel", () => {
+  const blank = { url: "about:blank", sessionKey: null, ours: false };
+
+  it("names the browser's startup tab instead of blaming a human for it", () => {
+    expect(tabLabel(blank, "thr_me")).toBe("(browser startup tab)");
+  });
+
+  it("never says 'yours' — the plugin cannot know whose an unbound tab is", () => {
+    const foreign = { url: "https://example.com/", sessionKey: null, ours: false };
+    expect(tabLabel(foreign, "thr_me")).toBe("(not opened by bb)");
+    expect(tabLabel(foreign, "thr_me")).not.toMatch(/yours/i);
+    expect(tabLabel(blank, "thr_me")).not.toMatch(/yours/i);
+  });
+
+  it("marks the caller's own row so it need not be found by matching an id by eye", () => {
+    const mine = { url: "https://example.com/", sessionKey: "thr_me", ours: true };
+    expect(tabLabel(mine, "thr_me")).toBe("thr_me (this thread)");
+  });
+
+  it("names another thread by its id, unmarked", () => {
+    const theirs = { url: "https://example.com/", sessionKey: "thr_other", ours: true };
+    expect(tabLabel(theirs, "thr_me")).toBe("thr_other");
+  });
+
+  it("distinguishes an agent tab that lost its binding from one we never opened", () => {
+    expect(tabLabel({ url: "https://example.com/", sessionKey: null, ours: true }, "thr_me")).toBe(
+      "(agent tab, unbound)",
+    );
+  });
+});
+
+describe("bb browser tabs and status", () => {
+  const tabs = [
+    { targetId: "t1", url: "about:blank", sessionKey: null, ours: false },
+    { targetId: "t2", url: "https://example.com/", sessionKey: "thr_me", ours: true },
+    { targetId: "t3", url: "https://example.org/", sessionKey: "thr_other", ours: true },
+  ];
+  const browser = {
+    show: async () => "shown",
+    hide: async () => "hidden",
+    current: async () => "headless" as const,
+    describe: async () => "Brave — /Applications/x (detected)",
+    quit: async () => true,
+    listTabs: async () => tabs,
+  };
+
+  it("lists every tab without claiming the startup tab belongs to anyone", async () => {
+    const result = await runCli(fakeOperations(), "thr_me", ["tabs"], browser);
+    expect(result.stdout).toContain("(browser startup tab)");
+    expect(result.stdout).toContain("thr_me (this thread)");
+    expect(result.stdout).toContain("thr_other");
+    expect(result.stdout).not.toMatch(/yours/i);
+  });
+
+  it("accounts for every open tab in status, so none reads as a stray", async () => {
+    const result = await runCli(fakeOperations(), "thr_me", ["status"], browser);
+    expect(result.stdout).toContain("3 tab(s)");
+    expect(result.stdout).toContain("2 opened by agents");
+    expect(result.stdout).toContain("1 browser startup");
+    expect(result.stdout).toContain("0 not ours");
+  });
+
+  it("says which browser is being driven — the question behind most confusion", async () => {
+    const result = await runCli(fakeOperations(), "thr_me", ["status"], browser);
+    expect(result.stdout).toContain("Brave — /Applications/x (detected)");
   });
 });
