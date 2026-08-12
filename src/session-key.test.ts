@@ -58,6 +58,35 @@ describe("createSessionKeyResolver", () => {
     expect(await resolve("child")).toBe("child");
   });
 
+  // A `thread.deleted` event for a row the host has already removed is the
+  // ordinary way this happens, and the host answers it with null rather than
+  // by throwing. Reading `.childOrigin` off that null threw a TypeError out
+  // of the resolver, which the teardown could only warn about — leaving the
+  // deleted thread's page open for the idle reaper to find half an hour later.
+  it("treats a thread the host answers null for as its own root, without throwing", async () => {
+    const bb = {
+      sdk: { threads: { get: async () => null } },
+    } as never;
+    const resolve = createSessionKeyResolver(bb);
+    // Its own id, not scratch and not a throw: the teardown compares the
+    // resolved key with the thread id to decide whether this thread OWNS the
+    // page, and only an exact match closes it.
+    await expect(resolve("thr_deleted")).resolves.toBe("thr_deleted");
+  });
+
+  it("stops the walk at an ancestor the host answers null for", async () => {
+    const bb = {
+      sdk: {
+        threads: {
+          get: async ({ threadId }: { threadId: string }) =>
+            threadId === "child" ? { parentThreadId: "gone", childOrigin: "spawn" } : null,
+        },
+      },
+    } as never;
+    const resolve = createSessionKeyResolver(bb);
+    await expect(resolve("child")).resolves.toBe("child");
+  });
+
   it("survives a parent cycle", async () => {
     const resolve = createSessionKeyResolver(
       fakeBb({

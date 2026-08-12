@@ -117,15 +117,44 @@ window. The profile directory is untouched, so **every login survives** the
 switch in both directions. There is no `--headed` flag on any command — headed
 is a property of the browser process, and therefore of the profile.
 
-While headed, the reaper leaves tabs nobody is bound to alone, so the tabs
-*you* open are not closed out from under you mid-login. Debris therefore
-accumulates while headed and clears when you go back to headless (which closes
-the browser).
+While headed, the reaper only closes tabs *this plugin* opened, so the tabs you
+open yourself are never closed out from under you mid-login — however long they
+sit there. The plugin's own orphans are still collected in both modes, so
+nothing accumulates waiting for a mode change.
+
+## Verifying it works
+
+```sh
+scripts/verify           # eleven checks against the bb you are running
+scripts/verify --clean   # …and close the page afterwards
+```
+
+It drives the installed plugin through the same `bb browser` surface an agent
+uses, against a real Chromium — nothing is mocked. Each check prints what it
+proves. Exit code is the number of failures, so `scripts/verify && echo ok`
+means something.
+
+What it covers: the plugin is loaded with all eight tools and its skill and no
+errors; a real page opens, reads, evaluates and snapshots **inside the default
+sandbox**, with no `dangerouslyDisableSandbox` and no `browse` wrapper; the page
+persists across commands; a screenshot round-trips as real PNG bytes; `file://`
+is refused; and the panel's MJPEG route serves frames.
+
+Three things a script cannot check, in order of what is most worth your time:
+
+1. **The panel.** Open a thread, click **+** in the side panel, choose
+   **Browser**. The live page appears, and clicking a link inside it navigates.
+2. **Per-thread isolation.** In two different bb threads, `bb browser open` a
+   different URL in each, then `bb browser read` in both. Each must still report
+   its own page — that is the property the whole binding mechanism exists for.
+3. **Headed mode.** `bb plugin config browser set headed true`, reload the
+   plugin, run any command: a real Chrome window appears and your logins survive
+   the switch, because the profile directory does not change.
 
 ## Development
 
 ```sh
-npm test          # 276 tests, no live browser touched
+npm test          # 327 tests, no live browser touched
 npm run typecheck
 bb plugin types   # refresh types/ from the running bb
 ```

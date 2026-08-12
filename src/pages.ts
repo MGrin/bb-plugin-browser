@@ -24,11 +24,13 @@ import {
 } from "./browser-endpoint.js";
 import {
   bindingKey,
+  createdKey,
   markerUrl,
   originKey,
   withoutPrefix,
   type Binding,
   type BrowserPointer,
+  type CreatedTarget,
   type PageRegistry,
 } from "./page-registry.js";
 
@@ -59,6 +61,25 @@ export interface PagesDeps {
   /** See PageRegistryDeps.cdp — a test's way to shorten the connect timeout. */
   cdp?: CdpOptions;
 }
+
+/** Where a session's page was when its browser was taken down for a relaunch. */
+interface PendingRestore {
+  profile: string;
+  url: string;
+  at: number;
+}
+
+const restoreKey = (sessionKey: string) => `restore:${sessionKey}`;
+
+/**
+ * How long a captured URL stays worth restoring.
+ *
+ * A relaunch is consumed by the very next command, which is seconds away. The
+ * window exists only so a capture that is never consumed — the thread went
+ * quiet, bb restarted — cannot reopen a logged-in page an hour later when
+ * somebody finally types a command.
+ */
+const RESTORE_WINDOW_MS = 10 * 60_000;
 
 /** What a session needs to put itself on this thread's page. */
 export interface PageBinding {
@@ -99,6 +120,13 @@ export interface Pages extends PageRegistry {
   shutdownBrowser(profile: string): Promise<void>;
   /** The same, for every browser this engine has running. */
   shutdownAllBrowsers(): Promise<void>;
+  /**
+   * Record where every bound page is, so the next page each session is handed
+   * can go back there. Called immediately before a relaunch — the one moment
+   * pages are about to be destroyed for a reason that has nothing to do with
+   * the threads using them.
+   */
+  captureForRestore(profile: string): Promise<void>;
 }
 
 /**
@@ -110,6 +138,52 @@ export interface Pages extends PageRegistry {
 export const TAB_LABEL = "bbpage";
 
 export function createPages(deps: PagesDeps): Pages {
+  /**
+   * Put a thread back where it was after its browser was relaunched.
+   *
+   * Toggling `headed` closes the browser, which takes every page with it, so
+   * a thread that had been working somewhere would otherwise come back to a
+   * blank tab with no explanation. `captureForRestore` records where each
+   * bound page was before the shutdown; this consumes that record the next
+   * time the session is handed a page.
+   *
+   * Deliberately narrow, because "reopen the page you had" is a bad default
+   * for an agent's browser: the record is written only by the relaunch path,
+   * used at most once, deleted whether or not the navigation worked, and
+   * ignored once stale. An explicit `browser_close` must never resurrect a
+   * logged-in page minutes later.
+   */
+  async function restoreUrlIfPending(
+    sessionKey: string,
+    profile: string,
+    browserWsUrl: string,
+  ): Promise<void> {
+    const pending = await deps.kv.get<PendingRestore>(restoreKey(sessionKey));
+    if (!pending) return;
+    await deps.kv.delete(restoreKey(sessionKey));
+    if (pending.profile !== profile) return;
+    if (Date.now() - pending.at > RESTORE_WINDOW_MS) return;
+
+    try {
+      await deps.engine.run({
+        profile,
+        session: sessionKey,
+        attach: true,
+        argv: ["batch"],
+        stdin: JSON.stringify([
+          ["connect", browserWsUrl],
+          ["tab", TAB_LABEL],
+          ["open", pending.url],
+        ]),
+      });
+    } catch (error) {
+      // A blank tab is a worse outcome than a wrong one only if nobody is
+      // told: the page exists and is usable either way, so this is a note,
+      // not a failure of createPage.
+      deps.log(`could not restore ${pending.url} for ${sessionKey}: ${messageOf(error)}`);
+    }
+  }
+
   async function createPage(
     sessionKey: string,
     profile: string,
@@ -158,6 +232,18 @@ export function createPages(deps: PagesDeps): Pages {
       tab: TAB_LABEL,
     };
     await deps.kv.set(bindingKey(sessionKey), binding);
+    await restoreUrlIfPending(sessionKey, profile, browserWsUrl);
+    // And that WE opened this tab, keyed by target rather than by session:
+    // a binding is lost routinely (a rebind, a thread teardown, a forget),
+    // and the page it named is then indistinguishable from a tab the human
+    // opened unless something outlives the binding to say otherwise. That
+    // record is what lets the reaper clear its own orphans while the browser
+    // is headed instead of suspending itself and leaving them for a headless
+    // relaunch that restores them anyway. The registry prunes these when the
+    // browser no longer has the target, so the store stays bounded by the
+    // number of open tabs.
+    const ownership: CreatedTarget = { profile, at: Date.now() };
+    await deps.kv.set(createdKey(binding.targetId), ownership);
     // Remembered per profile as well as per binding: the reaper has to be
     // able to find this browser after every binding for it is gone, which is
     // exactly the state a restart leaves behind together with the tabs it
@@ -255,6 +341,28 @@ export function createPages(deps: PagesDeps): Pages {
       return (await bindingFor(sessionKey, profile)).cdpUrl;
     },
 
+    async captureForRestore(profile) {
+      // Through the registry, so capturing cannot start a browser to find out
+      // where its pages are — the whole point is that one is about to stop.
+      let open: Awaited<ReturnType<PageRegistry["listOpenPages"]>>;
+      try {
+        open = await deps.registry.listOpenPages();
+      } catch (error) {
+        deps.log(`could not capture pages before the relaunch: ${messageOf(error)}`);
+        return;
+      }
+      const at = Date.now();
+      for (const page of open) {
+        // Only bound pages: an unbound tab belongs to nobody to restore it
+        // for. And only real destinations — a blank tab restored is just a
+        // blank tab, with a stale record left behind to expire.
+        if (!page.sessionKey) continue;
+        if (!/^https?:\/\//.test(page.url)) continue;
+        const pending: PendingRestore = { profile, url: page.url, at };
+        await deps.kv.set(restoreKey(page.sessionKey), pending);
+      }
+    },
+
     async shutdownBrowser(profile) {
       try {
         await deps.engine.shutdown(profile);
@@ -277,3 +385,5 @@ export function createPages(deps: PagesDeps): Pages {
     },
   };
 }
+
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));

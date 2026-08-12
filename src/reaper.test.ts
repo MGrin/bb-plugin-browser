@@ -14,6 +14,7 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
   const closedTargets: string[] = [];
   const logs: string[] = [];
   const warnings: string[] = [];
+  const shutdowns: string[] = [];
   // The browser's tab list, shared with `closeUnboundPage` the way a real
   // browser shares it: closing a page really removes it from the list.
   const state = { pages: [] as OpenPage[] };
@@ -25,6 +26,9 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
       closed.push(sessionKey);
     },
     listOpenPages: async () => state.pages,
+    shutdownBrowser: async () => {
+      shutdowns.push("browser");
+    },
     closeUnboundPage: async (targetId: string) => {
       closedTargets.push(targetId);
       state.pages = state.pages.filter((page) => page.targetId !== targetId);
@@ -33,14 +37,25 @@ function reaperWith(overrides: Partial<ReaperDeps> = {}) {
     warn: (message: string) => warnings.push(message),
     ...overrides,
   });
-  return { closed, closedTargets, logs, warnings, state, reaper };
+  return { closed, closedTargets, logs, warnings, shutdowns, state, reaper };
 }
 
-const page = (targetId: string, sessionKey: string | null = null): OpenPage => ({
-  targetId,
-  url: "about:blank",
-  sessionKey,
-});
+/**
+ * A page in the browser. `ours` defaults to false — a tab this plugin did
+ * NOT open — because that is the conservative default for every test that
+ * does not care, and it keeps the headless tests honest: they must still
+ * close debris nobody created through this plugin, which is exactly what a
+ * relaunch's restored tabs are.
+ */
+const page = (
+  targetId: string,
+  sessionKey: string | null = null,
+  ours = false,
+): OpenPage => ({ targetId, url: "about:blank", sessionKey, ours });
+
+/** A page this plugin opened, whoever is (or is no longer) bound to it. */
+const ourPage = (targetId: string, sessionKey: string | null = null): OpenPage =>
+  page(targetId, sessionKey, true);
 
 describe("reaper: idle pages", () => {
   it("closes a page idle past the timeout", async () => {
@@ -333,6 +348,44 @@ describe("reaper: the human's own tabs, while the browser is headed", () => {
     expect(closed).toEqual(["thr_a"]);
   });
 
+  // The half the blanket suspension got wrong. A page this plugin opened and
+  // then lost the binding for was unreapable until headless returned — and
+  // toggling headed relaunches Chromium, which RESTORES that debris with
+  // fresh ids. "Headed → lose a binding → toggle twice" carried tabs forward
+  // forever. Our own orphans go in both modes; nothing else is touched while
+  // the window is up.
+  it("still closes an orphan it opened itself while the window is up", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [ourPage("a-page-we-opened-and-lost")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["a-page-we-opened-and-lost"]);
+  });
+
+  it("tells its own orphan apart from the human's tab in the same sweep", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => true });
+    state.pages = [page("the-humans-login-tab"), ourPage("ours")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["ours"]);
+  });
+
+  // Headless there is no window and therefore no human tab, and a restored
+  // tab carries a fresh target id no record of ours could ever name — so the
+  // pass must still close pages it cannot claim. This is the measured case
+  // the whole module exists for: 21 leftover tabs came back after one plugin
+  // reload, and not one of them was recognisable as ours.
+  it("closes a tab it cannot claim once the window is gone", async () => {
+    const { closedTargets, state, reaper } = reaperWith({ headed: async () => false });
+    state.pages = [page("restored-by-chromium")];
+
+    await reaper.sweep(0);
+    await reaper.sweep(600);
+    expect(closedTargets).toEqual(["restored-by-chromium"]);
+  });
+
   it("resumes closing unbound tabs once the window is gone", async () => {
     let headed = true;
     const { closedTargets, state, reaper } = reaperWith({ headed: async () => headed });
@@ -490,5 +543,96 @@ describe("thread teardown", () => {
     await expect(teardown({ thread: { id: "thr_a" } })).resolves.toBeUndefined();
     expect(closed).toEqual([]);
     expect(warnings.join("\n")).toContain("thread vanished");
+  });
+});
+
+// Shutdown ordering, which the sweep loop's own tests did not pin.
+//
+// A mutation that deleted the post-sleep abort check left the suite green.
+// The consequence is one extra full sweep running *during* teardown — the
+// plugin is disposing, the browser may already be going away, and the sweep
+// closes pages and reaches for a CDP endpoint on the way out.
+describe("runSweeps on abort", () => {
+  it("does not sweep again when the signal aborts during the sleep", async () => {
+    const controller = new AbortController();
+    const sweep = vi.fn(async () => {});
+    const done = runSweeps(controller.signal, { sweep }, { intervalMs: 50, warn: () => {} });
+    // Abort while the loop is parked in its sleep, which is where a plugin
+    // reload or a bb shutdown actually lands.
+    controller.abort();
+    await done;
+    expect(sweep).not.toHaveBeenCalled();
+  });
+
+  it("stops sweeping once aborted, rather than running one last pass", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const sweep = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) controller.abort();
+    });
+    await runSweeps(controller.signal, { sweep }, { intervalMs: 1, warn: () => {} });
+    expect(calls).toBe(1);
+  });
+});
+
+// A Chromium with nothing open is pure resident memory. Until this existed it
+// stayed running until bb itself went away, which on a laptop means all day.
+describe("shutting an empty browser down", () => {
+  it("shuts down once the last page is gone", async () => {
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual(["browser"]);
+  });
+
+  it("leaves a browser that still has a page alone", async () => {
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [{ targetId: "tab-1", url: "https://example.com", sessionKey: "thr_a", ours: true }];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("never shuts down while a window is on screen", async () => {
+    // The human closed their last tab and is about to open another; taking
+    // the window away then would look like a crash.
+    const { reaper, shutdowns, state } = reaperWith({ headed: async () => true });
+    state.pages = [];
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("never shuts down while anything is held", async () => {
+    // `watch` is taken for a command's whole duration as well as by a panel
+    // viewer, so a hold means work is in flight even with no tab open yet.
+    const { reaper, shutdowns, state } = reaperWith();
+    state.pages = [];
+    reaper.watch("thr_a");
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+    reaper.unwatch("thr_a");
+    await reaper.sweep(2000);
+    expect(shutdowns).toEqual(["browser"]);
+  });
+
+  it("does not shut down on a guess when the listing failed", async () => {
+    const { reaper, shutdowns } = reaperWith({
+      listOpenPages: async () => {
+        throw new Error("browser is gone");
+      },
+    });
+    await reaper.sweep(1000);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("warns rather than throwing when the shutdown fails", async () => {
+    const { reaper, warnings, state } = reaperWith({
+      shutdownBrowser: async () => {
+        throw new Error("port busy");
+      },
+    });
+    state.pages = [];
+    await expect(reaper.sweep(1000)).resolves.toBeUndefined();
+    expect(warnings.join(" ")).toMatch(/could not shut the idle browser down/);
   });
 });

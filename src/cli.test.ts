@@ -61,3 +61,83 @@ describe("runCli", () => {
     expect(result.stderr).toContain("no such element");
   });
 });
+
+// Each subcommand's wiring, pinned one at a time.
+//
+// A mutation sweep found that every one of these could be re-routed — `close`
+// to `read`, `--full` inverted — with the whole suite still green, because the
+// original five tests exercised three of eight subcommands. Wiring a command
+// to the wrong operation produces a confident success message and does nothing,
+// which is the worst failure this CLI can have.
+describe("runCli subcommand wiring", () => {
+  it("routes read to read, and returns what the page said", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["read"]);
+    expect(operations.read).toHaveBeenCalledWith("thr_a");
+    expect(operations.close).not.toHaveBeenCalled();
+    expect(result.stdout).toBe("page text");
+  });
+
+  it("routes eval to evaluate, passing the expression", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["eval", "document.title"]);
+    expect(operations.evaluate).toHaveBeenCalledWith("thr_a", "document.title");
+    expect(result.stdout).toBe("42");
+  });
+
+  it("routes close to close — never to a read that would report false success", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["close"]);
+    expect(operations.close).toHaveBeenCalledWith("thr_a");
+    expect(operations.read).not.toHaveBeenCalled();
+    expect(result.stdout).toBe("closed");
+  });
+
+  it("routes click to click, passing the selector", async () => {
+    const operations = fakeOperations();
+    await runCli(operations, "thr_a", ["click", "#submit"]);
+    expect(operations.click).toHaveBeenCalledWith("thr_a", "#submit");
+  });
+});
+
+describe("runCli flags and defaults", () => {
+  it("snapshots the interactive tree by default", async () => {
+    const operations = fakeOperations();
+    await runCli(operations, "thr_a", ["snapshot"]);
+    expect(operations.snapshot).toHaveBeenCalledWith("thr_a", true);
+  });
+
+  it("snapshots the full tree only when --full is passed", async () => {
+    const operations = fakeOperations();
+    await runCli(operations, "thr_a", ["snapshot", "--full"]);
+    expect(operations.snapshot).toHaveBeenCalledWith("thr_a", false);
+  });
+
+  it("does not submit unless --submit is passed", async () => {
+    const operations = fakeOperations();
+    await runCli(operations, "thr_a", ["type", "#q", "hello"]);
+    expect(operations.type).toHaveBeenCalledWith("thr_a", "#q", "hello", false);
+  });
+});
+
+describe("runCli usage errors", () => {
+  it.each([
+    { argv: ["open"], missing: "url", op: "open" as const },
+    { argv: ["click"], missing: "selector", op: "click" as const },
+    { argv: ["eval"], missing: "expression", op: "evaluate" as const },
+    { argv: ["type", "#q"], missing: "text", op: "type" as const },
+  ])("refuses $argv with no $missing, and calls nothing", async ({ argv, op }) => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", argv);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("usage:");
+    expect(operations[op]).not.toHaveBeenCalled();
+  });
+
+  it("treats an empty selector as missing rather than passing it through", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["click", ""]);
+    expect(result.exitCode).toBe(1);
+    expect(operations.click).not.toHaveBeenCalled();
+  });
+});

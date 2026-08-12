@@ -337,9 +337,13 @@ describe("pages", () => {
       await pages.pageUrlFor("thr_a", "main");
 
       const open = await pages.listOpenPages();
+      // And which of them this plugin opened. `restored` came back with the
+      // browser and belongs to nobody here; `tab-1` is ours. While the
+      // browser is headed that difference is the only thing standing between
+      // the reaper and the human's login tab.
       expect(open).toEqual([
-        { targetId: "restored", url: "https://leftover.example/", sessionKey: null },
-        { targetId: "tab-1", url: "about:blank", sessionKey: "thr_a" },
+        { targetId: "restored", url: "https://leftover.example/", sessionKey: null, ours: false },
+        { targetId: "tab-1", url: "about:blank", sessionKey: "thr_a", ours: true },
       ]);
     });
 
@@ -369,8 +373,99 @@ describe("pages", () => {
       }
 
       const open = await pages.listOpenPages();
-      expect(open).toEqual([{ targetId: "tab-1", url: "about:blank", sessionKey: null }]);
+      // Unowned now — and still recognisably ours, which is the whole reason
+      // the record is keyed by target instead of by session: a binding is
+      // lost routinely, and a page that loses one has not stopped being a
+      // page this plugin opened.
+      expect(open).toEqual([
+        { targetId: "tab-1", url: "about:blank", sessionKey: null, ours: true },
+      ]);
       expect(browserCdpUrl).toHaveBeenCalledTimes(1);
+    });
+
+    // The record of which tabs this plugin opened is written per target and
+    // never per session, so it survives the binding. That makes it a store
+    // that could grow forever — one row per page ever created — which is why
+    // every one of these is about it NOT doing that.
+    describe("the record of which tabs this plugin opened", () => {
+      const createdRows = (kv: { store: Map<string, unknown> }) =>
+        [...kv.store.keys()].filter((key) => key.startsWith("created:"));
+
+      it("prunes the row of a tab the browser no longer has", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        expect(createdRows(kv)).toEqual(["created:tab-1"]);
+
+        // The tab goes away behind our back — a crash, the panel, a relaunch
+        // that minted new ids for everything. Backdated past the grace, since
+        // the grace exists only to cover the moments around a create.
+        server.targets = [];
+        await kv.set("created:tab-1", { profile: "main", at: Date.now() - 10 * 60_000 });
+
+        await pages.listOpenPages();
+        expect(createdRows(kv)).toEqual([]);
+      });
+
+      // `createPage` opens the tab and writes this row afterwards, so a
+      // listing that started before the tab existed must not be allowed to
+      // delete the row written after it. Pruning that row would disown a live
+      // page permanently — and while headed, "not ours" means "never reaped".
+      it("keeps a row younger than the grace period, even with no such tab", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        server.targets = [];
+
+        await pages.listOpenPages();
+        expect(createdRows(kv)).toEqual(["created:tab-1"]);
+      });
+
+      it("prunes nothing at all when no browser of ours is reachable", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        await kv.set("created:tab-1", { profile: "main", at: Date.now() - 10 * 60_000 });
+        await server.close();
+
+        // An unreachable browser is not evidence that its tabs are gone, and
+        // treating it as such would disown every page across a bb restart.
+        expect(await pages.listOpenPages()).toEqual([]);
+        expect(createdRows(kv)).toEqual(["created:tab-1"]);
+      });
+
+      it("drops the row when the session's own page is closed", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+
+        await pages.closePage("thr_a");
+        expect(createdRows(kv)).toEqual([]);
+      });
+
+      it("drops the row when the page is reaped as an orphan", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        await pages.forget("thr_a");
+
+        await pages.closeUnboundPage("tab-1");
+        expect(createdRows(kv)).toEqual([]);
+      });
+
+      // A close that failed leaves the tab OPEN. Dropping the row there would
+      // disown a page this plugin made, and the reaper would then decline to
+      // try again for as long as the browser is headed.
+      it("keeps the row when the close failed and the tab is still open", async () => {
+        server = await fakeCdp();
+        const { pages, kv } = pagesFor(server.url);
+        await pages.pageUrlFor("thr_a", "main");
+        await pages.forget("thr_a");
+        server.failOn("Target.closeTarget", "boom");
+
+        await expect(pages.closeUnboundPage("tab-1")).rejects.toThrow(/boom/);
+        expect(createdRows(kv)).toEqual(["created:tab-1"]);
+      });
     });
 
     it("closes a page nobody is bound to", async () => {
@@ -650,6 +745,11 @@ describe("a CDP connect that never completes", () => {
       graceMs: 60_000,
       headed: async () => false,
       closePage: async () => {},
+      // This test is about a hung listing, not about shutdown: a browser
+      // whose pages cannot be listed must never be shut down on a guess.
+      shutdownBrowser: async () => {
+        throw new Error("must not shut down when the listing never resolved");
+      },
       listOpenPages: async () => {
         const open = await pages.listOpenPages();
         listed.push("ok");
@@ -678,4 +778,77 @@ describe("a CDP connect that never completes", () => {
       await loop;
     }
   }, 15_000);
+});
+
+// Toggling `headed` closes the browser, which takes every page with it. A
+// thread that was working somewhere would otherwise come back to a blank tab
+// for a reason that had nothing to do with it.
+describe("restoring where a thread was after a relaunch", () => {
+  /** Every `open` a session ran, decoded out of the batch payloads. */
+  const opened = (browser: { calls: { stdin?: string }[] }) =>
+    browser.calls
+      .flatMap((call) => JSON.parse(call.stdin ?? "[]") as string[][])
+      .filter((argv) => argv[0] === "open")
+      .map((argv) => argv[1]);
+
+  it("puts the session's next page back where it was", async () => {
+    server = await fakeCdp();
+    const { pages, kv, browser } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    server.targets = server.targets.map((target) =>
+      target.targetId === "tab-1" ? { ...target, url: "https://example.com/deep" } : target,
+    );
+
+    await pages.captureForRestore("main");
+    expect(await kv.get("restore:thr_a")).toMatchObject({ url: "https://example.com/deep" });
+
+    // The relaunch: the browser is gone, so the next command creates a page.
+    server.targets = [];
+    await pages.pageUrlFor("thr_a", "main");
+    expect(opened(browser)).toContain("https://example.com/deep");
+    // Used once and dropped, so it cannot fire again later.
+    expect(await kv.get("restore:thr_a")).toBeUndefined();
+  });
+
+  it("does not restore a capture that has gone stale", async () => {
+    server = await fakeCdp();
+    const { pages, kv, browser } = pagesFor(server.url);
+    await kv.set("restore:thr_a", {
+      profile: "main",
+      url: "https://example.com/old",
+      at: Date.now() - 60 * 60_000,
+    });
+    await pages.pageUrlFor("thr_a", "main");
+    expect(opened(browser)).not.toContain("https://example.com/old");
+    expect(await kv.get("restore:thr_a")).toBeUndefined();
+  });
+
+  it("captures nothing for a tab no thread is bound to", async () => {
+    server = await fakeCdp();
+    const { pages, kv } = pagesFor(server.url);
+    // A bound page first: without one there is no remembered browser address,
+    // so the listing comes back empty and this would pass without reaching
+    // the rule it is meant to check.
+    await pages.pageUrlFor("thr_a", "main");
+    server.targets = [
+      ...server.targets.map((target) =>
+        target.targetId === "tab-1" ? { ...target, url: "https://example.com/mine" } : target,
+      ),
+      { targetId: "someone-elses", type: "page", url: "https://example.org/" },
+    ];
+
+    await pages.captureForRestore("main");
+    // The human's tab is not a thread's page to put back.
+    expect(await kv.list("restore:")).toEqual(["restore:thr_a"]);
+  });
+
+  it("captures nothing for a page that is not on a real destination", async () => {
+    server = await fakeCdp();
+    const { pages, kv } = pagesFor(server.url);
+    await pages.pageUrlFor("thr_a", "main");
+    // Left on the create marker: restoring a blank tab is just a blank tab,
+    // with a stale record left behind to expire.
+    await pages.captureForRestore("main");
+    expect(await kv.list("restore:")).toEqual([]);
+  });
 });

@@ -605,12 +605,15 @@ Things this document promised, or that a reader would reasonably expect, and
 which are **not** built. None of them is blocking; all of them are cheap to add
 later, and saying so beats a design that quietly reads as done.
 
-1. **The reaper never shuts the browser down.** The design says a profile's
-   browser dies "once it has no pages left"; nothing implements that. The idle
-   and unbound passes close *tabs*, and the browser process is only ever closed
-   by `onDispose` (plugin reload / bb shutdown) or by toggling `headed`. So
-   after the last tab is reaped, Chromium stays resident indefinitely. This is
-   the one gap with an ongoing cost — idle RAM.
+1. ~~**The reaper never shuts the browser down.**~~ **Closed.** A sweep that
+   finds no tabs left now shuts the browser down and forgets its address, which
+   is the same act (a remembered ephemeral port outlives the process holding
+   it). Three guards, each a case where "no tabs" does not mean "unused": a
+   listing that failed, a headed window on screen, and any hold — `watch` is
+   taken for a command's whole duration as well as by a panel viewer. The
+   remaining race is self-correcting: a command arriving after the check takes
+   its hold too late to be seen, but every command ensures its browser before
+   attaching, so the worst case is one relaunch.
 2. **`bb browser sessions` and `bb browser mode` do not exist.** Headed-ness is
    a plugin setting (see Rendering modes); there is no command that lists which
    threads hold pages. The `bb browser` command list is the eight page
@@ -620,10 +623,14 @@ later, and saying so beats a design that quietly reads as done.
 4. **`maxPagesPerProfile` was dropped on purpose.** The reaper plus explicit
    `browser_close` covers the real leak, and no fleet has come close to
    exhausting memory. Add it if one ever does.
-5. **No last-URL restore across a headed/headless relaunch.** The design says
-   the engine records each session's last URL and restores it so a thread sees
-   a reload rather than a failure; it does not. A thread whose page went away
-   with the old process gets a fresh blank page on its next command.
+5. ~~**No last-URL restore across a headed/headless relaunch.**~~ **Closed.**
+   The relaunch path captures where each bound page was, and the next page a
+   session is handed goes back there. Narrow on purpose — "reopen the page you
+   had" is a bad default for an agent's browser: the record is written only by
+   the relaunch path, used at most once, deleted whether or not the navigation
+   worked, ignored after ten minutes, and never written for a tab no thread is
+   bound to or a page still sitting on its create marker. An explicit
+   `browser_close` must never resurrect a logged-in page later.
 6. **The headed exemption is bounded but not self-clearing.** A plugin-owned
    tab that loses its binding *while* headed is unreapable until headless
    returns — and toggling headed relaunches Chromium, which restores that

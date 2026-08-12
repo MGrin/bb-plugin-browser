@@ -96,6 +96,12 @@ export default async function plugin(bb: BbPluginApi) {
     closePage: (sessionKey) => registry.closePage(sessionKey),
     listOpenPages: () => registry.listOpenPages(),
     closeUnboundPage: (targetId) => registry.closeUnboundPage(targetId),
+    // Reached only when the browser has no tabs at all. `pages` rather than
+    // `registry` because this is the one thing the reaper does that changes
+    // the browser's existence rather than its contents — and it is the same
+    // call the headed toggle makes, so the remembered address is dropped with
+    // the process either way.
+    shutdownBrowser: () => pages.shutdownBrowser(defaultProfile),
     log: (message) => bb.log.info(message),
     // A failed close means a tab is still open that nothing may reference
     // again — that belongs at warn, not info.
@@ -166,6 +172,9 @@ export default async function plugin(bb: BbPluginApi) {
         );
         // The casts point at pages that are about to stop existing.
         screencast.stopAll();
+        // Where each thread was, so its next page can go back there rather
+        // than coming up blank for a reason that had nothing to do with it.
+        await pages.captureForRestore(defaultProfile);
         // Through `pages`, not `engine`: closing the browser and forgetting
         // where it was are one act. A remembered address outlives its
         // browser by pointing at a freed ephemeral port, and the next
