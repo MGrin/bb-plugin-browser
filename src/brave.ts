@@ -1,0 +1,144 @@
+// Starting — or finding — the one real Brave that agents share.
+//
+// v1 downloaded Chrome for Testing, which announces itself as "only for
+// automated testing", never updates, and is not the browser anyone actually
+// uses. This launches the real /Applications/Brave Browser.app against a
+// profile directory of its own, so it is a normal browser with a normal window
+// that happens to accept CDP.
+//
+// The rule that v1 got wrong, and the reason this module has no `stop()`:
+// THE BROWSER OUTLIVES THE PLUGIN. v1 shut its browser down whenever the
+// plugin reloaded, which destroyed every open page and every thread's handle
+// on one — and a rebind replaces a page rather than finding it, so a plugin
+// reload silently threw away whatever a thread was doing, including a
+// half-finished login. Here a reload reattaches: the browser keeps running,
+// the tabs keep existing, and their target ids stay valid.
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+/**
+ * Where Brave lives. Only the real app — never a downloaded automation build.
+ * Checked at launch so a missing Brave is a clear message rather than a spawn
+ * error nobody can act on.
+ */
+export const BRAVE_BINARY =
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
+
+/**
+ * Chromium writes the port it actually bound here, inside the profile. Asking
+ * for port 0 and reading it back is what keeps this from fighting whatever
+ * else on the machine wants a fixed debugging port.
+ */
+const PORT_FILE = "DevToolsActivePort";
+
+/** How long to wait for a freshly launched Brave to publish its port. */
+const LAUNCH_TIMEOUT_MS = 20_000;
+
+export interface BraveOptions {
+  /** The profile directory this browser owns. Never a human's profile. */
+  profileDir: string;
+  log: (message: string) => void;
+  /** Overridable for tests; defaults to the real Brave. */
+  binary?: string;
+}
+
+export interface BraveEndpoint {
+  /** e.g. "http://127.0.0.1:53211" — what Playwright's connectOverCDP takes. */
+  httpEndpoint: string;
+  port: number;
+  /** True when this call started the browser rather than finding it. */
+  launched: boolean;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The port a previous launch published, if that browser is still answering.
+ *
+ * The file survives a crash, so its presence proves nothing on its own — the
+ * probe is what distinguishes "already running" from "left behind". Returning
+ * null for a stale file is what makes launching idempotent.
+ */
+export async function runningPort(profileDir: string): Promise<number | null> {
+  const file = join(profileDir, PORT_FILE);
+  if (!existsSync(file)) return null;
+  const port = Number((await readFile(file, "utf8")).split("\n")[0]?.trim());
+  if (!Number.isInteger(port) || port <= 0) return null;
+  return (await answersOn(port)) ? port : null;
+}
+
+/** Whether a DevTools endpoint on this port is alive right now. */
+async function answersOn(port: number): Promise<boolean> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The browser agents share: found if it is already running, started if not.
+ *
+ * Launch flags, each for a reason:
+ *   --remote-debugging-port=0   let the OS pick; read it back from the profile
+ *   --user-data-dir             the dedicated profile, never the human's
+ *   --no-first-run              no welcome tour on a fresh profile
+ *   --no-default-browser-check  never ask to become the default browser
+ *   --disable-blink-features=AutomationControlled
+ *                               navigator.webdriver stays false. This one is
+ *                               not hygiene: an X account was locked in August
+ *                               because a browser without it was detected.
+ */
+export async function startOrAttach(options: BraveOptions): Promise<BraveEndpoint> {
+  const binary = options.binary ?? BRAVE_BINARY;
+  await mkdir(options.profileDir, { recursive: true });
+
+  const existing = await runningPort(options.profileDir);
+  if (existing) {
+    options.log(`attached to the agents' browser on port ${existing}`);
+    return { httpEndpoint: `http://127.0.0.1:${existing}`, port: existing, launched: false };
+  }
+
+  if (!existsSync(binary)) {
+    throw new Error(
+      `Brave is not installed at ${binary}. The agents' browser is the real Brave, ` +
+        "not a downloaded automation build — install Brave or point BRAVE_BINARY at it.",
+    );
+  }
+
+  // Detached, and stdio ignored: this browser is meant to outlive the plugin
+  // load that started it. Keeping a pipe open would tie its lifetime to ours,
+  // which is exactly the coupling that made a plugin reload destroy every page.
+  const child = spawn(
+    binary,
+    [
+      "--remote-debugging-port=0",
+      `--user-data-dir=${options.profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-blink-features=AutomationControlled",
+      "about:blank",
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  child.unref();
+
+  const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const port = await runningPort(options.profileDir);
+    if (port) {
+      options.log(`started the agents' browser on port ${port}`);
+      return { httpEndpoint: `http://127.0.0.1:${port}`, port, launched: true };
+    }
+    await sleep(200);
+  }
+  throw new Error(
+    `Brave did not publish a debugging port within ${LAUNCH_TIMEOUT_MS}ms — ` +
+      `check ${join(options.profileDir, PORT_FILE)}`,
+  );
+}
