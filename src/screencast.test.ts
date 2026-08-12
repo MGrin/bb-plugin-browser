@@ -93,7 +93,12 @@ describe("screencast", () => {
     expect(server.received.some((m) => m.method === "Page.screencastFrameAck")).toBe(true);
   });
 
-  it("a subscriber that joins mid-cast never receives frames sent before it joined", async () => {
+  // Chrome emits a frame when the screencast STARTS and then only on repaint,
+  // so a viewer joining a running cast would otherwise sit blank until the
+  // page happened to change — on a settled page, forever. Every "the panel
+  // froze" report in live testing traced back to this: reconnecting after a
+  // Reload joins the existing cast and waits for a repaint that never comes.
+  it("paints a late subscriber immediately with the current frame", async () => {
     server = await fakeCdp();
     const screencast = screencastFor();
     const early: string[] = [];
@@ -103,11 +108,38 @@ describe("screencast", () => {
 
     const late: string[] = [];
     await screencast.subscribe("thr_a", server.url, (frame) => late.push(frame));
+    // Painted at once, without the page having repainted.
+    expect(late).toEqual(["BEFORE"]);
+
     server.emit("Page.screencastFrame", { data: "AFTER", sessionId: 2 });
     await tick();
-
     expect(early).toEqual(["BEFORE", "AFTER"]);
-    expect(late).toEqual(["AFTER"]);
+    expect(late).toEqual(["BEFORE", "AFTER"]);
+  });
+
+  it("replays only the newest frame, not the history", async () => {
+    server = await fakeCdp();
+    const screencast = screencastFor();
+    await screencast.subscribe("thr_a", server.url, () => {});
+    for (const data of ["ONE", "TWO", "THREE"]) {
+      server.emit("Page.screencastFrame", { data, sessionId: 1 });
+      await tick();
+    }
+
+    const late: string[] = [];
+    await screencast.subscribe("thr_a", server.url, (frame) => late.push(frame));
+    expect(late).toEqual(["THREE"]);
+  });
+
+  it("does not replay to the subscriber that started the cast", async () => {
+    // Chrome sends that one its own start-of-screencast frame; replaying a
+    // stale frame from a previous cast on the same key would show a picture
+    // of the past.
+    server = await fakeCdp();
+    const screencast = screencastFor();
+    const first: string[] = [];
+    await screencast.subscribe("thr_a", server.url, (frame) => first.push(frame));
+    expect(first).toEqual([]);
   });
 
   it("a subscriber that throws does not stop delivery to the others, or crash the process", async () => {

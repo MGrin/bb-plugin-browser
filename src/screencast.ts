@@ -83,6 +83,19 @@ interface Cast {
   viewport: Viewport | null;
   /** Keeps this tab in the foreground for as long as anyone is watching. */
   foreground: ReturnType<typeof setInterval> | null;
+  /**
+   * The most recent frame, replayed to every viewer that arrives later.
+   *
+   * Chrome emits a frame when the screencast STARTS and then only when the
+   * page repaints. So the first subscriber gets a picture immediately and
+   * every subsequent one — a second panel, or the same panel reconnecting
+   * after a Reload — joins an already-running cast and receives nothing at
+   * all until the page happens to change. On a settled page that is never,
+   * and the panel shows a blank or stale view indefinitely while the cast,
+   * the socket and the page are all healthy. Every "it froze" report in
+   * testing traced back here.
+   */
+  lastFrame: string | null;
 }
 
 export function createScreencast(deps: ScreencastDeps): Screencast {
@@ -102,7 +115,13 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
   async function startCast(cdpUrl: string): Promise<Cast> {
     const session = await openCdp(cdpUrl);
     try {
-      const cast: Cast = { session, subscribers: new Set(), viewport: null, foreground: null };
+      const cast: Cast = {
+        session,
+        subscribers: new Set(),
+        viewport: null,
+        foreground: null,
+        lastFrame: null,
+      };
       session.on("Page.screencastFrame", (params) => {
         const frame = params as {
           data: string;
@@ -125,6 +144,7 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
         // fire-and-forget: a rejected ack (socket already on its way down)
         // is not this handler's problem to surface.
         session.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => {});
+        cast.lastFrame = frame.data;
         for (const subscriber of cast.subscribers) {
           try {
             subscriber(frame.data);
@@ -235,6 +255,20 @@ export function createScreencast(deps: ScreencastDeps): Screencast {
     async subscribe(sessionKey, cdpUrl, onFrame) {
       const cast = await getOrStartCast(sessionKey, cdpUrl);
       cast.subscribers.add(onFrame);
+
+      // Paint immediately with whatever the page looks like now, rather than
+      // waiting for a repaint that a settled page will never produce. Only
+      // for viewers that JOINED a running cast — the one that started it is
+      // about to get Chrome's own start-of-screencast frame.
+      if (cast.lastFrame) {
+        try {
+          onFrame(cast.lastFrame);
+        } catch {
+          // A subscriber that throws on its first frame is the stream route
+          // discovering its client is already gone; its own teardown handles
+          // it, and it must not prevent this subscribe from returning.
+        }
+      }
 
       // A flag local to this closure, not a re-derived check against the
       // cast map: it makes a repeated call to the *same* unsubscribe
