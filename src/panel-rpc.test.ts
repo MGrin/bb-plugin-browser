@@ -94,7 +94,11 @@ describe("panel rpc handlers", () => {
     expect(await handlers.view({ threadId: "thr_child" })).toEqual({
       streamPath: "/api/v1/plugins/browser/http/stream",
       token: "tok-secret",
-      page: { url: "https://example.com/", viewport: { width: 1440, height: 900 } },
+      page: {
+        url: "https://example.com/",
+        viewport: { width: 1440, height: 900 },
+        cdpUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+      },
     });
   });
 
@@ -118,7 +122,11 @@ describe("panel rpc handlers", () => {
       screencast: { dispatchInput: vi.fn(async () => {}), viewportOf: () => null },
     });
     const result = await handlers.view({ threadId: "thr_a" });
-    expect(result.page).toEqual({ url: "https://example.com/", viewport: null });
+    expect(result.page).toEqual({
+      url: "https://example.com/",
+      viewport: null,
+      cdpUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+    });
   });
 
   it("navigate opens the resolved session's page at the typed address", async () => {

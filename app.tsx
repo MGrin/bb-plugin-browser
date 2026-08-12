@@ -316,6 +316,166 @@ function OpenBrowserPanel({ attributes }: PluginMessageDirectiveProps) {
   );
 }
 
+
+/**
+ * EXPERIMENT — the panel talking CDP straight to Chromium.
+ *
+ * The shipped panel streams MJPEG from bb's own origin and sends each input as
+ * its own HTTP request. Two structural problems came out of live use: an
+ * `<img>` on a multipart response holds one of the browser's six connections
+ * to bb's origin, so a forgotten panel can starve bb's own API calls and make
+ * the whole app sluggish; and a round trip per keystroke makes typing feel
+ * detached.
+ *
+ * This does neither. One WebSocket to the page's own CDP endpoint carries
+ * frames down and input up, on a different origin from bb entirely — so it
+ * cannot compete for bb's connections, and a keystroke is a socket write
+ * rather than an HTTP request.
+ *
+ * It is NOT shippable as it stands: a CDP socket is total control of the
+ * browser, and handing that to the renderer (let alone through a tunnel) is
+ * not something to do casually. The point is to find out whether this class of
+ * transport feels right before building the safe version of it, where the
+ * plugin keeps CDP to itself and speaks its own protocol over its own port.
+ */
+function DirectBrowserPanel({ threadId }: PluginThreadPanelProps) {
+  const rpc = useRpc<typeof panelRpcContract>();
+  const [frame, setFrame] = useState<string | null>(null);
+  const [status, setStatus] = useState("connecting…");
+  const [stats, setStats] = useState({ frames: 0, lastMs: 0 });
+  const socketRef = useRef<WebSocket | null>(null);
+  const nextId = useRef(1);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const viewport = useRef<{ width: number; height: number } | null>(null);
+  const sentAt = useRef<number | null>(null);
+
+  const send = useCallback((method: string, params: Record<string, unknown> = {}) => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ id: nextId.current++, method, params }));
+  }, []);
+
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const view = await rpc.call("view", { threadId });
+        if (cancelled) return;
+        if (!view.page) {
+          setStatus("no page open in this thread yet");
+          return;
+        }
+        socket = new WebSocket(view.page.cdpUrl);
+        socketRef.current = socket;
+        socket.addEventListener("open", () => {
+          setStatus("connected");
+          send("Page.enable");
+          send("Page.bringToFront");
+          send("Page.startScreencast", { format: "jpeg", quality: 60, maxWidth: 1280 });
+        });
+        socket.addEventListener("close", () => setStatus("socket closed"));
+        socket.addEventListener("error", () => setStatus("socket error"));
+        socket.addEventListener("message", (event) => {
+          const message = JSON.parse(String(event.data)) as {
+            method?: string;
+            params?: {
+              data?: string;
+              sessionId?: number;
+              metadata?: { deviceWidth?: number; deviceHeight?: number };
+            };
+          };
+          if (message.method !== "Page.screencastFrame" || !message.params?.data) return;
+          const width = message.params.metadata?.deviceWidth;
+          const height = message.params.metadata?.deviceHeight;
+          if (width && height) viewport.current = { width, height };
+          setFrame(message.params.data);
+          setStats((previous) => ({
+            frames: previous.frames + 1,
+            lastMs: sentAt.current ? Math.round(performance.now() - sentAt.current) : previous.lastMs,
+          }));
+          sentAt.current = null;
+          send("Page.screencastFrameAck", { sessionId: message.params.sessionId });
+        });
+      } catch (error) {
+        if (!cancelled) setStatus(error instanceof Error ? error.message : "failed");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      socket?.close();
+      socketRef.current = null;
+    };
+  }, [rpc, threadId, send]);
+
+  const pointOf = (event: React.MouseEvent<HTMLImageElement>) => {
+    const image = imageRef.current;
+    if (!image) return { x: 0, y: 0 };
+    return toPageCoordinates({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      rect: image.getBoundingClientRect(),
+      frame: viewport.current ?? { width: image.naturalWidth, height: image.naturalHeight },
+    });
+  };
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+      <div className="flex shrink-0 items-center gap-3 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+        <span>direct CDP · {status}</span>
+        <span>{stats.frames} frames</span>
+        {stats.lastMs ? <span>last input → paint: {stats.lastMs}ms</span> : null}
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto bg-muted/20">
+        {frame ? (
+          <img
+            ref={imageRef}
+            src={`data:image/jpeg;base64,${frame}`}
+            alt="Live page"
+            tabIndex={0}
+            autoFocus
+            draggable={false}
+            className="block w-full select-none outline-none"
+            onMouseDown={(event) => {
+              sentAt.current = performance.now();
+              const p = pointOf(event);
+              send("Input.dispatchMouseEvent", {
+                type: "mousePressed", x: p.x, y: p.y, button: "left", clickCount: 1,
+              });
+            }}
+            onMouseUp={(event) => {
+              const p = pointOf(event);
+              send("Input.dispatchMouseEvent", {
+                type: "mouseReleased", x: p.x, y: p.y, button: "left", clickCount: 1,
+              });
+            }}
+            onWheel={(event) => {
+              const p = pointOf(event);
+              send("Input.dispatchMouseEvent", {
+                type: "mouseWheel", x: p.x, y: p.y, deltaX: 0, deltaY: event.deltaY,
+                button: "none", clickCount: 0,
+              });
+            }}
+            onKeyDown={(event) => {
+              if (event.metaKey || event.ctrlKey) return;
+              event.preventDefault();
+              sentAt.current = performance.now();
+              if (event.key.length === 1) {
+                send("Input.dispatchKeyEvent", { type: "char", text: event.key });
+              } else {
+                send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: event.key, windowsVirtualKeyCode: event.keyCode });
+                send("Input.dispatchKeyEvent", { type: "keyUp", key: event.key, windowsVirtualKeyCode: event.keyCode });
+              }
+            }}
+          />
+        ) : (
+          <p className="p-4 text-sm text-muted-foreground">{status}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.threadPanelAction({
     id: "browser",
@@ -325,6 +485,14 @@ export default definePluginApp((app) => {
     // fills whatever is left.
     layout: "flush",
     component: BrowserPanel,
+  });
+
+  app.slots.threadPanelAction({
+    id: "browser-direct",
+    title: "Browser (direct CDP — experiment)",
+    icon: "Zap",
+    layout: "flush",
+    component: DirectBrowserPanel,
   });
 
   app.slots.messageDirective({

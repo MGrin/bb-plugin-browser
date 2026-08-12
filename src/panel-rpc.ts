@@ -72,6 +72,19 @@ export const panelRpcContract = {
           url: z.string(),
           /** The page's CSS viewport, once a cast is running. */
           viewport: z.object({ width: z.number(), height: z.number() }).nullable(),
+          /**
+           * The page's own CDP websocket — EXPERIMENTAL, for the direct-socket
+           * view.
+           *
+           * Handing this to the renderer hands it full control of the browser,
+           * which is why the shipped panel does not use it and why this must
+           * not survive the experiment it exists for. The question it answers:
+           * whether talking CDP straight from the panel (frames down and input
+           * up on ONE socket, off bb's origin entirely) feels usable — the
+           * MJPEG-over-bb's-origin design starves bb's six-connection budget
+           * and puts an HTTP round trip under every keystroke.
+           */
+          cdpUrl: z.string(),
         })
         .nullable(),
     }),
@@ -133,7 +146,11 @@ export function createPanelRpcHandlers(
         streamPath: `/api/v1/plugins/${deps.pluginId}/http${STREAM_PATH}`,
         token: await deps.token(),
         page: page
-          ? { url: page.url, viewport: deps.screencast.viewportOf(sessionKey) }
+          ? {
+              url: page.url,
+              viewport: deps.screencast.viewportOf(sessionKey),
+              cdpUrl: page.cdpUrl,
+            }
           : null,
       };
     },
