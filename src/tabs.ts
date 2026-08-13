@@ -57,7 +57,7 @@ export interface Tabs {
  * Worth the round trip: it is the only identifier that outlives this process,
  * and everything in this module is built on that property.
  */
-async function targetIdOf(page: Page): Promise<string> {
+async function readTargetId(page: Page): Promise<string> {
   const session = await page.context().newCDPSession(page);
   try {
     const info = (await session.send("Target.getTargetInfo")) as {
@@ -65,16 +65,72 @@ async function targetIdOf(page: Page): Promise<string> {
     };
     return info.targetInfo.targetId;
   } finally {
-    await session.detach().catch(() => {});
+    // Deliberately NOT awaited. A tab wedged enough to make `Target.getTargetInfo`
+    // time out will hang its own detach too, and awaiting that here would put the
+    // unbounded wait straight back — in the cleanup path, where it is harder to see.
+    void session.detach().catch(() => {});
   }
 }
 
-/** Every page in the browser, paired with its target id. */
-async function pagesWithIds(context: BrowserContext): Promise<{ page: Page; targetId: string }[]> {
-  const pages = context.pages().filter((page) => !page.isClosed());
-  return Promise.all(
-    pages.map(async (page) => ({ page, targetId: await targetIdOf(page) })),
+/**
+ * How long the browser gets to answer a question about a tab.
+ *
+ * Generous for a local CDP round trip, which is sub-millisecond when the browser
+ * is healthy — this is a deadlock guard, not a latency budget.
+ */
+export const TARGET_ID_TIMEOUT_MS = 5_000;
+
+/**
+ * Reject if `work` outlives `ms`.
+ *
+ * The losing promise keeps running; there is no way to cancel a CDP send. That
+ * is the point — the CALLER is what needed rescuing.
+ */
+export async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * A page's target id, remembered.
+ *
+ * TWO fixes live here, and the plugin was losing 25-minute stretches to their
+ * absence — one handler measured at 1509s on 2026-08-13.
+ *
+ * The deadline is the safety net: this round trip ran with NO timeout, and it
+ * happens inside `tabFor`, which completes BEFORE actions.ts arms its 20s
+ * `setDefaultTimeout`. So the action timeout everybody assumed was protecting
+ * them protected the action and not the tab lookup that precedes it. One
+ * unresponsive tab hung the call forever.
+ *
+ * The cache is the reason the deadline is rarely needed: a target id is fixed
+ * for the life of a page — that permanence is the whole premise of this module
+ * — so it is worth asking once. Before this, every `browser_*` call swept EVERY
+ * open tab with a fresh CDP session each, which is both the stall's blast radius
+ * and a cost that grew with tabs nobody was using. A WeakMap means a closed page
+ * takes its entry with it.
+ */
+const targetIds = new WeakMap<Page, string>();
+
+async function targetIdOf(page: Page): Promise<string> {
+  const cached = targetIds.get(page);
+  if (cached !== undefined) return cached;
+  const targetId = await withDeadline(
+    readTargetId(page),
+    TARGET_ID_TIMEOUT_MS,
+    "the browser",
   );
+  targetIds.set(page, targetId);
+  return targetId;
 }
 
 export function createTabs(deps: TabsDeps): Tabs {
@@ -90,6 +146,34 @@ export function createTabs(deps: TabsDeps): Tabs {
       throw new Error("the agents' browser reported no context — is it still running?");
     }
     return contexts[0]!;
+  }
+
+  /**
+   * Every page in the browser, paired with its target id.
+   *
+   * A page that misses the deadline is SKIPPED, not thrown. These sweeps run on
+   * every tool call, and one wedged tab — very often a tab belonging to some
+   * other thread entirely — used to be able to fail, or hang, everyone else's
+   * lookup. Skipping costs a thread its binding in the worst case: `findExisting`
+   * misses the wedged tab and `create` opens a fresh one, which the reaper then
+   * tidies up. A new tab is a recoverable annoyance; the alternative was the
+   * whole plugin stopping until someone noticed.
+   */
+  async function pagesWithIds(
+    context: BrowserContext,
+  ): Promise<{ page: Page; targetId: string }[]> {
+    const pages = context.pages().filter((page) => !page.isClosed());
+    const entries = await Promise.all(
+      pages.map(async (page) => {
+        try {
+          return { page, targetId: await targetIdOf(page) };
+        } catch (err) {
+          deps.log(`skipping an unresponsive tab (${page.url()}): ${String(err)}`);
+          return null;
+        }
+      }),
+    );
+    return entries.filter((entry): entry is { page: Page; targetId: string } => entry !== null);
   }
 
   // Two callers arriving for the same thread at once must not open two tabs;
