@@ -1,9 +1,48 @@
 // `bb browser …` — the same operations as the tools, for humans and for
 // agents that would rather type a command.
+import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import type { BbPluginApi, PluginCliResult } from "@bb/plugin-sdk";
 import type { Actions } from "./actions.js";
 import type { SessionKeyResolver } from "./session-key.js";
+
+/**
+ * Which commit is this PROCESS running? (MX-139/MX-141)
+ *
+ * bb bundles a `path:` plugin FROM SOURCE at reload, so a revision read here — at module
+ * load, the same moment — is by construction the code now executing. Nothing else can say:
+ * `bb plugin list` prints `running` and the source path but no revision, `bb plugin source`
+ * has none to record for a path: source, and dist/ is NOT the loaded artifact (its mtime was
+ * measured lying by 15 minutes). So a checkout can sit clean on main, every drift check
+ * green, while the process runs something older.
+ *
+ * This file lives in src/, so the repo root is asked for by `--show-toplevel` rather than
+ * assumed from the directory — git works from anywhere inside the tree, but the reported
+ * sourceDir should be the checkout a human would compare against.
+ *
+ * Synchronous on purpose: the value must be fixed before anything can observe it, and it is
+ * one git call per load. Failure yields rev: null rather than a guess — a tarball install has
+ * no git dir, and that must stay distinguishable from a real mismatch so a checker reports
+ * UNKNOWN rather than OK. `dirty` rides along because a bundle built from an edited tree
+ * matches NO commit, and comparing revisions alone would call that a match.
+ */
+const BUILD_STAMP: { rev: string | null; dirty: boolean | null; sourceDir: string; loadedAt: string; why: string | null } = (() => {
+  const here = import.meta.dirname;
+  const loadedAt = new Date().toISOString();
+  try {
+    const git = (args: string[]): string =>
+      execFileSync("git", ["-C", here, ...args], { encoding: "utf8", timeout: 5000 }).trim();
+    return {
+      rev: git(["rev-parse", "HEAD"]),
+      dirty: git(["status", "--porcelain"]).length > 0,
+      sourceDir: git(["rev-parse", "--show-toplevel"]),
+      loadedAt,
+      why: null,
+    };
+  } catch (e) {
+    return { rev: null, dirty: null, sourceDir: here, loadedAt, why: e instanceof Error ? e.message : String(e) };
+  }
+})();
 
 const ok = (stdout: string): PluginCliResult => ({ exitCode: 0, stdout });
 const fail = (stderr: string): PluginCliResult => ({ exitCode: 1, stderr });
@@ -175,8 +214,25 @@ export function registerCli(
       { name: "hide", summary: "Put the browser back to headless", usage: "bb browser hide" },
       { name: "status", summary: "Mode and open tabs", usage: "bb browser status" },
       { name: "quit", summary: "Close the shared browser", usage: "bb browser quit" },
+      {
+        name: "build",
+        summary: "Which commit this RUNNING process was loaded from (not the checkout)",
+        usage: "bb browser build [--json]",
+      },
     ],
-    run: async (argv, ctx) =>
-      runCli(operations, await resolveSessionKey(ctx.threadId), argv, browser),
+    run: async (argv, ctx) => {
+      // BEFORE resolveSessionKey, deliberately: that resolves (and can create) this
+      // thread's browser session. "What is running" must stay answerable without
+      // touching the browser at all, including when the browser is what is broken.
+      if (argv[0] === "build") {
+        if (argv.includes("--json")) return ok(JSON.stringify(BUILD_STAMP));
+        const dirty = BUILD_STAMP.dirty === null ? "" : BUILD_STAMP.dirty ? " +dirty" : "";
+        const why = BUILD_STAMP.why ? `  (${BUILD_STAMP.why})` : "";
+        return ok(
+          `loaded ${BUILD_STAMP.rev ?? "unknown"}${dirty} from ${BUILD_STAMP.sourceDir} at ${BUILD_STAMP.loadedAt}${why}`,
+        );
+      }
+      return runCli(operations, await resolveSessionKey(ctx.threadId), argv, browser);
+    },
   });
 }
