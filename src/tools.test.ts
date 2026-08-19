@@ -20,6 +20,7 @@ function fakeActions() {
     snapshot: vi.fn(async () => "tree"),
     click: vi.fn(async () => "clicked"),
     type: vi.fn(async () => "typed"),
+    upload: vi.fn(async () => "attached"),
     evaluate: vi.fn(async () => "42"),
     screenshot: vi.fn(async () => ({ base64: "aGVsbG8=" })),
     close: vi.fn(async () => "closed"),
