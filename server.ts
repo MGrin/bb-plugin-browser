@@ -15,7 +15,7 @@
 //   * The connection is remade on demand. A reload reattaches to the running
 //     browser and every thread finds its own tab again, because a targetId is
 //     the browser's, not this process's.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Browser } from "playwright-core";
 import { chromium } from "./src/playwright-runtime.js";
 import { createActions } from "./src/actions.js";

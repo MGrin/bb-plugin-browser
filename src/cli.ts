@@ -2,7 +2,7 @@
 // agents that would rather type a command.
 import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import type { BbPluginApi, PluginCliResult } from "@bb/plugin-sdk";
+import type { BbPluginApi, PluginCliResult } from "@get-bb/plugin-sdk";
 import type { Actions } from "./actions.js";
 import type { PageHolder } from "./holder.js";
 import type { SessionKeyResolver } from "./session-key.js";

@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createSessionKeyResolver, SCRATCH_SESSION_KEY } from "./session-key.js";
 
-type Thread = { parentThreadId: string | null; childOrigin: string | null };
+// Derived from the SDK, not restated. A restated shape is what let these tests
+// keep mocking `childOrigin` for the whole life of a bb that stopped sending it
+// (MX-265): every case passed against a field the host never returns. Derived,
+// a rename breaks this file.
+type Thread = Pick<
+  Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>,
+  "parentThreadId" | "originKind"
+>;
 
 function fakeBb(threads: Record<string, Thread>) {
   return {
@@ -25,7 +33,7 @@ describe("createSessionKeyResolver", () => {
 
   it("returns the thread itself when it has no parent", async () => {
     const resolve = createSessionKeyResolver(
-      fakeBb({ a: { parentThreadId: null, childOrigin: null } }),
+      fakeBb({ a: { parentThreadId: null, originKind: null } }),
     );
     expect(await resolve("a")).toBe("a");
   });
@@ -33,9 +41,9 @@ describe("createSessionKeyResolver", () => {
   it("walks to the root so subagents share the coordinator's page", async () => {
     const resolve = createSessionKeyResolver(
       fakeBb({
-        root: { parentThreadId: null, childOrigin: null },
-        mid: { parentThreadId: "root", childOrigin: "spawn" },
-        leaf: { parentThreadId: "mid", childOrigin: "spawn" },
+        root: { parentThreadId: null, originKind: null },
+        mid: { parentThreadId: "root", originKind: null },
+        leaf: { parentThreadId: "mid", originKind: null },
       }),
     );
     expect(await resolve("leaf")).toBe("root");
@@ -44,8 +52,8 @@ describe("createSessionKeyResolver", () => {
   it("stops at a fork, which is a peer exploration", async () => {
     const resolve = createSessionKeyResolver(
       fakeBb({
-        root: { parentThreadId: null, childOrigin: null },
-        forked: { parentThreadId: "root", childOrigin: "fork" },
+        root: { parentThreadId: null, originKind: null },
+        forked: { parentThreadId: "root", originKind: "fork" },
       }),
     );
     expect(await resolve("forked")).toBe("forked");
@@ -53,14 +61,14 @@ describe("createSessionKeyResolver", () => {
 
   it("stops at an unreadable ancestor instead of throwing", async () => {
     const resolve = createSessionKeyResolver(
-      fakeBb({ child: { parentThreadId: "gone", childOrigin: "spawn" } }),
+      fakeBb({ child: { parentThreadId: "gone", originKind: null } }),
     );
     expect(await resolve("child")).toBe("child");
   });
 
   // A `thread.deleted` event for a row the host has already removed is the
   // ordinary way this happens, and the host answers it with null rather than
-  // by throwing. Reading `.childOrigin` off that null threw a TypeError out
+  // by throwing. Reading `.originKind` off that null threw a TypeError out
   // of the resolver, which the teardown could only warn about — leaving the
   // deleted thread's page open for the idle reaper to find half an hour later.
   it("treats a thread the host answers null for as its own root, without throwing", async () => {
@@ -79,7 +87,7 @@ describe("createSessionKeyResolver", () => {
       sdk: {
         threads: {
           get: async ({ threadId }: { threadId: string }) =>
-            threadId === "child" ? { parentThreadId: "gone", childOrigin: "spawn" } : null,
+            threadId === "child" ? { parentThreadId: "gone", originKind: null } : null,
         },
       },
     } as never;
@@ -90,8 +98,8 @@ describe("createSessionKeyResolver", () => {
   it("survives a parent cycle", async () => {
     const resolve = createSessionKeyResolver(
       fakeBb({
-        a: { parentThreadId: "b", childOrigin: "spawn" },
-        b: { parentThreadId: "a", childOrigin: "spawn" },
+        a: { parentThreadId: "b", originKind: null },
+        b: { parentThreadId: "a", originKind: null },
       }),
     );
     expect(await resolve("a")).toBe("b");
@@ -107,14 +115,14 @@ describe("createSessionKeyResolver", () => {
         threads: {
           get: async ({ threadId }: { threadId: string }) => {
             if (threadId === "child") {
-              return { parentThreadId: "flaky", childOrigin: "spawn" };
+              return { parentThreadId: "flaky", originKind: null };
             }
             if (threadId === "flaky") {
               if (flakyShouldFail) {
                 flakyShouldFail = false;
                 throw new Error("transient failure");
               }
-              return { parentThreadId: null, childOrigin: null };
+              return { parentThreadId: null, originKind: null };
             }
             throw new Error("no such thread");
           },
