@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { z } from "zod";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Actions } from "./actions.js";
 import { createPageHolder } from "./holder.js";
 import { registerTools, TOOL_NAMES } from "./tools.js";

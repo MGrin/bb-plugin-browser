@@ -4,7 +4,7 @@
 // coordinator work one page and one cookie jar. Walking to the root of the
 // parent chain gives that key. A fork is a peer exploration, not a subagent,
 // so it starts its own.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 /** Calls made outside any thread share this key. */
 export const SCRATCH_SESSION_KEY = "scratch";
@@ -27,7 +27,10 @@ export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
     let root = threadId;
     while (!seen.includes(current)) {
       seen.push(current);
-      let thread: { parentThreadId: string | null; childOrigin: string | null } | null;
+      // The shape comes from the SDK rather than a local restatement: a local one
+      // silently kept compiling when bb renamed the field, which is how the fork
+      // check below became dead code.
+      let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>> | null;
       try {
         thread = await bb.sdk.threads.get({ threadId: current });
       } catch {
@@ -36,7 +39,7 @@ export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
       }
       // A host that ANSWERS with null — the ordinary shape of a `thread.deleted`
       // event for a row the host has already removed — is not a thread with no
-      // parent. Reading `.childOrigin` off it throws a TypeError out of the
+      // parent. Reading `.originKind` off it throws a TypeError out of the
       // resolver, and the caller that matters is the thread teardown: it would
       // only warn, and the page would be left to the idle reaper half an hour
       // later. So null is an unreadable thread, handled exactly like a throw —
@@ -47,7 +50,7 @@ export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
         break;
       }
       root = current; // This node was successfully read, so it's a valid stopping point.
-      if (thread.childOrigin === "fork") break;
+      if (thread.originKind === "fork") break;
       if (!thread.parentThreadId) break;
       current = thread.parentThreadId;
     }

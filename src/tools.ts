@@ -3,7 +3,7 @@
 // Session keys are derived from ctx.threadId here and never accepted as a
 // parameter, so one thread cannot address another thread's page.
 import { z } from "zod";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { ALLOWED_SCHEMES, assertOpenableUrl, type Actions } from "./actions.js";
 import type { PageHolder } from "./holder.js";
 import type { SessionKeyResolver } from "./session-key.js";

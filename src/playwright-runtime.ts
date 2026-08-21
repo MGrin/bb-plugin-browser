@@ -1,6 +1,6 @@
 // Loading Playwright at runtime instead of bundling it.
 //
-// bb's plugin build bundles everything except `@bb/plugin-sdk` and
+// bb's plugin build bundles everything except `@get-bb/plugin-sdk` and
 // `better-sqlite3`, and the list is not configurable. Playwright cannot be
 // bundled: it ships a native fsevents binding and resolves chromium-bidi
 // dynamically, both of which esbuild refuses.
