@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { ALLOWED_SCHEMES, assertOpenableUrl, type Actions } from "./actions.js";
+import type { PageHolder } from "./holder.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
 /** The schema's view of the same rule Actions enforces by throwing. */
@@ -39,6 +40,7 @@ export function registerTools(
   operations: Actions,
   resolveSessionKey: SessionKeyResolver,
   mode: { show(): Promise<string> },
+  holder: PageHolder,
 ): void {
   // The one tool that is not about a page. An agent cannot pass a login wall,
   // solve a CAPTCHA, or decide whether a design looks right — this is how it
@@ -56,6 +58,16 @@ export function registerTools(
     execute: async () => mode.show(),
   });
 
+  /**
+   * The displacement notice goes ABOVE the result, every tool, no exceptions.
+   *
+   * A spawned thread shares its parent's session key, so several siblings drive
+   * one page and last navigator wins. Before MX-229 that was silent, and silence
+   * is the defect: a `read` or a `screenshot` of another thread's page comes back
+   * looking exactly like one of your own. So the notice is prefixed to the tool
+   * RESULT rather than logged — the log is not where the model is looking, and
+   * the moment it needs to know is the moment it reads the output.
+   */
   const tool = <Schema extends z.ZodType>(
     name: string,
     description: string,
@@ -66,7 +78,12 @@ export function registerTools(
       name,
       description: `${description} ${UNTRUSTED}`,
       parameters,
-      execute: async (params, ctx) => execute(params, await resolveSessionKey(ctx.threadId)),
+      execute: async (params, ctx) => {
+        const sessionKey = await resolveSessionKey(ctx.threadId);
+        const notice = await holder.claim(sessionKey, ctx.threadId);
+        const result = await execute(params, sessionKey);
+        return notice ? `${notice}\n\n${result}` : result;
+      },
     });
 
   // http/https only. z.url() alone accepts file://, javascript: and data:,
@@ -141,8 +158,18 @@ export function registerTools(
     description: `A PNG of the current page. ${UNTRUSTED}`,
     parameters: z.object({}),
     execute: async (_params, ctx) => {
-      const shot = await operations.screenshot(await resolveSessionKey(ctx.threadId));
-      return { content: [{ type: "image", data: shot.base64, mimeType: "image/png" }] };
+      const sessionKey = await resolveSessionKey(ctx.threadId);
+      const notice = await holder.claim(sessionKey, ctx.threadId);
+      const shot = await operations.screenshot(sessionKey);
+      // THE case this ticket turns on. A capture of a displaced tab returned
+      // "screenshot saved" for a page the thread had never opened, and the
+      // worker it happened to said: "had I filed it, it would have read as
+      // evidence." An image carries no provenance a reader can check, so the
+      // warning has to travel WITH it as text, in the same tool result.
+      const image = { type: "image" as const, data: shot.base64, mimeType: "image/png" };
+      return {
+        content: notice ? [{ type: "text" as const, text: notice }, image] : [image],
+      };
     },
   });
 }

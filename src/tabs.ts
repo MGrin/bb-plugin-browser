@@ -11,6 +11,7 @@
 // finds it. Nothing here caches a handle that can go stale behind our back;
 // every lookup asks the browser.
 import type { Browser, BrowserContext, Page } from "playwright-core";
+import { holderKey } from "./holder.js";
 
 /** What a thread's tab is, once we have found or made it. */
 export interface ThreadTab {
@@ -44,7 +45,14 @@ export interface Tabs {
   closeTab(sessionKey: string): Promise<void>;
   /** Every open tab, with whether this plugin opened it and who holds it. */
   listTabs(): Promise<
-    { targetId: string; url: string; sessionKey: string | null; ours: boolean }[]
+    {
+      targetId: string;
+      url: string;
+      sessionKey: string | null;
+      ours: boolean;
+      /** Which thread drove it LAST — not the same as whose tab it is. */
+      lastDriver: string | null;
+    }[]
   >;
   /** Close a tab by target id — used by the reaper for our own orphans. */
   closeTarget(targetId: string): Promise<void>;
@@ -176,6 +184,23 @@ export function createTabs(deps: TabsDeps): Tabs {
     return entries.filter((entry): entry is { page: Page; targetId: string } => entry !== null);
   }
 
+  /**
+   * targetId -> sessionKey, for the two questions that only have a target id.
+   *
+   * The bindings are stored the other way round because that is the direction
+   * every lookup on the hot path needs; this scan is for `listTabs` and for the
+   * reaper, neither of which runs per action.
+   */
+  async function sessionKeysByTarget(): Promise<Map<string, string>> {
+    const bindings = new Map<string, string>();
+    for (const storedKey of await deps.kv.list("tab:")) {
+      const sessionKey = storedKey.startsWith("tab:") ? storedKey.slice(4) : storedKey;
+      const targetId = await deps.kv.get<string>(tabKey(sessionKey));
+      if (targetId) bindings.set(targetId, sessionKey);
+    }
+    return bindings;
+  }
+
   // Two callers arriving for the same thread at once must not open two tabs;
   // the loser's tab would be orphaned immediately and the thread would hold a
   // handle nothing else agreed on. Same shape of fix as v1 needed, kept here
@@ -230,6 +255,11 @@ export function createTabs(deps: TabsDeps): Tabs {
     async closeTab(sessionKey) {
       const targetId = await deps.kv.get<string>(tabKey(sessionKey));
       await deps.kv.delete(tabKey(sessionKey));
+      // The driver record dies with the page. Kept, it would tell the next
+      // thread to take this key that a thread from before the close "drove this
+      // tab more recently than you did" — about a page that no longer exists.
+      // A warning that is sometimes false is one an agent learns to ignore.
+      await deps.kv.delete(holderKey(sessionKey));
       if (!targetId) return;
       const found = (await pagesWithIds(await context())).find(
         (candidate) => candidate.targetId === targetId,
@@ -245,24 +275,33 @@ export function createTabs(deps: TabsDeps): Tabs {
         (candidate) => candidate.targetId === targetId,
       );
       await deps.kv.delete(ownedKey(targetId));
+      // Same reason as closeTab, reached the other way round: the reaper knows
+      // only a target id, and an idle sweep that left the driver behind would
+      // hand a stale accusation to whoever next takes that session key.
+      const sessionKey = (await sessionKeysByTarget()).get(targetId);
+      if (sessionKey) await deps.kv.delete(holderKey(sessionKey));
       if (found) await found.page.close().catch(() => {});
     },
 
     async listTabs() {
       const open = await pagesWithIds(await context());
-      const bindings = new Map<string, string>();
-      for (const storedKey of await deps.kv.list("tab:")) {
-        const sessionKey = storedKey.startsWith("tab:") ? storedKey.slice(4) : storedKey;
-        const targetId = await deps.kv.get<string>(tabKey(sessionKey));
-        if (targetId) bindings.set(targetId, sessionKey);
-      }
+      const bindings = await sessionKeysByTarget();
       return Promise.all(
-        open.map(async (entry) => ({
-          targetId: entry.targetId,
-          url: entry.page.url(),
-          sessionKey: bindings.get(entry.targetId) ?? null,
-          ours: (await deps.kv.get<boolean>(ownedKey(entry.targetId))) === true,
-        })),
+        open.map(async (entry) => {
+          const sessionKey = bindings.get(entry.targetId) ?? null;
+          return {
+            targetId: entry.targetId,
+            url: entry.page.url(),
+            sessionKey,
+            ours: (await deps.kv.get<boolean>(ownedKey(entry.targetId))) === true,
+            // Whose tab it is and who last DROVE it are different questions once
+            // siblings share a session key, and the second is the one that says
+            // whether the page in front of you is the one you left (MX-229).
+            lastDriver: sessionKey
+              ? (await deps.kv.get<string>(holderKey(sessionKey))) ?? null
+              : null,
+          };
+        }),
       );
     },
   };

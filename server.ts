@@ -25,6 +25,7 @@ import { profileDirIn } from "./src/profile.js";
 import { createModeSwitch } from "./src/mode.js";
 import { registerCli } from "./src/cli.js";
 import { createReaper2, DEFAULT_IDLE_MINUTES, idleMsFrom } from "./src/reaper2.js";
+import { createPageHolder } from "./src/holder.js";
 import { createSessionKeyResolver } from "./src/session-key.js";
 import { createTabs } from "./src/tabs.js";
 import { registerTools, TOOL_NAMES } from "./src/tools.js";
@@ -108,6 +109,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   const actions = createActions({ tabs, activity: reaper });
 
+  // Who last drove each page. A spawned thread shares its parent's session key,
+  // so siblings contend for one Page and last navigator wins; this is what makes
+  // that visible to the loser instead of silent (MX-229).
+  const holder = createPageHolder({ kv: bb.storage.kv });
+
   // Headless by default; headed for the two moments a human is needed. One
   // profile can only be held by one process, so this is a relaunch — see
   // src/mode.ts for what that costs and why it is worth it.
@@ -135,7 +141,7 @@ export default async function plugin(bb: BbPluginApi) {
     log: (message) => bb.log.info(message),
   });
 
-  registerTools(bb, actions, createSessionKeyResolver(bb), mode);
+  registerTools(bb, actions, createSessionKeyResolver(bb), mode, holder);
   registerCli(bb, actions, createSessionKeyResolver(bb), {
     // Browser-level, so it goes past Actions rather than through it: Actions
     // is deliberately per-tab and has no way to end the browser.
@@ -159,7 +165,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? `${found.name} — ${found.path} (detected)`
         : "no Chromium-family browser found — set the browserPath setting";
     },
-  });
+  }, holder);
   bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 
   bb.background.service("reaper", {
