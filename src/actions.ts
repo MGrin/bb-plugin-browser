@@ -11,6 +11,9 @@
 // inherit them instead of re-implementing them:
 //   * http/https only — file:// would make open+read a local file reader
 //   * page-controlled output is capped before it can reach a model context
+//   * upload names its files explicitly — it is the one outbound path
+import { stat } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import type { Page } from "playwright-core";
 import type { Tabs } from "./tabs.js";
 
@@ -47,6 +50,7 @@ export interface Actions {
   snapshot(sessionKey: string, interactive: boolean): Promise<string>;
   click(sessionKey: string, selector: string): Promise<string>;
   type(sessionKey: string, selector: string, text: string, submit: boolean): Promise<string>;
+  upload(sessionKey: string, selector: string, paths: string[]): Promise<string>;
   evaluate(sessionKey: string, expression: string): Promise<string>;
   screenshot(sessionKey: string): Promise<{ base64: string }>;
   close(sessionKey: string): Promise<string>;
@@ -88,6 +92,60 @@ export function assertOpenableUrl(url: string): void {
 }
 
 /** Cap page-controlled text, and say so rather than truncating silently. */
+/**
+ * Files one `upload` may hand to a page.
+ *
+ * A cap that a real form would never reach, present because the failure it
+ * prevents is not a slow upload: a selector that matched the wrong input, or a
+ * glob that expanded further than intended, becomes a refusal instead of a
+ * silent bulk send.
+ */
+export const MAX_UPLOAD_FILES = 10;
+
+/**
+ * *** UPLOAD IS THE ONLY PATH THAT SENDS LOCAL BYTES OUTWARD, so it is the
+ * mirror image of the `file://` rule above and needs its own guard. ***
+ *
+ * `open`+`read` on a `file://` url would let a page's content talk an agent
+ * into READING a local file. `upload` is the same risk running the other way:
+ * a page that says "attach your credentials to continue" is asking an agent to
+ * SEND one. The defence is the same in both directions and it is not a path
+ * allowlist, which would be guesswork about which files matter — it is that
+ * the agent must name each file explicitly, so the choice is always in the
+ * transcript rather than inferred from the page.
+ *
+ * What this function refuses is narrower and worth stating plainly: paths that
+ * are not absolute (a relative path resolves against whatever directory the bb
+ * server happens to be in, which is not the one the caller was thinking of),
+ * and anything that is not a regular file. A directory handed to
+ * `setInputFiles` fails deep inside Playwright with a message that names
+ * neither the path nor the reason.
+ */
+async function assertUploadableFiles(paths: string[]): Promise<string[]> {
+  if (paths.length === 0) throw new Error("upload needs at least one file path");
+  if (paths.length > MAX_UPLOAD_FILES) {
+    throw new Error(
+      `upload was given ${paths.length} files, over the ${MAX_UPLOAD_FILES}-file limit — ` +
+        "name the files you mean rather than passing a wide glob",
+    );
+  }
+  return Promise.all(
+    paths.map(async (path) => {
+      if (!isAbsolute(path)) {
+        throw new Error(
+          `upload needs an absolute path, got "${path}" — a relative path resolves ` +
+            "against the bb server's working directory, not yours",
+        );
+      }
+      const full = resolve(path);
+      const info = await stat(full).catch(() => null);
+      if (!info) throw new Error(`no such file: ${full}`);
+      if (!info.isFile()) throw new Error(`not a regular file: ${full}`);
+      return full;
+    }),
+  );
+}
+
 export function capped(text: string): string {
   if (text.length <= MAX_OUTPUT_CHARS) return text;
   return `${text.slice(0, MAX_OUTPUT_CHARS)}\n\n[truncated: showing ${MAX_OUTPUT_CHARS} of ${text.length} chars]`;
@@ -158,6 +216,18 @@ export function createActions(deps: ActionsDeps): Actions {
         await field.fill(text);
         if (submit) await field.press("Enter");
         return submit ? `typed into ${selector} and pressed Enter` : `typed into ${selector}`;
+      });
+    },
+
+    async upload(sessionKey, selector, paths) {
+      const files = await assertUploadableFiles(paths);
+      return onPage(sessionKey, async (page) => {
+        // setInputFiles rather than a synthetic change event: a React dropzone
+        // keeps its own state and ignores an input whose FileList was swapped
+        // from JavaScript, so the eval route silently uploads nothing. This
+        // drives the input the way the browser does.
+        await page.locator(selector).first().setInputFiles(files);
+        return `attached ${files.length} file(s) to ${selector}: ${files.join(", ")}`;
       });
     },
 

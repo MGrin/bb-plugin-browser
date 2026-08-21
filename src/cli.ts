@@ -167,6 +167,11 @@ export async function runCli(
         if (positional.length < 2) return fail("usage: bb browser type <selector> <text> [--submit]");
         return ok(await operations.type(sessionKey, positional[0], positional[1], submit));
       }
+      case "upload": {
+        if (rest.length < 2) return fail("usage: bb browser upload <selector> <absolute-path>...");
+        const [selector, ...paths] = rest;
+        return ok(await operations.upload(sessionKey, selector, paths));
+      }
       case "eval":
         if (!rest[0]) return fail("usage: bb browser eval <expression>");
         return ok(await operations.evaluate(sessionKey, rest[0]));

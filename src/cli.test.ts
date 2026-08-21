@@ -12,6 +12,7 @@ function fakeOperations() {
     snapshot: vi.fn(async () => "tree"),
     click: vi.fn(async () => "clicked"),
     type: vi.fn(async () => "typed"),
+    upload: vi.fn(async () => "attached"),
     evaluate: vi.fn(async () => "42"),
     screenshot: vi.fn(async () => ({ base64: "AAA" })),
     close: vi.fn(async () => "closed"),
@@ -24,6 +25,23 @@ describe("runCli", () => {
     const result = await runCli(operations, "thr_a", ["open", "https://example.com"]);
     expect(operations.open).toHaveBeenCalledWith("thr_a", "https://example.com");
     expect(result.exitCode).toBe(0);
+  });
+
+  it("passes every path after the selector to upload", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["upload", "input[type=file]", "/tmp/a.pdf", "/tmp/b.pdf"]);
+    expect(operations.upload).toHaveBeenCalledWith("thr_a", "input[type=file]", ["/tmp/a.pdf", "/tmp/b.pdf"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("refuses an upload with a selector but no file", async () => {
+    const operations = fakeOperations();
+    const result = await runCli(operations, "thr_a", ["upload", "input[type=file]"]);
+    // The selector alone is the shape a caller lands on by forgetting the
+    // path, and setInputFiles([]) CLEARS the input rather than failing — so
+    // the wrong thing here is a silent no-op, not an error.
+    expect(operations.upload).not.toHaveBeenCalled();
+    expect(result.exitCode).not.toBe(0);
   });
 
   it("submits when --submit is passed", async () => {
