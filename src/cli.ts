@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import type { BbPluginApi, PluginCliResult } from "@bb/plugin-sdk";
 import type { Actions } from "./actions.js";
+import type { PageHolder } from "./holder.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
 /**
@@ -59,6 +60,39 @@ export interface TabRow {
   url: string;
   sessionKey: string | null;
   ours: boolean;
+  /** Which thread drove this tab last — null when nothing has. */
+  lastDriver?: string | null;
+}
+
+/**
+ * Subcommands that drive a page, and therefore contend for it.
+ *
+ * `tabs`, `status`, `show`, `hide`, `quit` and `build` are about the browser
+ * rather than about one page, so they neither claim it nor get a notice — a
+ * warning printed by `bb browser tabs` would be noise on the very command an
+ * orchestrator runs to investigate the warning.
+ */
+export const PAGE_COMMANDS = new Set([
+  "open",
+  "read",
+  "snapshot",
+  "click",
+  "type",
+  "eval",
+  "screenshot",
+  "close",
+]);
+
+/**
+ * How a tab's last driver is shown, when it is not the thread the tab belongs to.
+ *
+ * This is the row that identified the culprit on 2026-08-21 — and it did so only
+ * because someone happened to look while the offending thread was mid-task. A
+ * recorded driver makes that answerable after the fact instead of by luck.
+ */
+export function driverSuffix(tab: TabRow): string {
+  if (!tab.lastDriver || tab.lastDriver === tab.sessionKey) return "";
+  return `  <- last driven by ${tab.lastDriver}`;
 }
 
 /**
@@ -98,7 +132,13 @@ export interface CliBrowser {
   quit(): Promise<boolean>;
   /** Every open tab: ours and the human's alike. */
   listTabs(): Promise<
-    { targetId: string; url: string; sessionKey: string | null; ours: boolean }[]
+    {
+      targetId: string;
+      url: string;
+      sessionKey: string | null;
+      ours: boolean;
+      lastDriver: string | null;
+    }[]
   >;
 }
 
@@ -146,7 +186,9 @@ export async function runCli(
         // one that is not its own, and seeing which is which is the point of
         // listing them.
         return ok(
-          tabs.map((tab) => `${tabLabel(tab, sessionKey).padEnd(28)} ${tab.url}`).join("\n"),
+          tabs
+            .map((tab) => `${tabLabel(tab, sessionKey).padEnd(28)} ${tab.url}${driverSuffix(tab)}`)
+            .join("\n"),
         );
       }
       case "show": {
@@ -196,6 +238,7 @@ export function registerCli(
   operations: Actions,
   resolveSessionKey: SessionKeyResolver,
   browser: CliBrowser,
+  holder: PageHolder,
 ): void {
   bb.cli.register({
     name: "browser",
@@ -232,7 +275,25 @@ export function registerCli(
           `loaded ${BUILD_STAMP.rev ?? "unknown"}${dirty} from ${BUILD_STAMP.sourceDir} at ${BUILD_STAMP.loadedAt}${why}`,
         );
       }
-      return runCli(operations, await resolveSessionKey(ctx.threadId), argv, browser);
+      const sessionKey = await resolveSessionKey(ctx.threadId);
+      // Claimed BEFORE the command runs, so the notice describes the state the
+      // command is about to execute in. `runCli` is left alone deliberately: it
+      // is the shared body the tools and the CLI both lean on, and contention is
+      // a property of the CALLER, which only this layer knows.
+      const notice = PAGE_COMMANDS.has(argv[0] ?? "")
+        ? await holder.claim(sessionKey, ctx.threadId)
+        : null;
+      const result = await runCli(operations, sessionKey, argv, browser);
+      if (!notice) return result;
+      // A FAILING page command is where this matters most, not least: "Execution
+      // context was destroyed, most likely because of a navigation" is what a
+      // sibling's goto looks like from inside your evaluate. Dropping the notice
+      // on a non-zero exit would hide the contention in the one result that is
+      // already evidence of it.
+      if (result.exitCode !== 0) {
+        return { exitCode: result.exitCode, stderr: `${notice}\n\n${result.stderr ?? ""}`.trim() };
+      }
+      return result.stdout ? ok(`${notice}\n\n${result.stdout}`) : ok(notice);
     },
   });
 }
