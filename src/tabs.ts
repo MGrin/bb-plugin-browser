@@ -41,6 +41,17 @@ export interface Tabs {
   tabFor(sessionKey: string): Promise<ThreadTab>;
   /** This thread's tab if it exists — never creates one. */
   existingTab(sessionKey: string): Promise<ThreadTab | null>;
+  /**
+   * Take a page that is already open as this thread's tab.
+   *
+   * Only the mode switch uses this, and only for a page the browser restored
+   * by itself — see the long note in src/mode.ts. It is deliberately narrow:
+   * it takes a target id the caller has already decided is adoptable, because
+   * the decision needs the picture from BEFORE the relaunch and this module
+   * cannot see that.
+   */
+  adopt(sessionKey: string, targetId: string): Promise<void>;
+
   /** Close this thread's tab and forget it. Safe to call twice. */
   closeTab(sessionKey: string): Promise<void>;
   /** Every open tab, with whether this plugin opened it and who holds it. */
@@ -250,6 +261,16 @@ export function createTabs(deps: TabsDeps): Tabs {
 
       inflight.set(sessionKey, work);
       return work;
+    },
+
+    async adopt(sessionKey, targetId) {
+      await deps.kv.set(tabKey(sessionKey), targetId);
+      // Same pair `create` writes, for the same reason: the binding says whose
+      // tab it is, the ownership record says the reaper may eventually close
+      // it. A page adopted without the second is exactly the orphan MX-306 is
+      // about, arrived at from the other direction.
+      await deps.kv.set(ownedKey(targetId), true);
+      deps.log(`adopted a restored tab for ${sessionKey} (${targetId})`);
     },
 
     async closeTab(sessionKey) {

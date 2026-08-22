@@ -51,41 +51,41 @@ describe("withDeadline", () => {
 // MX-229: `holder:` rows say who last drove a page. They are written by the
 // tool/CLI layer and released HERE, because a page that no longer exists must
 // not leave an accusation behind for whoever next takes its session key.
-describe("the last-driver record's lifetime", () => {
-  function fakePage(targetId: string, url: string) {
-    let closed = false;
-    const page = {
-      isClosed: () => closed,
-      url: () => url,
-      close: async () => {
-        closed = true;
-      },
-      context: () => ({
-        newCDPSession: async () => ({
-          send: async () => ({ targetInfo: { targetId } }),
-          detach: async () => {},
-        }),
+function fakePage(targetId: string, url: string) {
+  let closed = false;
+  const page = {
+    isClosed: () => closed,
+    url: () => url,
+    close: async () => {
+      closed = true;
+    },
+    context: () => ({
+      newCDPSession: async () => ({
+        send: async () => ({ targetInfo: { targetId } }),
+        detach: async () => {},
       }),
-    };
-    return page as unknown as Parameters<typeof Object.freeze>[0];
-  }
+    }),
+  };
+  return page as unknown as Parameters<typeof Object.freeze>[0];
+}
 
-  function harness(pages: ReturnType<typeof fakePage>[] = []) {
-    const store = new Map<string, unknown>();
-    const kv = {
-      get: async <T,>(key: string) => store.get(key) as T | undefined,
-      set: async (key: string, value: unknown) => void store.set(key, value),
-      delete: async (key: string) => void store.delete(key),
-      list: async (prefix?: string) =>
-        [...store.keys()].filter((key) => !prefix || key.startsWith(prefix)),
-    };
-    const browser = async () =>
-      ({ contexts: () => [{ pages: () => pages }] }) as unknown as Awaited<
-        ReturnType<TabsDeps["browser"]>
-      >;
-    return { store, tabs: createTabs({ browser, kv, log: () => {} }) };
-  }
+function harness(pages: ReturnType<typeof fakePage>[] = []) {
+  const store = new Map<string, unknown>();
+  const kv = {
+    get: async <T,>(key: string) => store.get(key) as T | undefined,
+    set: async (key: string, value: unknown) => void store.set(key, value),
+    delete: async (key: string) => void store.delete(key),
+    list: async (prefix?: string) =>
+      [...store.keys()].filter((key) => !prefix || key.startsWith(prefix)),
+  };
+  const browser = async () =>
+    ({ contexts: () => [{ pages: () => pages }] }) as unknown as Awaited<
+      ReturnType<TabsDeps["browser"]>
+    >;
+  return { store, tabs: createTabs({ browser, kv, log: () => {} }) };
+}
 
+describe("the last-driver record's lifetime", () => {
   it("surfaces who last drove each tab, so `bb browser tabs` can say so", async () => {
     const { store, tabs } = harness([fakePage("t_1", "https://a.example/")]);
     store.set(tabKey("thr_parent"), "t_1");
@@ -137,5 +137,34 @@ describe("the last-driver record's lifetime", () => {
     await tabs.closeTarget("t_1");
     expect(store.has(holderKey("thr_one"))).toBe(false);
     expect(store.get(holderKey("thr_two"))).toBe("thr_worker_b");
+  });
+});
+
+// ADOPTION (MX-306). A mode switch is a relaunch, and Chromium session-restores
+// the profile's pages — so the agent's page is already back, with a new target
+// id that no binding names. Adoption is how it stops being an orphan; the
+// decision about WHICH page is adoptable is the mode switch's, because it needs
+// the picture from before the relaunch.
+describe("adopting a page the browser restored", () => {
+  it("binds the page to the thread, so tabFor finds it again", async () => {
+    const { store, tabs } = harness([fakePage("t_new", "https://a.example/")]);
+    // The pre-relaunch binding, pointing at a target id that died with the
+    // old process.
+    store.set(tabKey("thr_a"), "t_dead");
+
+    await tabs.adopt("thr_a", "t_new");
+
+    expect(store.get(tabKey("thr_a"))).toBe("t_new");
+    expect((await tabs.tabFor("thr_a")).targetId).toBe("t_new");
+  });
+
+  // The half that is easy to leave out and impossible to see afterwards: an
+  // adopted page with no ownership record is precisely the unreapable orphan
+  // this fix exists to stop making, arrived at from the other direction.
+  it("records the page as ours, so the reaper may eventually close it", async () => {
+    const { store, tabs } = harness([fakePage("t_new", "https://a.example/")]);
+    await tabs.adopt("thr_a", "t_new");
+    expect(store.get(ownedKey("t_new"))).toBe(true);
+    expect((await tabs.listTabs())[0]).toMatchObject({ ours: true, sessionKey: "thr_a" });
   });
 });

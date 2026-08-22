@@ -5,23 +5,43 @@ import {
   DEFAULT_HEADED_HOURS,
   humanizeDuration,
   type ModeDeps,
+  type OpenTab,
 } from "./mode.js";
 
 const HOUR = 3_600_000;
 
+/**
+ * A fake browser that SESSION-RESTORES, because that is the mechanism the
+ * switch has to cope with (MX-306). On relaunch every page comes back with a
+ * NEW target id, bound to nobody and owned by nobody — which is exactly what
+ * Chromium does with the profile's tabs, and the reason a naive restore opened
+ * a second copy of every page.
+ */
 function switchWith(overrides: Partial<ModeDeps> = {}) {
   const calls: string[] = [];
-  const state = { mode: "headless" as "headless" | "headed" };
+  const state = {
+    mode: "headless" as "headless" | "headed",
+    tabs: [
+      { targetId: "t1", url: "https://example.com/", sessionKey: "thr_a", ours: true },
+      { targetId: "t2", url: "about:blank", sessionKey: "thr_blank", ours: true },
+    ] as OpenTab[],
+  };
+  /** What a relaunch does to the tabs: everything back, nothing bound. */
+  const sessionRestore = () => {
+    state.tabs = state.tabs.map((tab, index) => ({
+      targetId: `r${index}`,
+      url: tab.url,
+      sessionKey: null,
+      ours: false,
+    }));
+  };
   const deps: ModeDeps = {
     currentMode: async () => state.mode,
     running: async () => true,
     modeSince: async () => 0,
     autoHideAfterMs: async () => DEFAULT_HEADED_HOURS * HOUR,
     busy: () => false,
-    capture: async () => [
-      { sessionKey: "thr_a", url: "https://example.com/" },
-      { sessionKey: "thr_blank", url: "about:blank" },
-    ],
+    openTabs: async () => state.tabs.map((tab) => ({ ...tab })),
     quit: async () => {
       calls.push("quit");
       return true;
@@ -29,9 +49,18 @@ function switchWith(overrides: Partial<ModeDeps> = {}) {
     relaunch: async (mode) => {
       calls.push(`relaunch ${mode}`);
       state.mode = mode;
+      sessionRestore();
+    },
+    adopt: async (sessionKey, targetId) => {
+      calls.push(`adopt ${sessionKey} ${targetId}`);
+      const tab = state.tabs.find((candidate) => candidate.targetId === targetId);
+      if (!tab) throw new Error(`no such tab ${targetId}`);
+      tab.sessionKey = sessionKey;
+      tab.ours = true;
     },
     restore: async (sessionKey, url) => {
       calls.push(`restore ${sessionKey} ${url}`);
+      state.tabs.push({ targetId: `n${state.tabs.length}`, url, sessionKey, ours: true });
     },
     log: () => {},
     ...overrides,
@@ -53,15 +82,17 @@ describe("mode switching", () => {
     expect(calls).toEqual([
       "quit",
       "relaunch headed",
-      "restore thr_a https://example.com/",
+      // ADOPTED, not reopened: the browser already brought the page back.
+      "adopt thr_a r0",
     ]);
     expect(message).toContain("on screen");
   });
 
   // A blank tab restored is still a blank tab; reopening it only costs time.
   it("does not restore pages that were never anywhere", async () => {
-    const { calls } = switchWith();
-    expect(calls.filter((call) => call.includes("about:blank"))).toEqual([]);
+    const { mode, calls } = switchWith();
+    await mode.show();
+    expect(calls.filter((call) => call.includes("thr_blank"))).toEqual([]);
   });
 
   // Asking for the mode it is already in must not tear the browser down —
@@ -76,9 +107,11 @@ describe("mode switching", () => {
   it("captures before quitting, not after", async () => {
     const order: string[] = [];
     const { mode } = switchWith({
-      capture: async () => {
-        order.push("capture");
-        return [{ sessionKey: "thr_a", url: "https://example.com/" }];
+      openTabs: async () => {
+        order.push("read the tabs");
+        return [
+          { targetId: "t1", url: "https://example.com/", sessionKey: "thr_a", ours: true },
+        ];
       },
       quit: async () => {
         order.push("quit");
@@ -86,16 +119,18 @@ describe("mode switching", () => {
       },
     });
     await mode.show();
-    expect(order).toEqual(["capture", "quit"]);
+    expect(order.slice(0, 2)).toEqual(["read the tabs", "quit"]);
   });
 
   it("restores the rest when one page fails to come back", async () => {
     const restored: string[] = [];
     const { mode } = switchWith({
-      capture: async () => [
-        { sessionKey: "thr_a", url: "https://a.example/" },
-        { sessionKey: "thr_b", url: "https://b.example/" },
+      openTabs: async () => [
+        { targetId: "t1", url: "https://a.example/", sessionKey: "thr_a", ours: true },
+        { targetId: "t2", url: "https://b.example/", sessionKey: "thr_b", ours: true },
       ],
+      // A browser that restored nothing, so both pages go down the reopen path.
+      relaunch: async () => {},
       restore: async (sessionKey) => {
         if (sessionKey === "thr_a") throw new Error("gone");
         restored.push(sessionKey);
@@ -104,6 +139,76 @@ describe("mode switching", () => {
     const message = await mode.show();
     expect(restored).toEqual(["thr_b"]);
     expect(message).toContain("1 of 2");
+  });
+
+  // THE DEFECT MX-306 IS ABOUT. A switch is a relaunch, and Chromium
+  // session-restores the profile's pages — so the agent's page is already back
+  // before `restore` runs. Opening it again left a second copy that was
+  // `ours: false` and bound to nobody, which the reaper skips by the very rule
+  // that protects a human's tab. One orphan per agent tab per switch, forever.
+  it("adopts the page the browser restored instead of opening a second copy", async () => {
+    const { mode, calls, state } = switchWith();
+    await mode.show();
+    expect(calls.filter((call) => call.startsWith("restore"))).toEqual([]);
+    expect(calls).toContain("adopt thr_a r0");
+    const example = state.tabs.filter((tab) => tab.url === "https://example.com/");
+    expect(example).toHaveLength(1);
+    expect(example[0]).toMatchObject({ sessionKey: "thr_a", ours: true });
+  });
+
+  // Adoption is an optimisation over reopening, never a requirement: a browser
+  // that restores nothing (the setting can be turned off) must still put every
+  // thread back.
+  it("opens the page itself when the browser restored nothing", async () => {
+    const { mode, calls } = switchWith({ relaunch: async () => {} });
+    await mode.show();
+    expect(calls).toContain("restore thr_a https://example.com/");
+  });
+
+  // THE ARM THE FIX IS NOT ABOUT, and the one an ownership bug would hide in.
+  // Adoption takes an unbound, unowned page — which after a relaunch is what a
+  // HUMAN's restored tab looks like too. It is only ever matched by url, so a
+  // tab of his at a url no agent had is never a candidate.
+  it("never adopts a tab the plugin did not open", async () => {
+    const { mode, state } = switchWith({});
+    state.tabs.push({
+      targetId: "h1",
+      url: "https://workspace.example/",
+      sessionKey: null,
+      ours: false,
+    });
+    await mode.show();
+    const his = state.tabs.filter((tab) => tab.url === "https://workspace.example/");
+    expect(his).toHaveLength(1);
+    expect(his[0]).toMatchObject({ sessionKey: null, ours: false });
+  });
+
+  // And when he is on the SAME url as an agent, one restored page is reserved
+  // for him before any adoption happens — so a relaunch that brought back only
+  // his copy reopens the agent's rather than taking his. Without the
+  // reservation this adopts his page, and the reaper becomes eligible to close
+  // it later, which is the whole hazard.
+  it("reserves a restored page for each tab that was not ours", async () => {
+    const { mode, calls, state } = switchWith({
+      openTabs: async () => state.tabs.map((tab) => ({ ...tab })),
+      relaunch: async () => {
+        // Only the human's copy came back.
+        state.tabs = [
+          { targetId: "r0", url: "https://example.com/", sessionKey: null, ours: false },
+        ];
+      },
+    });
+    state.tabs = [
+      { targetId: "t1", url: "https://example.com/", sessionKey: "thr_a", ours: true },
+      { targetId: "h1", url: "https://example.com/", sessionKey: null, ours: false },
+    ];
+    await mode.show();
+    expect(calls.filter((call) => call.startsWith("adopt"))).toEqual([]);
+    expect(calls).toContain("restore thr_a https://example.com/");
+    expect(state.tabs.find((tab) => tab.targetId === "r0")).toMatchObject({
+      sessionKey: null,
+      ours: false,
+    });
   });
 
   it("says plainly that unsubmitted input is lost", async () => {
@@ -162,7 +267,7 @@ describe("returning to headless on its own", () => {
     expect(calls).toContain("quit");
     expect(calls).toContain("relaunch headless");
     // Restoring is inherited from the manual switch: a thread's page comes back.
-    expect(calls).toContain("restore thr_a https://example.com/");
+    expect(calls).toContain("adopt thr_a r0");
     expect(message).toBeTruthy();
   });
 
