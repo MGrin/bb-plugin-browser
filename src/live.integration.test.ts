@@ -306,28 +306,27 @@ suite("the action surface, under two threads at once", () => {
 });
 
 // WHAT A MODE SWITCH REALLY DOES TO THE TABS — measured, after inferring it
-// wrong (MX-297, MX-306).
+// wrong twice (MX-297, MX-306).
 //
 // `server.ts` captures only tabs with a session key, and a human's tab has
 // none, so it is obvious from the code that a switch loses it. That inference
 // is WRONG, and it survived until a mutation exposed it: replacing the rescue
 // with a no-op left the test passing, because Chromium SESSION-RESTORES the
 // profile on relaunch. The tab was never lost. A surviving mutant usually means
-// a weak test; here it meant the rescue was redundant.
+// a weak test; there it meant the rescue was redundant.
 //
-// The real defect is the mirror of the imagined one — not destruction but
+// The real defect was the mirror of the imagined one — not destruction but
 // DUPLICATION. Session restore brings each page back UNBOUND and UNOWNED (its
-// target id is new, so no kv record names it), and `restore` then opens a second
-// copy. The orphan is `ours: false`, and the reaper's first line is
+// target id is new, so no kv record names it), and `restore` then opened a
+// second copy. The orphan was `ours: false`, and the reaper's first line is
 // `if (!tab.ours) continue` — the rule that protects a human's tab — so nothing
-// ever closes it. One per agent tab per switch, plus an `about:blank` per
-// launch, forever. That is a mechanism for MX-289's `3 browser startup` blanks
-// and for the 01:22Z episode naming `about:blank` unresponsive three times.
+// ever closed it. One per agent tab per switch, forever.
 //
-// THIS IS A CHARACTERIZATION TEST. It asserts the duplicate is there. When
-// MX-306 is fixed it goes red ON PURPOSE. If it goes red with nobody having
-// fixed it, session restore has changed behaviour and the first half — a human's
-// tab surviving — is no longer safe.
+// MX-306 fixes that by ADOPTING the restored page instead of reopening it.
+// This test is the falsifier for both halves at once, and they pull in
+// opposite directions: adoption must claim the agent's restored page (or the
+// leak is back) and must not claim the human's (or the reaper becomes eligible
+// to close a tab he opened, which is the worse bug of the two).
 suite("a mode switch, with a tab the plugin did not open", () => {
   let profileDir = "";
   let endpoint = "";
@@ -349,7 +348,7 @@ suite("a mode switch, with a tab the plugin did not open", () => {
     await rm(profileDir, { recursive: true, force: true }).catch(() => {});
   }, 30_000);
 
-  it("keeps a human's tab, and leaks a duplicate of the agent's (MX-306)", async () => {
+  it("keeps a human's tab and adopts the agent's, leaving no duplicate (MX-306)", async () => {
     const kv = memoryKv();
     const tabs = createTabs({ browser: connect, kv, log: () => {} });
     const actions = createActions({
@@ -370,10 +369,7 @@ suite("a mode switch, with a tab the plugin did not open", () => {
       modeSince: () => modeSince(profileDir),
       autoHideAfterMs: async () => 0,
       busy: () => false,
-      capture: async () =>
-        (await tabs.listTabs())
-          .filter((tab) => tab.sessionKey !== null)
-          .map((tab) => ({ sessionKey: tab.sessionKey as string, url: tab.url })),
+      openTabs: () => tabs.listTabs(),
       quit: async () => {
         const closed = await quit(profileDir);
         browser = null;
@@ -384,6 +380,7 @@ suite("a mode switch, with a tab the plugin did not open", () => {
         endpoint = (await startOrAttach({ profileDir, mode: next, log: () => {} })).httpEndpoint;
         await connect();
       },
+      adopt: (sessionKey, targetId) => tabs.adopt(sessionKey, targetId),
       restore: async (sessionKey, url) => {
         await actions.open(sessionKey, url);
       },
@@ -394,25 +391,34 @@ suite("a mode switch, with a tab the plugin did not open", () => {
     expect(await currentMode(profileDir)).toBe("headed");
     const after = await tabs.listTabs();
 
-    // 1. THE HUMAN'S TAB SURVIVES, and comes back as what it was. Nothing in
-    //    this plugin puts it back: the browser does.
-    const humansTab = after.find((tab) => tab.url.includes("?human"));
-    expect(humansTab).toBeDefined();
-    expect(humansTab?.ours).toBe(false);
-    expect(humansTab?.sessionKey).toBeNull();
+    // 1. THE HUMAN'S TAB SURVIVES, and comes back as what it was — still not
+    //    ours, still bound to nobody. Nothing in this plugin puts it back: the
+    //    browser does. Adoption must not have touched it.
+    const humansTabs = after.filter((tab) => tab.url.includes("?human"));
+    expect(humansTabs).toHaveLength(1);
+    expect(humansTabs[0]?.ours).toBe(false);
+    expect(humansTabs[0]?.sessionKey).toBeNull();
 
-    // 2. THE AGENT'S TAB IS DUPLICATED — one session-restored orphan and one
-    //    the restore opened. This is the defect, asserted so it cannot be
-    //    fixed by accident or reintroduced silently.
+    // 2. THE AGENT'S TAB IS NOT DUPLICATED. Exactly one page at that url, and
+    //    it is the session-restored one, adopted: bound to the thread and ours.
+    //    Before the fix there were two — one orphan and one the restore opened.
     const agents = after.filter((tab) => tab.url.includes("?agent"));
-    expect(agents).toHaveLength(2);
-    expect(agents.filter((tab) => tab.ours && tab.sessionKey === "thr_agent")).toHaveLength(1);
-    expect(agents.filter((tab) => !tab.ours && tab.sessionKey === null)).toHaveLength(1);
+    expect(agents).toHaveLength(1);
+    expect(agents[0]?.ours).toBe(true);
+    expect(agents[0]?.sessionKey).toBe("thr_agent");
 
-    // 3. AND NOTHING WILL EVER CLEAN IT. The reaper skips anything not ours —
-    //    the rule that protects a human's tab also protects this orphan. Run
-    //    with time wound days forward and the tightest possible idle window, so
-    //    a pass cannot be an accident of timing.
+    // 3. AND THE THREAD STILL FINDS IT. Adoption is only worth anything if the
+    //    binding it wrote is the one `tabFor` reads — an adopted page nobody can
+    //    reach is a leak with extra steps.
+    const again = await tabs.tabFor("thr_agent");
+    expect(again.targetId).toBe(agents[0]?.targetId);
+    expect(again.page.url()).toContain("?agent");
+
+    // 4. THE ARM THIS FIX IS NOT ABOUT, checked because it is where an ownership
+    //    bug would hide. The reaper closes only tabs that are ours, so adoption
+    //    changing who owns what could make it eligible to close the human's.
+    //    Wound days forward with the tightest idle window, so a pass cannot be
+    //    an accident of timing.
     const reaper = createReaper2({
       idleMs: async () => 1,
       listTabs: () => tabs.listTabs(),
@@ -422,9 +428,11 @@ suite("a mode switch, with a tab the plugin did not open", () => {
     });
     await reaper.sweep(Date.now() + 24 * 3_600_000);
     await reaper.sweep(Date.now() + 48 * 3_600_000);
-    const orphans = (await tabs.listTabs()).filter(
-      (tab) => tab.url.includes("?agent") && !tab.ours,
-    );
-    expect(orphans).toHaveLength(1);
+    const survivors = await tabs.listTabs();
+    expect(survivors.filter((tab) => tab.url.includes("?human"))).toHaveLength(1);
+    // The adopted page IS ours now, so the reaper is free to take it once it
+    // has been idle — that is the point, and the orphan it replaced could never
+    // be taken at all.
+    expect(survivors.filter((tab) => tab.url.includes("?agent"))).toHaveLength(0);
   }, 120_000);
 });

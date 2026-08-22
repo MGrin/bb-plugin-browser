@@ -146,10 +146,10 @@ export default async function plugin(bb: BbPluginApi) {
     // The reaper already tracks which threads hold a page, for the same reason:
     // a relaunch under a live command breaks it.
     busy: () => reaper.busy(),
-    capture: async () =>
-      (await tabs.listTabs())
-        .filter((tab) => tab.sessionKey !== null)
-        .map((tab) => ({ sessionKey: tab.sessionKey as string, url: tab.url })),
+    // Every tab, not just the bound ones: the switch needs to know which pages
+    // were NOT ours before it decides what the browser restored is safe to
+    // adopt (MX-306).
+    openTabs: () => tabs.listTabs(),
     quit: async () => {
       const closed = await quitBrowser(await profileDir());
       browser = null;
@@ -162,6 +162,7 @@ export default async function plugin(bb: BbPluginApi) {
       await new Promise((resolve) => setTimeout(resolve, 1200));
       await connected();
     },
+    adopt: (sessionKey, targetId) => tabs.adopt(sessionKey, targetId),
     restore: async (sessionKey, url) => {
       await actions.open(sessionKey, url);
     },

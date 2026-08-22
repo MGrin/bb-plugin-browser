@@ -64,6 +64,17 @@ export function humanizeDuration(ms: number): string {
   return rest ? `${days}d ${rest}h` : `${days}d`;
 }
 
+/** One open tab, as the switch needs to see it. */
+export interface OpenTab {
+  /** The browser's own id for the page — what a binding is written against. */
+  targetId: string;
+  url: string;
+  /** The thread whose binding names it, or null for nobody's. */
+  sessionKey: string | null;
+  /** Whether this plugin opened it. A human's tab is never ours. */
+  ours: boolean;
+}
+
 export interface ModeDeps {
   currentMode(): Promise<BrowserMode>;
   /** Whether a browser is answering at all. A mode file outlives its process. */
@@ -74,12 +85,18 @@ export interface ModeDeps {
   autoHideAfterMs(): Promise<number>;
   /** True while an agent has a page command in flight. */
   busy(): boolean;
-  /** Where each thread's tab currently is, so it can be put back. */
-  capture(): Promise<{ sessionKey: string; url: string }[]>;
+  /**
+   * Every tab open right now. Read TWICE: before the quit, to know where each
+   * thread was and which pages were not ours, and again after the relaunch, to
+   * see what the browser restored by itself.
+   */
+  openTabs(): Promise<OpenTab[]>;
   quit(): Promise<boolean>;
   /** Start in this mode and reconnect. */
   relaunch(mode: BrowserMode): Promise<void>;
-  /** Put a thread back on a url after the relaunch. */
+  /** Take a page the browser restored as this thread's tab. */
+  adopt(sessionKey: string, targetId: string): Promise<void>;
+  /** Put a thread back on a url after the relaunch, when nothing was restored. */
   restore(sessionKey: string, url: string): Promise<void>;
   log(message: string): void;
 }
@@ -111,18 +128,57 @@ export function createModeSwitch(deps: ModeDeps): ModeSwitch {
         : "the browser is already headless";
     }
 
-    // Captured BEFORE anything is torn down: after the quit there is nothing
-    // left to ask where a thread was.
-    const open = (await deps.capture()).filter((entry) => worthRestoring(entry.url));
+    // Read BEFORE anything is torn down: after the quit there is nothing left
+    // to ask where a thread was.
+    const before = await deps.openTabs();
+    const open = before
+      .filter((tab): tab is OpenTab & { sessionKey: string } => tab.sessionKey !== null)
+      .filter((tab) => worthRestoring(tab.url));
+    // Pages that were NOT ours. Session restore brings these back too, and one
+    // of them may sit on the same url as an agent's page.
+    const foreign = before.filter((tab) => !tab.ours).map((tab) => tab.url);
     deps.log(`switching the browser to ${mode}; ${open.length} tab(s) to restore`);
 
     await deps.quit();
     await deps.relaunch(mode);
 
+    // WHAT THE BROWSER ALREADY DID (MX-306). Chromium session-restores the
+    // profile's pages on relaunch, so each one is back before this code runs —
+    // with a NEW target id, which means no binding names it and no `owned:`
+    // record calls it ours. Reopening it left a second copy that was `ours:
+    // false` and bound to nobody, and the reaper's first line is `if
+    // (!tab.ours) continue` — the rule that protects a human's tab. So nothing
+    // ever closed those: one per agent tab per switch, plus a blank per launch,
+    // forever. Adopting the restored page instead both ends the duplication and
+    // puts the page back under the reaper, which is what should have been
+    // tidying it.
+    const candidates = (await deps.openTabs()).filter(
+      (tab) => !tab.ours && tab.sessionKey === null,
+    );
+    // A url is all there is to match on, and after a relaunch a human's
+    // restored tab looks exactly like ours: unbound and unowned. So before any
+    // adoption, one restored page is set aside for each page that was not ours.
+    // In the ordinary case — his copy and ours both restored — this changes
+    // nothing, because the two are interchangeable. It matters when the browser
+    // brought back FEWER copies than there were: without it the last page at
+    // that url gets adopted, and it may be his.
+    for (const url of foreign) {
+      const index = candidates.findIndex((tab) => tab.url === url);
+      if (index !== -1) candidates.splice(index, 1);
+    }
+
     let restored = 0;
+    let adopted = 0;
     for (const entry of open) {
       try {
-        await deps.restore(entry.sessionKey, entry.url);
+        const index = candidates.findIndex((tab) => tab.url === entry.url);
+        if (index !== -1) {
+          const [page] = candidates.splice(index, 1);
+          await deps.adopt(entry.sessionKey, page!.targetId);
+          adopted += 1;
+        } else {
+          await deps.restore(entry.sessionKey, entry.url);
+        }
         restored += 1;
       } catch (error) {
         // One page failing to come back is not a reason to abandon the rest,
@@ -133,6 +189,9 @@ export function createModeSwitch(deps: ModeDeps): ModeSwitch {
           }`,
         );
       }
+    }
+    if (adopted > 0) {
+      deps.log(`adopted ${adopted} tab(s) the browser restored by itself`);
     }
 
     const note =
