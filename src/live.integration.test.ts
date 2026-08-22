@@ -18,8 +18,10 @@ import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { detect } from "./browsers.js";
-import { currentMode, modeSince, runningPort, startOrAttach } from "./launch.js";
+import { currentMode, modeSince, quit, runningPort, startOrAttach } from "./launch.js";
 import { createActions } from "./actions.js";
+import { createModeSwitch } from "./mode.js";
+import { createReaper2 } from "./reaper2.js";
 import { createTabs, ownedKey, tabKey, type Tabs } from "./tabs.js";
 import { memoryKv } from "./test-support/memory-kv.js";
 
@@ -301,4 +303,128 @@ suite("the action surface, under two threads at once", () => {
     expect(noteworthy[0]).toBe("watch thr_one");
     expect(noteworthy.at(-1)).toBe("unwatch thr_one");
   }, 60_000);
+});
+
+// WHAT A MODE SWITCH REALLY DOES TO THE TABS — measured, after inferring it
+// wrong (MX-297, MX-306).
+//
+// `server.ts` captures only tabs with a session key, and a human's tab has
+// none, so it is obvious from the code that a switch loses it. That inference
+// is WRONG, and it survived until a mutation exposed it: replacing the rescue
+// with a no-op left the test passing, because Chromium SESSION-RESTORES the
+// profile on relaunch. The tab was never lost. A surviving mutant usually means
+// a weak test; here it meant the rescue was redundant.
+//
+// The real defect is the mirror of the imagined one — not destruction but
+// DUPLICATION. Session restore brings each page back UNBOUND and UNOWNED (its
+// target id is new, so no kv record names it), and `restore` then opens a second
+// copy. The orphan is `ours: false`, and the reaper's first line is
+// `if (!tab.ours) continue` — the rule that protects a human's tab — so nothing
+// ever closes it. One per agent tab per switch, plus an `about:blank` per
+// launch, forever. That is a mechanism for MX-289's `3 browser startup` blanks
+// and for the 01:22Z episode naming `about:blank` unresponsive three times.
+//
+// THIS IS A CHARACTERIZATION TEST. It asserts the duplicate is there. When
+// MX-306 is fixed it goes red ON PURPOSE. If it goes red with nobody having
+// fixed it, session restore has changed behaviour and the first half — a human's
+// tab surviving — is no longer safe.
+suite("a mode switch, with a tab the plugin did not open", () => {
+  let profileDir = "";
+  let endpoint = "";
+  let browser: Browser | null = null;
+
+  const connect = async () => {
+    if (!browser || !browser.isConnected()) browser = await chromium.connectOverCDP(endpoint);
+    return browser;
+  };
+
+  beforeAll(async () => {
+    profileDir = await throwawayProfile("bb-browser-modeswitch-");
+    endpoint = (await startOrAttach({ profileDir, log: () => {} })).httpEndpoint;
+  }, 60_000);
+
+  afterAll(async () => {
+    await browser?.close().catch(() => {});
+    await quit(profileDir).catch(() => {});
+    await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  }, 30_000);
+
+  it("keeps a human's tab, and leaks a duplicate of the agent's (MX-306)", async () => {
+    const kv = memoryKv();
+    const tabs = createTabs({ browser: connect, kv, log: () => {} });
+    const actions = createActions({
+      tabs,
+      activity: { touch: () => {}, watch: () => {}, unwatch: () => {}, forget: () => {} },
+    });
+
+    const mine = await tabs.tabFor("thr_agent");
+    await mine.page.goto("https://example.com/?agent");
+    const humans = await (await connect()).contexts()[0]!.newPage();
+    await humans.goto("https://example.com/?human");
+
+    // The real mode switch, wired exactly as `server.ts` wires it — a real quit
+    // and a real relaunch, which is the boundary no unit test crosses.
+    const mode = createModeSwitch({
+      currentMode: () => currentMode(profileDir),
+      running: async () => (await runningPort(profileDir)) !== null,
+      modeSince: () => modeSince(profileDir),
+      autoHideAfterMs: async () => 0,
+      busy: () => false,
+      capture: async () =>
+        (await tabs.listTabs())
+          .filter((tab) => tab.sessionKey !== null)
+          .map((tab) => ({ sessionKey: tab.sessionKey as string, url: tab.url })),
+      quit: async () => {
+        const closed = await quit(profileDir);
+        browser = null;
+        return closed;
+      },
+      relaunch: async (next) => {
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        endpoint = (await startOrAttach({ profileDir, mode: next, log: () => {} })).httpEndpoint;
+        await connect();
+      },
+      restore: async (sessionKey, url) => {
+        await actions.open(sessionKey, url);
+      },
+      log: () => {},
+    });
+
+    await mode.show();
+    expect(await currentMode(profileDir)).toBe("headed");
+    const after = await tabs.listTabs();
+
+    // 1. THE HUMAN'S TAB SURVIVES, and comes back as what it was. Nothing in
+    //    this plugin puts it back: the browser does.
+    const humansTab = after.find((tab) => tab.url.includes("?human"));
+    expect(humansTab).toBeDefined();
+    expect(humansTab?.ours).toBe(false);
+    expect(humansTab?.sessionKey).toBeNull();
+
+    // 2. THE AGENT'S TAB IS DUPLICATED — one session-restored orphan and one
+    //    the restore opened. This is the defect, asserted so it cannot be
+    //    fixed by accident or reintroduced silently.
+    const agents = after.filter((tab) => tab.url.includes("?agent"));
+    expect(agents).toHaveLength(2);
+    expect(agents.filter((tab) => tab.ours && tab.sessionKey === "thr_agent")).toHaveLength(1);
+    expect(agents.filter((tab) => !tab.ours && tab.sessionKey === null)).toHaveLength(1);
+
+    // 3. AND NOTHING WILL EVER CLEAN IT. The reaper skips anything not ours —
+    //    the rule that protects a human's tab also protects this orphan. Run
+    //    with time wound days forward and the tightest possible idle window, so
+    //    a pass cannot be an accident of timing.
+    const reaper = createReaper2({
+      idleMs: async () => 1,
+      listTabs: () => tabs.listTabs(),
+      closeTarget: (targetId) => tabs.closeTarget(targetId),
+      log: () => {},
+      warn: () => {},
+    });
+    await reaper.sweep(Date.now() + 24 * 3_600_000);
+    await reaper.sweep(Date.now() + 48 * 3_600_000);
+    const orphans = (await tabs.listTabs()).filter(
+      (tab) => tab.url.includes("?agent") && !tab.ours,
+    );
+    expect(orphans).toHaveLength(1);
+  }, 120_000);
 });
