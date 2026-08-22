@@ -115,3 +115,33 @@ describe("idleMsFrom", () => {
     expect(idleMsFrom(raw)).toBe(expected);
   });
 });
+
+// Read by the mode switch, not by the reaper: switching headed/headless is a
+// browser relaunch, and doing it under a live page command turns another
+// thread's `open` into an error. The reaper already tracks exactly this.
+describe("whether anything is in flight", () => {
+  it("is quiet with nothing held", () => {
+    const { reaper } = reaperWith([]);
+    expect(reaper.busy()).toBe(false);
+  });
+
+  it("is busy from watch until the matching unwatch", () => {
+    const { reaper } = reaperWith([]);
+    reaper.watch("thr_a");
+    expect(reaper.busy()).toBe(true);
+    reaper.unwatch("thr_a");
+    expect(reaper.busy()).toBe(false);
+  });
+
+  // Nested holds are real: a long command can watch twice, and one unwatch
+  // must not report the machine free while the other is still running.
+  it("stays busy until every nested hold is released", () => {
+    const { reaper } = reaperWith([]);
+    reaper.watch("thr_a");
+    reaper.watch("thr_a");
+    reaper.unwatch("thr_a");
+    expect(reaper.busy()).toBe(true);
+    reaper.unwatch("thr_a");
+    expect(reaper.busy()).toBe(false);
+  });
+});

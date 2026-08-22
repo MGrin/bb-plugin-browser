@@ -5,6 +5,7 @@ import { writeFile } from "node:fs/promises";
 import type { BbPluginApi, PluginCliResult } from "@get-bb/plugin-sdk";
 import type { Actions } from "./actions.js";
 import type { PageHolder } from "./holder.js";
+import { humanizeDuration } from "./mode.js";
 import type { SessionKeyResolver } from "./session-key.js";
 
 /**
@@ -126,6 +127,13 @@ export interface CliBrowser {
   hide(): Promise<string>;
   /** Which mode it is in right now. */
   current(): Promise<"headless" | "headed">;
+  /** How long it has been in that mode, or null when that cannot be known. */
+  modeAgeMs(): Promise<number | null>;
+  /**
+   * What the last automatic return to headless said, if one has happened and
+   * nothing has put the browser back on screen since.
+   */
+  lastAutoHide(): Promise<string | null>;
   /** Which browser is being driven, and where it came from. */
   describe(): Promise<string>;
   /** Close the shared browser. False when there was nothing running. */
@@ -206,10 +214,12 @@ export async function runCli(
       }
       case "status": {
         if (!browser) return fail("status is not available here");
-        const [mode, tabs, which] = await Promise.all([
+        const [mode, tabs, which, ageMs, autoHidden] = await Promise.all([
           browser.current(),
           browser.listTabs(),
           browser.describe(),
+          browser.modeAgeMs(),
+          browser.lastAutoHide(),
         ]);
         // Broken out by kind rather than "N open, M ours": the leftover was
         // the browser's own blank startup tab, and a bare remainder made it
@@ -219,7 +229,15 @@ export async function runCli(
           `${tabs.filter((tab) => !tab.ours && BLANK_URLS.has(tab.url)).length} browser startup`,
           `${tabs.filter((tab) => !tab.ours && !BLANK_URLS.has(tab.url)).length} not ours`,
         ];
-        return ok(`${which}\n${mode}, ${tabs.length} tab(s): ${parts.join(", ")}`);
+        // A clock on HEADED only. That is the state that drifts — 69h and 90h
+        // on two occasions (MX-297) — and a duration printed against headless
+        // too would turn the line into uptime rather than exposure. A null age
+        // prints nothing rather than a guess.
+        const age = mode === "headed" && ageMs !== null ? ` for ${humanizeDuration(ageMs)}` : "";
+        // The window went away and the human is owed a reason. The plugin log
+        // is not where they look; this is.
+        const note = autoHidden ? `\n${autoHidden}` : "";
+        return ok(`${which}\n${mode}${age}, ${tabs.length} tab(s): ${parts.join(", ")}${note}`);
       }
       case "quit": {
         if (!browser) return fail("quit is not available here");

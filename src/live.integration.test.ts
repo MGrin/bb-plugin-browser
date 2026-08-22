@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { detect } from "./browsers.js";
-import { runningPort, startOrAttach } from "./launch.js";
+import { currentMode, modeSince, runningPort, startOrAttach } from "./launch.js";
 import { createActions } from "./actions.js";
 import { createTabs, ownedKey, tabKey, type Tabs } from "./tabs.js";
 import { memoryKv } from "./test-support/memory-kv.js";
@@ -49,6 +49,7 @@ const ACROSS_TIME_MS = 3_000;
 suite("a real browser, driven the way agents will drive it", () => {
   let profileDir = "";
   let endpoint = "";
+  let startedAt = 0;
   let browser: Browser | null = null;
   let kv = memoryKv();
   let tabs: Tabs;
@@ -62,6 +63,7 @@ suite("a real browser, driven the way agents will drive it", () => {
 
   beforeAll(async () => {
     profileDir = await throwawayProfile("bb-browser-live-");
+    startedAt = Date.now();
     const started = await startOrAttach({ profileDir, log: () => {} });
     endpoint = started.httpEndpoint;
     kv = memoryKv();
@@ -88,6 +90,32 @@ suite("a real browser, driven the way agents will drive it", () => {
     }
     await rm(profileDir, { recursive: true, force: true }).catch(() => {});
   }, 30_000);
+
+  // 0. THE HEADED CLOCK IS REAL (MX-297).
+  // The automatic return to headless is timed from the mode file's MTIME,
+  // because `startOrAttach` writes it exactly once per launch and nothing else
+  // touches it — no format change, no migration for existing profiles. That is
+  // a claim about a real browser starting, so a mock cannot check it: this can.
+  it("dates a browser's mode from the moment it was actually launched", async () => {
+    const since = await modeSince(profileDir);
+    expect(since).not.toBeNull();
+    expect(await currentMode(profileDir)).toBe("headless");
+    // Generous, because the assertion is "this is the launch, not some other
+    // event" — being wrong here means minutes or days out, never seconds.
+    expect(Math.abs((since as number) - startedAt)).toBeLessThan(60_000);
+  });
+
+  // Unknown has to stay distinguishable from "just now": the auto-return reads
+  // an unknown clock as a reason NOT to act, and a 0 here would make it fire
+  // instantly on a browser somebody may be looking at.
+  it("says it does not know, for a profile no browser has ever launched in", async () => {
+    const untouched = await throwawayProfile("bb-browser-nomode-");
+    try {
+      expect(await modeSince(untouched)).toBeNull();
+    } finally {
+      await rm(untouched, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 
   // 1. SURVIVES TIME.
   // The v1 failure: a page was destroyed and replaced roughly every thirty
@@ -182,6 +210,7 @@ suite("a real browser, driven the way agents will drive it", () => {
 suite("the action surface, under two threads at once", () => {
   let profileDir = "";
   let endpoint = "";
+  let startedAt = 0;
   let browser: Browser | null = null;
   let actions: ReturnType<typeof createActions>;
   const noteworthy: string[] = [];

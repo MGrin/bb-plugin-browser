@@ -20,9 +20,16 @@ import type { Browser } from "playwright-core";
 import { chromium } from "./src/playwright-runtime.js";
 import { createActions } from "./src/actions.js";
 import { detect } from "./src/browsers.js";
-import { currentMode, quit as quitBrowser, startOrAttach, type BrowserMode } from "./src/launch.js";
+import {
+  currentMode,
+  modeSince,
+  quit as quitBrowser,
+  runningPort,
+  startOrAttach,
+  type BrowserMode,
+} from "./src/launch.js";
 import { profileDirIn } from "./src/profile.js";
-import { createModeSwitch } from "./src/mode.js";
+import { autoHideMsFrom, createModeSwitch, DEFAULT_HEADED_HOURS } from "./src/mode.js";
 import { registerCli } from "./src/cli.js";
 import { createReaper2, DEFAULT_IDLE_MINUTES, idleMsFrom } from "./src/reaper2.js";
 import { createPageHolder } from "./src/holder.js";
@@ -30,8 +37,15 @@ import { createSessionKeyResolver } from "./src/session-key.js";
 import { createTabs } from "./src/tabs.js";
 import { registerTools, TOOL_NAMES } from "./src/tools.js";
 
-/** How often idle tabs are swept. */
+/** How often idle tabs are swept, and the headed clock is read. */
 const SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * What the last automatic return to headless said. Persisted rather than held
+ * in memory because the point of it is to be there when a person eventually
+ * looks, which may be days and several plugin reloads later.
+ */
+const AUTO_HIDE_NOTE = "auto-hide-note";
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -43,6 +57,13 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "A tab no thread has used for this long is closed. Only tabs this plugin opened are ever closed — a tab you open yourself is left alone however long it sits there.",
       default: String(DEFAULT_IDLE_MINUTES),
+    },
+    headedHours: {
+      type: "string",
+      label: "Return the browser to headless after (hours)",
+      description:
+        "`bb browser show` puts the browser on screen for a human. Nothing ever put it back on its own, so one `show` left it headed for 69 hours on one occasion and 90 on another — 99.9% of all the time it has spent on screen (MX-297). This is how long it may sit headed before it is returned. Every real takeover measured ended inside four minutes, so the default leaves a wide margin; `off` never returns it.",
+      default: String(DEFAULT_HEADED_HOURS),
     },
     browserPath: {
       type: "string",
@@ -119,6 +140,12 @@ export default async function plugin(bb: BbPluginApi) {
   // src/mode.ts for what that costs and why it is worth it.
   const mode = createModeSwitch({
     currentMode: async () => currentMode(await profileDir()),
+    running: async () => (await runningPort(await profileDir())) !== null,
+    modeSince: async () => modeSince(await profileDir()),
+    autoHideAfterMs: async () => autoHideMsFrom((await settings.get()).headedHours),
+    // The reaper already tracks which threads hold a page, for the same reason:
+    // a relaunch under a live command breaks it.
+    busy: () => reaper.busy(),
     capture: async () =>
       (await tabs.listTabs())
         .filter((tab) => tab.sessionKey !== null)
@@ -151,9 +178,15 @@ export default async function plugin(bb: BbPluginApi) {
       return closed;
     },
     listTabs: () => tabs.listTabs(),
-    show: () => mode.show(),
+    show: async () => {
+      // Showing it again answers the note, so it stops being news.
+      await bb.storage.kv.delete(AUTO_HIDE_NOTE);
+      return mode.show();
+    },
     hide: () => mode.hide(),
     current: () => mode.current(),
+    modeAgeMs: () => mode.modeAgeMs(),
+    lastAutoHide: async () => (await bb.storage.kv.get<string>(AUTO_HIDE_NOTE)) ?? null,
     // Worth a line of its own in `status`: on a machine with several browsers
     // installed, "which one am I logged into" is the question behind most of
     // the confusing answers this plugin can give.
@@ -187,6 +220,24 @@ export default async function plugin(bb: BbPluginApi) {
           await reaper.sweep();
         } catch (error) {
           bb.log.warn(`sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        // Sharing the reaper's timer rather than starting a second one: both
+        // ask "has this been sitting unused too long", and one loop is one
+        // thing to reason about when the browser is what has gone wrong.
+        try {
+          const returned = await mode.autoHide();
+          if (returned) {
+            bb.log.info(returned);
+            // Kept where a person will find it. `bb.log` is the plugin log,
+            // which is not somewhere anyone looks after a window disappears.
+            await bb.storage.kv.set(AUTO_HIDE_NOTE, returned);
+          }
+        } catch (error) {
+          bb.log.warn(
+            `could not return the browser to headless: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
     },

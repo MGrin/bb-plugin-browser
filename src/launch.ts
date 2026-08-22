@@ -16,7 +16,7 @@
 // the tabs keep existing, and their target ids stay valid.
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveBrowser } from "./browsers.js";
 
@@ -218,6 +218,39 @@ export async function quit(profileDir: string): Promise<boolean> {
   socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
   socket.close();
   return true;
+}
+
+/**
+ * When the running browser was launched into the mode it is in.
+ *
+ * The MODE_FILE's MTIME, deliberately, rather than a timestamp written inside
+ * it. `startOrAttach` writes that file exactly once per launch and nothing else
+ * touches it — an attach does not, and neither does a plugin reload — so its
+ * mtime IS the launch time, and reading it needs no format change and no
+ * migration for the profiles that already exist. That last part is the whole
+ * reason: a timestamp written into the file would be absent on every profile
+ * written before this existed, and the fallback for those would have been...
+ * the mtime.
+ *
+ * MEASURED 2026-08-22 against two independent instruments: the mtime read
+ * 2026-08-18T16:11:45Z and the plugin log's `started Brave for agents on port
+ * 64637 (headed)` line reads the same second.
+ *
+ * Null when there is no file. Callers must keep that distinguishable from "just
+ * now": an unknown clock is a reason not to act, not a reason to act at once.
+ *
+ * Falsifier, one step:
+ *   stat -f %Sm ~/.bb/plugins/browser/brave-agents/bb-mode
+ *   grep 'started .* for agents' ~/.bb/plugins/browser/logs/plugin.log | tail -1
+ * The two should name the same launch. If they diverge, something other than
+ * `startOrAttach` is writing that file and this clock has gone wrong.
+ */
+export async function modeSince(profileDir: string): Promise<number | null> {
+  try {
+    return (await stat(join(profileDir, MODE_FILE))).mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 /** What the running (or last-launched) browser is. Headless when unrecorded. */
