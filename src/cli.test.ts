@@ -225,7 +225,64 @@ describe("bb browser tabs and status", () => {
     describe: async () => "Brave — /Applications/x (detected)",
     quit: async () => true,
     listTabs: async () => tabs,
+    modeAgeMs: async () => 90 * 60_000,
+    lastAutoHide: async () => null,
   };
+
+  const headedBrowser = (overrides: Record<string, unknown> = {}) => ({
+    ...browser,
+    current: async () => "headed" as const,
+    ...overrides,
+  });
+
+  // MX-297. Headed is the state that drifts — measured at 69h and 90h on two
+  // occasions, against every real human takeover ending inside 193 seconds. A
+  // mode with no clock on it is how nobody noticed, so `status` carries one.
+  it("says how long the browser has been on screen", async () => {
+    const result = await runCli(fakeOperations(), "thr_me", ["status"], headedBrowser());
+    expect(result.stdout).toContain("headed for 1h 30m");
+  });
+
+  // Headless is not an exposure and has no clock worth reading; a duration on
+  // both would make the line about uptime instead of about risk.
+  it("says nothing about duration when it is headless", async () => {
+    const result = await runCli(fakeOperations(), "thr_me", ["status"], browser);
+    expect(result.stdout).toContain("headless,");
+    expect(result.stdout).not.toContain(" for ");
+  });
+
+  it("does not invent a duration it cannot know", async () => {
+    const result = await runCli(
+      fakeOperations(),
+      "thr_me",
+      ["status"],
+      headedBrowser({ modeAgeMs: async () => null }),
+    );
+    expect(result.stdout).toContain("headed,");
+    expect(result.stdout).not.toContain("for null");
+  });
+
+  // The whole price of a wrong automatic hide is whether the human meets an
+  // unexplained vanished window or an explained one. The log is not where he
+  // looks; this is.
+  it("reports an automatic return to headless, where a person would find it", async () => {
+    const result = await runCli(
+      fakeOperations(),
+      "thr_me",
+      ["status"],
+      browser2AutoHidden(),
+    );
+    expect(result.stdout).toContain("put back automatically");
+    expect(result.stdout).toContain("bb browser show");
+  });
+
+  function browser2AutoHidden() {
+    return {
+      ...browser,
+      lastAutoHide: async () =>
+        "put back automatically after 3d 17h on screen — `bb browser show` brings it back",
+    };
+  }
 
   it("lists every tab without claiming the startup tab belongs to anyone", async () => {
     const result = await runCli(fakeOperations(), "thr_me", ["tabs"], browser);

@@ -38,6 +38,15 @@ export interface Reaper2 {
   watch(sessionKey: string): void;
   unwatch(sessionKey: string): void;
   forget(sessionKey: string): void;
+  /**
+   * Whether any agent has a page command in flight right now.
+   *
+   * The same holds the reaper uses to keep from closing a tab mid-command,
+   * read by the mode switch for the same reason: switching headed/headless is
+   * a browser relaunch, and doing that under a live `open` turns somebody
+   * else's command into an error.
+   */
+  busy(): boolean;
   sweep(now?: number): Promise<void>;
 }
 
@@ -82,6 +91,9 @@ export function createReaper2(deps: Reaper2Deps): Reaper2 {
     forget(sessionKey) {
       lastUsed.delete(sessionKey);
       holds.delete(sessionKey);
+    },
+    busy() {
+      return holds.size > 0;
     },
 
     async sweep(now = Date.now()) {
