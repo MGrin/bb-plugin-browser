@@ -72,8 +72,8 @@ The browser is signed in, so a wrong click is a real action on a real account.
 - Only http and https urls open. `file://`, `javascript:` and `data:` are
   refused — do not try to work around that, it is deliberate.
 - Close your tab with `browser_close` when the task is done. Tabs you leave are
-  closed automatically after a while, but only ever tabs agents opened — a tab
-  the user opened themselves is never touched.
+  closed automatically after 30 minutes idle (`src/reaper2.ts`), but only ever
+  tabs agents opened — a tab the user opened themselves is never touched.
 
 ## The same thing from a shell
 
@@ -86,7 +86,7 @@ bb browser screenshot [path]   bb browser close
 bb browser show                # bring it on screen for the user
 bb browser hide                # back to headless
 bb browser status              # mode, and how many tabs are open
-bb browser tabs                # every tab, and whose it is
+bb browser tabs                # every tab; yours is marked, others are not
 bb browser quit                # close the shared browser entirely
 ```
 
