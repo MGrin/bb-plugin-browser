@@ -93,7 +93,7 @@ export async function runningPort(profileDir: string): Promise<number | null> {
 }
 
 /** Whether a DevTools endpoint on this port is alive right now. */
-async function answersOn(port: number): Promise<boolean> {
+export async function answersOn(port: number): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
       signal: AbortSignal.timeout(1500),
@@ -197,6 +197,8 @@ export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndp
  * outlives plugin reloads, and closing it is the act that broke v1. It exists
  * so a human can end it on purpose (`bb browser quit`), which is the only time
  * it should happen: it is their window, with possibly their tabs in it.
+ * The one exception is `src/connect.ts`, and only after a PROVEN wedge — a CDP
+ * handshake that times out while this port still answers (MX-1163).
  *
  * Returns false when there was nothing running to close, so a caller can say
  * "already closed" rather than implying it did something.

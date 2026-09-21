@@ -93,6 +93,15 @@ bb browser quit                # close the shared browser entirely
 Run inside a bb thread these drive that thread's tab; run outside one they
 drive the shared `scratch` tab.
 
+## If every browser call times out
+
+The plugin heals a wedged browser itself — typically after the machine slept:
+the connect is bounded at 10 s, and if the browser still answers but will not
+complete the handshake, it is closed and relaunched ONCE. The first call after
+a wake may therefore take ~15 s and then work; do not reach for another browser.
+If the recovery itself fails, the error says so and names
+`bb plugin run browser quit` — run that once, then retry.
+
 ## If the browser is not logged into a site
 
 That is expected on a fresh install: the agents' profile starts empty. Call

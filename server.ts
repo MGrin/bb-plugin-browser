@@ -20,7 +20,9 @@ import type { Browser } from "playwright-core";
 import { chromium } from "./src/playwright-runtime.js";
 import { createActions } from "./src/actions.js";
 import { detect } from "./src/browsers.js";
+import { createConnector } from "./src/connect.js";
 import {
+  answersOn,
   currentMode,
   modeSince,
   quit as quitBrowser,
@@ -95,17 +97,38 @@ export default async function plugin(bb: BbPluginApi) {
   /** Only used when nothing is running; a live browser keeps its own mode. */
   let launchMode: BrowserMode = "headless";
 
+  const attachAs = async (mode: BrowserMode) =>
+    startOrAttach({
+      profileDir: await profileDir(),
+      binary: await configuredBinary(),
+      mode,
+      log: (message) => bb.log.info(message),
+    });
+
+  // Bounded, and healed once when the endpoint is wedged — the one close this
+  // plugin makes on its own, and only after a proven wedge (MX-1163, see
+  // src/connect.ts).
+  const connect = createConnector({
+    attach: () => attachAs(launchMode),
+    // The mode file is only written at launch, so it still names the mode of
+    // the browser that wedged.
+    relaunch: async () => attachAs(await currentMode(await profileDir())),
+    connectOverCDP: (endpoint, timeout) => chromium().connectOverCDP(endpoint, { timeout }),
+    answers: answersOn,
+    quit: async () => {
+      const closed = await quitBrowser(await profileDir());
+      browser = null;
+      return closed;
+    },
+    log: (message) => bb.log.info(message),
+    warn: (message) => bb.log.warn(message),
+  });
+
   async function connected(): Promise<Browser> {
     if (browser?.isConnected()) return browser;
     if (connecting) return connecting;
     connecting = (async () => {
-      const endpoint = await startOrAttach({
-        profileDir: await profileDir(),
-        binary: await configuredBinary(),
-        mode: launchMode,
-        log: (message) => bb.log.info(message),
-      });
-      const next = await chromium().connectOverCDP(endpoint.httpEndpoint);
+      const next = await connect();
       browser = next;
       return next;
     })().finally(() => {

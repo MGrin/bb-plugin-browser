@@ -14,7 +14,10 @@ import { createRequire } from "node:module";
 const requireFromHere = createRequire(import.meta.url);
 
 export interface PlaywrightChromium {
-  connectOverCDP(endpoint: string): Promise<import("playwright-core").Browser>;
+  connectOverCDP(
+    endpoint: string,
+    options?: { timeout?: number },
+  ): Promise<import("playwright-core").Browser>;
 }
 
 let cached: PlaywrightChromium | null = null;
