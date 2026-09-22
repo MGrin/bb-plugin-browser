@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { holderKey } from "./holder.js";
 import type { TabsDeps } from "./tabs.js";
 import { createTabs, ownedKey, tabKey, TARGET_ID_TIMEOUT_MS, withDeadline } from "./tabs.js";
 
@@ -48,9 +47,6 @@ describe("withDeadline", () => {
   });
 });
 
-// MX-229: `holder:` rows say who last drove a page. They are written by the
-// tool/CLI layer and released HERE, because a page that no longer exists must
-// not leave an accusation behind for whoever next takes its session key.
 function fakePage(targetId: string, url: string) {
   let closed = false;
   const page = {
@@ -85,58 +81,22 @@ function harness(pages: ReturnType<typeof fakePage>[] = []) {
   return { store, tabs: createTabs({ browser, kv, log: () => {} }) };
 }
 
-describe("the last-driver record's lifetime", () => {
-  it("surfaces who last drove each tab, so `bb browser tabs` can say so", async () => {
-    const { store, tabs } = harness([fakePage("t_1", "https://a.example/")]);
-    store.set(tabKey("thr_parent"), "t_1");
-    store.set(ownedKey("t_1"), true);
-    store.set(holderKey("thr_parent"), "thr_worker_b");
+// MX-1080: each thread has its own tab, so a thread's teardown closes that
+// tab and no other — above all not its operator's, which a spawned worker
+// used to share.
+describe("closing one thread's tab", () => {
+  it("closes the worker's tab and leaves the operator's open", async () => {
+    const operatorPage = fakePage("t_op", "https://a.example/");
+    const workerPage = fakePage("t_w", "https://b.example/");
+    const { store, tabs } = harness([operatorPage, workerPage]);
+    store.set(tabKey("thr_operator"), "t_op");
+    store.set(tabKey("thr_worker"), "t_w");
 
-    const [row] = await tabs.listTabs();
-    expect(row).toMatchObject({ targetId: "t_1", sessionKey: "thr_parent", lastDriver: "thr_worker_b" });
-  });
-
-  it("reports no driver for a tab nobody has driven", async () => {
-    const { store, tabs } = harness([fakePage("t_1", "https://a.example/")]);
-    store.set(tabKey("thr_parent"), "t_1");
-    expect((await tabs.listTabs())[0]?.lastDriver).toBeNull();
-  });
-
-  it("forgets the driver when the thread's tab is closed", async () => {
-    const { store, tabs } = harness([fakePage("t_1", "https://a.example/")]);
-    store.set(tabKey("thr_parent"), "t_1");
-    store.set(holderKey("thr_parent"), "thr_worker_b");
-
-    await tabs.closeTab("thr_parent");
-    expect(store.has(holderKey("thr_parent"))).toBe(false);
-  });
-
-  // The reaper's path: it knows a target id and nothing else, so the session key
-  // has to be found in reverse. Left behind, this row would tell the next thread
-  // to take that key that someone "drove this tab more recently than you did" —
-  // about a page reaped half an hour ago.
-  it("forgets the driver when a tab is reaped by target id", async () => {
-    const { store, tabs } = harness([fakePage("t_1", "https://a.example/")]);
-    store.set(tabKey("thr_parent"), "t_1");
-    store.set(holderKey("thr_parent"), "thr_worker_b");
-
-    await tabs.closeTarget("t_1");
-    expect(store.has(holderKey("thr_parent"))).toBe(false);
-  });
-
-  it("leaves another session's driver record alone when reaping one tab", async () => {
-    const { store, tabs } = harness([
-      fakePage("t_1", "https://a.example/"),
-      fakePage("t_2", "https://b.example/"),
-    ]);
-    store.set(tabKey("thr_one"), "t_1");
-    store.set(tabKey("thr_two"), "t_2");
-    store.set(holderKey("thr_one"), "thr_worker_a");
-    store.set(holderKey("thr_two"), "thr_worker_b");
-
-    await tabs.closeTarget("t_1");
-    expect(store.has(holderKey("thr_one"))).toBe(false);
-    expect(store.get(holderKey("thr_two"))).toBe("thr_worker_b");
+    await tabs.closeTab("thr_worker");
+    expect((workerPage as unknown as { isClosed(): boolean }).isClosed()).toBe(true);
+    expect((operatorPage as unknown as { isClosed(): boolean }).isClosed()).toBe(false);
+    expect(store.get(tabKey("thr_operator"))).toBe("t_op");
+    expect(store.has(tabKey("thr_worker"))).toBe(false);
   });
 });
 

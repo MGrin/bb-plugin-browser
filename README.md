@@ -12,7 +12,8 @@ Your browser (real app, agents' profile, one process)
 ```
 
 Threads share the browser's cookies and logins, so a site logged into once is
-logged in for every thread. What they do not share is a tab.
+logged in for every thread. What they do not share is a tab — not even a
+thread and the threads it spawns.
 
 ## Install
 
@@ -99,9 +100,9 @@ the socket path is Chromium's own — run the live suite outside the sandbox.
 
 ## Credits
 
-Architecture and code are original. Two ideas come from
-[jssblck/bb-plugins](https://github.com/jssblck/bb-plugins): the ancestry-walked
-session key, so a fleet's subagents and their coordinator share one browser
-while a fork gets its own; and the tab-etiquette and untrusted-content framing
-in its agent skill. That repository carries no LICENSE, so nothing was copied
+Architecture and code are original. The tab-etiquette and untrusted-content
+framing in the agent skill come from
+[jssblck/bb-plugins](https://github.com/jssblck/bb-plugins), as did an
+ancestry-walked session key that let a spawned thread share its parent's tab —
+retired in MX-1080 once spawned threads became independent parallel workers. That repository carries no LICENSE, so nothing was copied
 from it.
