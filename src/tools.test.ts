@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { z } from "zod";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Actions } from "./actions.js";
-import { createPageHolder } from "./holder.js";
 import { registerTools, TOOL_NAMES } from "./tools.js";
 
 interface Registered {
@@ -28,10 +27,7 @@ function fakeActions() {
   } satisfies Record<keyof Actions, unknown>;
 }
 
-/**
- * Maps every thread to its own key. MX-229 is the case where this is NOT true,
- * so tests about contention pass a resolver that collapses siblings onto one.
- */
+/** Maps every thread to a distinct key, so a test can tell the tool used the resolver. */
 const oneKeyEach = (threadId: string | undefined) =>
   threadId ? `key-for-${threadId}` : "scratch";
 
@@ -44,30 +40,16 @@ function register(
     agents: { registerTool: (tool: Registered) => tools.push(tool) },
   } as unknown as BbPluginApi;
 
-  // The resolver maps a thread to its ancestor's key — the tools must use
-  // whatever it returns, not the raw threadId.
+  // The tools must use whatever the resolver returns, not the raw threadId.
   const resolveSessionKey = vi.fn(async (threadId: string | undefined) =>
     resolve(threadId),
   );
-
-  // The REAL holder over an in-memory kv, not a stub: the notice an agent sees
-  // is the product of this logic, and a stub would let the wiring pass while the
-  // message was wrong or absent.
-  const store = new Map<string, unknown>();
-  const holder = createPageHolder({
-    kv: {
-      get: async <T,>(key: string) => store.get(key) as T | undefined,
-      set: async (key: string, value: unknown) => void store.set(key, value),
-      delete: async (key: string) => void store.delete(key),
-    },
-  });
 
   registerTools(
     bb,
     operations as unknown as Actions,
     resolveSessionKey,
     { show: async () => "shown" },
-    holder,
   );
   const byName = (name: string) => {
     const tool = tools.find((candidate) => candidate.name === name);
@@ -79,7 +61,7 @@ function register(
     projectId: "prj_1",
     signal: new AbortController().signal,
   });
-  return { tools, byName, ctx, operations, resolveSessionKey, holder };
+  return { tools, byName, ctx, operations, resolveSessionKey };
 }
 
 /** Every key a tool's parameter schema advertises to the model. */
@@ -289,84 +271,5 @@ describe("tool schema required arguments", () => {
   ])("%s rejects an empty required string", (name, params) => {
     const { byName } = register();
     expect(byName(name).parameters.safeParse(params).success).toBe(false);
-  });
-});
-
-// MX-229: three workers spawned from one parent all resolve to the parent's
-// session key, so they drive ONE page and last-navigator-wins with no signal.
-// The fix does not stop them sharing — it stops them sharing SILENTLY.
-describe("a tab shared by sibling threads", () => {
-  /** What MX-229 actually is: distinct threads, one page key. */
-  const oneSharedKey = () => "thr_parent";
-
-  it("warns the first spawned thread that the tab is not its own", async () => {
-    const { byName, ctx } = register(fakeActions(), oneSharedKey);
-    const result = await byName("browser_read").execute({}, ctx("thr_worker_a"));
-    expect(result).toContain("SHARED PAGE");
-    expect(result).toContain("thr_parent");
-    // The result the agent asked for is still there, notice or not.
-    expect(result).toContain("page text");
-  });
-
-  it("tells the displaced thread WHICH thread drove the page", async () => {
-    const { byName, ctx } = register(fakeActions(), oneSharedKey);
-    await byName("browser_open").execute({ url: "https://a.example" }, ctx("thr_worker_a"));
-    const result = await byName("browser_read").execute({}, ctx("thr_worker_b"));
-    expect(result).toContain("thr_worker_a");
-    expect(result).toContain("page text");
-  });
-
-  it("warns BOTH ways as they take turns — every time, not just the first", async () => {
-    const { byName, ctx } = register(fakeActions(), oneSharedKey);
-    const read = byName("browser_read");
-    await read.execute({}, ctx("thr_worker_a"));
-    for (let round = 0; round < 3; round += 1) {
-      expect(await read.execute({}, ctx("thr_worker_b"))).toContain("thr_worker_a");
-      expect(await read.execute({}, ctx("thr_worker_a"))).toContain("thr_worker_b");
-    }
-  });
-
-  it("says nothing to a thread driving its own page", async () => {
-    const { byName, ctx } = register(fakeActions(), (threadId) => threadId ?? "scratch");
-    const result = await byName("browser_read").execute({}, ctx("thr_alone"));
-    expect(result).toBe("page text");
-  });
-
-  it("puts the notice beside the screenshot rather than swallowing it", async () => {
-    const { byName, ctx } = register(fakeActions(), oneSharedKey);
-    await byName("browser_open").execute({ url: "https://a.example" }, ctx("thr_worker_a"));
-    const result = (await byName("browser_screenshot").execute({}, ctx("thr_worker_b"))) as {
-      content: { type: string; text?: string }[];
-    };
-    expect(result.content.map((part) => part.type)).toEqual(["text", "image"]);
-    expect(result.content[0]?.text).toContain("thr_worker_a");
-  });
-
-  it("returns the screenshot alone when nobody else has driven the page", async () => {
-    const { byName, ctx } = register(fakeActions(), (threadId) => threadId ?? "scratch");
-    const result = (await byName("browser_screenshot").execute({}, ctx("thr_alone"))) as {
-      content: { type: string }[];
-    };
-    expect(result.content.map((part) => part.type)).toEqual(["image"]);
-  });
-
-  // browser_show asks mgrin to look at the window. It drives nothing, so a
-  // thread that calls it must not be recorded as the page's last driver —
-  // otherwise it steals the blame that belongs to whoever actually navigated.
-  it("does not let browser_show claim a page it never drove", async () => {
-    const { byName, ctx, holder } = register(fakeActions(), oneSharedKey);
-    await byName("browser_open").execute({ url: "https://a.example" }, ctx("thr_worker_a"));
-    await byName("browser_show").execute({}, ctx("thr_worker_b"));
-    expect(await holder.lastDriver("thr_parent")).toBe("thr_worker_a");
-  });
-
-  // A thread with no id is bb's own scratch caller, not a competitor.
-  it("stays silent when there is no thread to name", async () => {
-    const { byName } = register(fakeActions(), oneSharedKey);
-    const result = await byName("browser_read").execute(
-      {},
-      { threadId: undefined, projectId: "prj_1", signal: new AbortController().signal } as never,
-    );
-    expect(result).toBe("page text");
   });
 });

@@ -16,7 +16,8 @@ work.
 
 Your thread drives **one tab** of that browser. `browser_open` creates it the
 first time and reuses it afterwards, so every later command acts on the same
-page. A thread you spawn shares your tab; a fork gets its own.
+page. Every thread has its own tab — a thread you spawn, a fork and its
+parent included — and deleting or archiving a thread closes its tab.
 
 Every thread shares the browser's **cookies and logins** — a site logged into
 once is logged in for everyone. What is private is the tab: another thread

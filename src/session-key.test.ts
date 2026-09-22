@@ -1,141 +1,34 @@
 import { describe, expect, it } from "vitest";
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { createSessionKeyResolver, SCRATCH_SESSION_KEY } from "./session-key.js";
+import { resolveSessionKey, SCRATCH_SESSION_KEY } from "./session-key.js";
 
-// Derived from the SDK, not restated. A restated shape is what let these tests
-// keep mocking `childOrigin` for the whole life of a bb that stopped sending it
-// (MX-265): every case passed against a field the host never returns. Derived,
-// a rename breaks this file.
-type Thread = Pick<
-  Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>,
-  "parentThreadId" | "originKind"
->;
-
-function fakeBb(threads: Record<string, Thread>) {
-  return {
-    sdk: {
-      threads: {
-        get: async ({ threadId }: { threadId: string }) => {
-          const thread = threads[threadId];
-          if (!thread) throw new Error("no such thread");
-          return thread;
-        },
-      },
-    },
-  } as never;
-}
-
-describe("createSessionKeyResolver", () => {
+describe("resolveSessionKey", () => {
   it("returns scratch outside any thread", async () => {
-    const resolve = createSessionKeyResolver(fakeBb({}));
-    expect(await resolve(undefined)).toBe(SCRATCH_SESSION_KEY);
+    expect(await resolveSessionKey(undefined)).toBe(SCRATCH_SESSION_KEY);
+    expect(await resolveSessionKey("")).toBe(SCRATCH_SESSION_KEY);
   });
 
-  it("returns the thread itself when it has no parent", async () => {
-    const resolve = createSessionKeyResolver(
-      fakeBb({ a: { parentThreadId: null, originKind: null } }),
+  it("returns the thread itself", async () => {
+    expect(await resolveSessionKey("thr_a")).toBe("thr_a");
+  });
+
+  // THE test that goes red if the parent walk comes back (MX-1080). Two
+  // workers spawned by one operator are independent and run in parallel; one
+  // shared key meant one tab, so either could navigate the other's page away
+  // mid-read in a signed-in profile. The resolver takes no host handle at all,
+  // so it cannot read a parent chain — reintroducing one breaks this file.
+  it("gives spawned sibling workers their OWN keys, not their operator's", async () => {
+    const [operator, workerA, workerB] = await Promise.all(
+      ["thr_operator", "thr_worker_a", "thr_worker_b"].map((id) => resolveSessionKey(id)),
     );
-    expect(await resolve("a")).toBe("a");
+    expect(new Set([operator, workerA, workerB]).size).toBe(3);
+    expect(workerA).toBe("thr_worker_a");
+    expect(workerB).toBe("thr_worker_b");
   });
 
-  it("walks to the root so subagents share the coordinator's page", async () => {
-    const resolve = createSessionKeyResolver(
-      fakeBb({
-        root: { parentThreadId: null, originKind: null },
-        mid: { parentThreadId: "root", originKind: null },
-        leaf: { parentThreadId: "mid", originKind: null },
-      }),
-    );
-    expect(await resolve("leaf")).toBe("root");
-  });
-
-  it("stops at a fork, which is a peer exploration", async () => {
-    const resolve = createSessionKeyResolver(
-      fakeBb({
-        root: { parentThreadId: null, originKind: null },
-        forked: { parentThreadId: "root", originKind: "fork" },
-      }),
-    );
-    expect(await resolve("forked")).toBe("forked");
-  });
-
-  it("stops at an unreadable ancestor instead of throwing", async () => {
-    const resolve = createSessionKeyResolver(
-      fakeBb({ child: { parentThreadId: "gone", originKind: null } }),
-    );
-    expect(await resolve("child")).toBe("child");
-  });
-
-  // A `thread.deleted` event for a row the host has already removed is the
-  // ordinary way this happens, and the host answers it with null rather than
-  // by throwing. Reading `.originKind` off that null threw a TypeError out
-  // of the resolver, which the teardown could only warn about — leaving the
-  // deleted thread's page open for the idle reaper to find half an hour later.
-  it("treats a thread the host answers null for as its own root, without throwing", async () => {
-    const bb = {
-      sdk: { threads: { get: async () => null } },
-    } as never;
-    const resolve = createSessionKeyResolver(bb);
-    // Its own id, not scratch and not a throw: the teardown compares the
-    // resolved key with the thread id to decide whether this thread OWNS the
-    // page, and only an exact match closes it.
-    await expect(resolve("thr_deleted")).resolves.toBe("thr_deleted");
-  });
-
-  it("stops the walk at an ancestor the host answers null for", async () => {
-    const bb = {
-      sdk: {
-        threads: {
-          get: async ({ threadId }: { threadId: string }) =>
-            threadId === "child" ? { parentThreadId: "gone", originKind: null } : null,
-        },
-      },
-    } as never;
-    const resolve = createSessionKeyResolver(bb);
-    await expect(resolve("child")).resolves.toBe("child");
-  });
-
-  it("survives a parent cycle", async () => {
-    const resolve = createSessionKeyResolver(
-      fakeBb({
-        a: { parentThreadId: "b", originKind: null },
-        b: { parentThreadId: "a", originKind: null },
-      }),
-    );
-    expect(await resolve("a")).toBe("b");
-  });
-
-  it("does not cache a transient fetch failure against a later real resolution", async () => {
-    // "flaky" fails the first time it's fetched (as an ancestor of "child"),
-    // then succeeds on a later, direct resolution. The first walk must not
-    // poison the cache with a wrong mapping for "flaky".
-    let flakyShouldFail = true;
-    const bb = {
-      sdk: {
-        threads: {
-          get: async ({ threadId }: { threadId: string }) => {
-            if (threadId === "child") {
-              return { parentThreadId: "flaky", originKind: null };
-            }
-            if (threadId === "flaky") {
-              if (flakyShouldFail) {
-                flakyShouldFail = false;
-                throw new Error("transient failure");
-              }
-              return { parentThreadId: null, originKind: null };
-            }
-            throw new Error("no such thread");
-          },
-        },
-      },
-    } as never;
-    const resolve = createSessionKeyResolver(bb);
-
-    // First walk: "flaky"'s fetch throws, so the walk stops at "child".
-    expect(await resolve("child")).toBe("child");
-
-    // Resolving "flaky" directly, on the same resolver, must compute fresh
-    // instead of returning the first walk's root ("child").
-    expect(await resolve("flaky")).toBe("flaky");
+  // A `thread.deleted` event arrives for a row the host has already removed.
+  // The teardown closes the tab keyed by the thread's own id, so the key must
+  // not depend on reading the thread at all.
+  it("resolves a deleted thread to its own id without asking the host", async () => {
+    expect(await resolveSessionKey("thr_deleted")).toBe("thr_deleted");
   });
 });

@@ -34,8 +34,7 @@ import { profileDirIn } from "./src/profile.js";
 import { autoHideMsFrom, createModeSwitch, DEFAULT_HEADED_HOURS } from "./src/mode.js";
 import { registerCli } from "./src/cli.js";
 import { createReaper2, DEFAULT_IDLE_MINUTES, idleMsFrom } from "./src/reaper2.js";
-import { createPageHolder } from "./src/holder.js";
-import { createSessionKeyResolver } from "./src/session-key.js";
+import { resolveSessionKey } from "./src/session-key.js";
 import { createTabs } from "./src/tabs.js";
 import { registerTools, TOOL_NAMES } from "./src/tools.js";
 
@@ -153,11 +152,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   const actions = createActions({ tabs, activity: reaper });
 
-  // Who last drove each page. A spawned thread shares its parent's session key,
-  // so siblings contend for one Page and last navigator wins; this is what makes
-  // that visible to the loser instead of silent (MX-229).
-  const holder = createPageHolder({ kv: bb.storage.kv });
-
   // Headless by default; headed for the two moments a human is needed. One
   // profile can only be held by one process, so this is a relaunch — see
   // src/mode.ts for what that costs and why it is worth it.
@@ -192,8 +186,8 @@ export default async function plugin(bb: BbPluginApi) {
     log: (message) => bb.log.info(message),
   });
 
-  registerTools(bb, actions, createSessionKeyResolver(bb), mode, holder);
-  registerCli(bb, actions, createSessionKeyResolver(bb), {
+  registerTools(bb, actions, resolveSessionKey, mode);
+  registerCli(bb, actions, resolveSessionKey, {
     // Browser-level, so it goes past Actions rather than through it: Actions
     // is deliberately per-tab and has no way to end the browser.
     quit: async () => {
@@ -222,7 +216,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? `${found.name} — ${found.path} (detected)`
         : "no Chromium-family browser found — set the browserPath setting";
     },
-  }, holder);
+  });
   bb.agents.configure(() => ({ tools: [...TOOL_NAMES], skills: ["browser"] }));
 
   bb.background.service("reaper", {
@@ -270,13 +264,11 @@ export default async function plugin(bb: BbPluginApi) {
   // A thread that is gone should not leave a tab behind. Idempotent, and the
   // same handler for both events because a thread is routinely archived and
   // then deleted.
-  const resolveSessionKey = createSessionKeyResolver(bb);
   const teardown = async ({ thread }: { thread: { id: string } }) => {
     try {
+      // Every thread has its own tab (MX-1080), so the deleted thread's tab is
+      // the one to close — never its parent's, which lives on under its own id.
       const sessionKey = await resolveSessionKey(thread.id);
-      // Only this thread's own tab: a spawned child shares its parent's key,
-      // and closing on the child's teardown would take the parent's tab.
-      if (sessionKey !== thread.id) return;
       reaper.forget(sessionKey);
       await tabs.closeTab(sessionKey);
     } catch (error) {

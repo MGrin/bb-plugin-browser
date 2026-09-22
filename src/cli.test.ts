@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { createPageHolder } from "./holder.js";
-import { driverSuffix, PAGE_COMMANDS, registerCli, runCli, tabLabel } from "./cli.js";
+import { registerCli, runCli, tabLabel } from "./cli.js";
+import { resolveSessionKey } from "./session-key.js";
 
 function fakeOperations() {
   return {
@@ -200,22 +200,18 @@ describe("tabLabel", () => {
 
 describe("bb browser tabs and status", () => {
   const tabs = [
-    { targetId: "t1", url: "about:blank", sessionKey: null, ours: false, lastDriver: null },
+    { targetId: "t1", url: "about:blank", sessionKey: null, ours: false },
     {
       targetId: "t2",
       url: "https://example.com/",
       sessionKey: "thr_me",
       ours: true,
-      // A sibling spawned from thr_me drove this page more recently than thr_me
-      // did — the exact shape MX-229 is about, and previously invisible here.
-      lastDriver: "thr_sibling",
     },
     {
       targetId: "t3",
       url: "https://example.org/",
       sessionKey: "thr_other",
       ours: true,
-      lastDriver: "thr_other",
     },
   ];
   const browser = {
@@ -304,140 +300,28 @@ describe("bb browser tabs and status", () => {
     const result = await runCli(fakeOperations(), "thr_me", ["status"], browser);
     expect(result.stdout).toContain("Brave — /Applications/x (detected)");
   });
-
-  // MX-229. The thread that displaced another was identified on 2026-08-21 only
-  // because someone happened to run `tabs` while it was mid-task. Recording the
-  // driver makes that answerable afterwards instead of by luck.
-  it("names the thread that drove a tab last, when it is not the tab's own", async () => {
-    const result = await runCli(fakeOperations(), "thr_me", ["tabs"], browser);
-    expect(result.stdout).toContain("last driven by thr_sibling");
-  });
-
-  it("stays quiet about the driver when the tab's own thread drove it", async () => {
-    // Otherwise every row on a healthy machine carries a scary-looking arrow and
-    // the one row that matters stops standing out.
-    const result = await runCli(fakeOperations(), "thr_me", ["tabs"], browser);
-    expect(result.stdout).not.toContain("last driven by thr_other");
-  });
 });
 
-describe("driverSuffix", () => {
-  it("says nothing when nothing has driven the tab", () => {
-    expect(driverSuffix({ url: "u", sessionKey: "thr_a", ours: true, lastDriver: null })).toBe("");
-  });
-
-  it("says nothing when the driver is the tab's own thread", () => {
-    expect(driverSuffix({ url: "u", sessionKey: "thr_a", ours: true, lastDriver: "thr_a" })).toBe("");
-  });
-
-  it("names a driver that is not the tab's own thread", () => {
-    expect(driverSuffix({ url: "u", sessionKey: "thr_a", ours: true, lastDriver: "thr_b" })).toContain(
-      "thr_b",
-    );
-  });
-
-  it("tolerates a row from a caller that does not report a driver at all", () => {
-    expect(driverSuffix({ url: "u", sessionKey: "thr_a", ours: true })).toBe("");
-  });
-});
-
-describe("PAGE_COMMANDS", () => {
-  // The notice must not fire on the command an orchestrator runs to INVESTIGATE
-  // the notice, nor on the one that reports which commit is running.
-  it("covers every command that drives a page", () => {
-    for (const command of ["open", "read", "snapshot", "click", "type", "eval", "screenshot", "close"]) {
-      expect(PAGE_COMMANDS.has(command)).toBe(true);
-    }
-  });
-
-  it("excludes the browser-level commands", () => {
-    for (const command of ["tabs", "status", "show", "hide", "quit", "build"]) {
-      expect(PAGE_COMMANDS.has(command)).toBe(false);
-    }
-  });
-});
-
-// The CLI half of MX-229. `runCli` is deliberately untouched — it is the body
-// the tools share, and contention is a property of the CALLER — so the notice
-// is attached here, and only here.
-describe("registerCli's contention notice", () => {
-  function harness(actions: Partial<Record<string, unknown>> = {}) {
-    let run!: (
-      argv: string[],
-      ctx: { threadId: string | undefined },
-    ) => Promise<{ exitCode: number; stdout?: string; stderr?: string }>;
+// MX-1080: the CLI resolves a page the same way the tools do — the calling
+// thread's own id — so a worker and its operator never land on one tab.
+describe("registerCli's session key", () => {
+  it("drives each calling thread's own tab, and scratch outside a thread", async () => {
+    let run!: (argv: string[], ctx: { threadId: string | undefined }) => Promise<unknown>;
     const bb = {
       cli: { register: (spec: { run: typeof run }) => void (run = spec.run) },
     } as unknown as Parameters<typeof registerCli>[0];
-
+    const opened: string[] = [];
     const operations = {
-      open: async () => "opened",
-      read: async () => "page text",
-      snapshot: async () => "tree",
-      click: async () => "clicked",
-      type: async () => "typed",
-      evaluate: async () => {
-        throw new Error("page.evaluate: Execution context was destroyed");
+      open: async (sessionKey: string) => {
+        opened.push(sessionKey);
+        return "opened";
       },
-      screenshot: async () => ({ base64: "aGVsbG8=" }),
-      close: async () => "closed",
-      ...actions,
-    };
+    } as unknown as Parameters<typeof registerCli>[1];
+    registerCli(bb, operations, resolveSessionKey, {} as Parameters<typeof registerCli>[3]);
 
-    const store = new Map<string, unknown>();
-    const holder = createPageHolder({
-      kv: {
-        get: async <T,>(key: string) => store.get(key) as T | undefined,
-        set: async (key: string, value: unknown) => void store.set(key, value),
-        delete: async (key: string) => void store.delete(key),
-      },
-    });
-
-    registerCli(
-      bb,
-      operations as unknown as Parameters<typeof registerCli>[1],
-      // MX-229's shape: every sibling collapses onto the parent's key.
-      async () => "thr_parent",
-      {
-        listTabs: async () => [],
-        mode: async () => "headless" as const,
-        show: async () => "shown",
-        hide: async () => "hidden",
-        quit: async () => "quit",
-      } as unknown as Parameters<typeof registerCli>[3],
-      holder,
-    );
-    return { run, store };
-  }
-
-  it("prefixes a page command's output with the notice", async () => {
-    const { run } = harness();
-    await run(["open", "https://a.example"], { threadId: "thr_worker_a" });
-    const result = await run(["read"], { threadId: "thr_worker_b" });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("thr_worker_a");
-    expect(result.stdout).toContain("page text");
-  });
-
-  // "Execution context was destroyed, most likely because of a navigation" is
-  // what a sibling's goto looks like from inside your evaluate — so the failing
-  // result is the one that most needs to say who else is on the page. Dropping
-  // the notice on a non-zero exit would hide the contention in its own evidence.
-  it("keeps the notice on a page command that FAILS", async () => {
-    const { run } = harness();
-    await run(["open", "https://a.example"], { threadId: "thr_worker_a" });
-    const result = await run(["eval", "1"], { threadId: "thr_worker_b" });
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain("thr_worker_a");
-    expect(result.stderr).toContain("Execution context was destroyed");
-  });
-
-  it("says nothing on a browser-level command, which drives no page", async () => {
-    const { run, store } = harness();
-    await run(["open", "https://a.example"], { threadId: "thr_worker_a" });
-    const result = await run(["tabs"], { threadId: "thr_worker_b" });
-    expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).not.toContain("NOT YOURS ALONE");
-    // And it must not steal the blame either: thr_worker_a still drove last.
-    expect(store.get("holder:thr_parent")).toBe("thr_worker_a");
+    await run(["open", "https://a.example"], { threadId: "thr_operator" });
+    await run(["open", "https://a.example"], { threadId: "thr_worker" });
+    await run(["open", "https://a.example"], { threadId: undefined });
+    expect(opened).toEqual(["thr_operator", "thr_worker", "scratch"]);
   });
 });

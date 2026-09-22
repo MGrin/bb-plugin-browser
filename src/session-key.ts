@@ -1,10 +1,13 @@
-// Which browser page a thread drives.
+// Which browser page a thread drives: its own, keyed by its own id.
 //
-// A spawned child shares its parent's page, so a fleet's subagents and their
-// coordinator work one page and one cookie jar. Walking to the root of the
-// parent chain gives that key. A fork is a peer exploration, not a subagent,
-// so it starts its own.
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+// This used to walk the parent chain to the root, so a spawned child shared its
+// parent's page (MX-229) — right while a spawned thread was a subagent of its
+// coordinator. Since 2026-09-21 a project's operator spawns independent,
+// parallel WORKER threads, and a shared root made every worker drive the
+// operator's tab in a signed-in profile: one could navigate a page away from
+// under another mid-read, and nothing refused it (MX-1080). So the key is the
+// calling thread, full stop. Logins are still shared — one profile — only the
+// TAB is private.
 
 /** Calls made outside any thread share this key. */
 export const SCRATCH_SESSION_KEY = "scratch";
@@ -13,49 +16,5 @@ export type SessionKeyResolver = (
   threadId: string | undefined,
 ) => Promise<string>;
 
-export function createSessionKeyResolver(bb: BbPluginApi): SessionKeyResolver {
-  // A thread's ancestry never changes, so a resolved key is cacheable forever.
-  const cache = new Map<string, string>();
-
-  return async (threadId) => {
-    if (!threadId) return SCRATCH_SESSION_KEY;
-    const cached = cache.get(threadId);
-    if (cached) return cached;
-
-    const seen: string[] = [];
-    let current = threadId;
-    let root = threadId;
-    while (!seen.includes(current)) {
-      seen.push(current);
-      // The shape comes from the SDK rather than a local restatement: a local one
-      // silently kept compiling when bb renamed the field, which is how the fork
-      // check below became dead code.
-      let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>> | null;
-      try {
-        thread = await bb.sdk.threads.get({ threadId: current });
-      } catch {
-        seen.pop(); // A failed fetch must not be cached — it may be transient.
-        break; // An unreadable thread means root stays at the last node we could read.
-      }
-      // A host that ANSWERS with null — the ordinary shape of a `thread.deleted`
-      // event for a row the host has already removed — is not a thread with no
-      // parent. Reading `.originKind` off it throws a TypeError out of the
-      // resolver, and the caller that matters is the thread teardown: it would
-      // only warn, and the page would be left to the idle reaper half an hour
-      // later. So null is an unreadable thread, handled exactly like a throw —
-      // the walk stops, nothing is cached, and a deleted thread still resolves
-      // to its own id, which is what makes the teardown close ITS page.
-      if (!thread) {
-        seen.pop();
-        break;
-      }
-      root = current; // This node was successfully read, so it's a valid stopping point.
-      if (thread.originKind === "fork") break;
-      if (!thread.parentThreadId) break;
-      current = thread.parentThreadId;
-    }
-
-    for (const id of seen) cache.set(id, root);
-    return root;
-  };
-}
+export const resolveSessionKey: SessionKeyResolver = async (threadId) =>
+  threadId || SCRATCH_SESSION_KEY;
