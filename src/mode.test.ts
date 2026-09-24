@@ -361,3 +361,36 @@ describe("saying how long", () => {
     expect(humanizeDuration(48 * HOUR)).toBe("2d");
   });
 });
+
+// MX-1205, 09-21 11:15:20Z. Auto-hide asked for headless; `quit`'s socket
+// failed ("could not reach the browser") and Brave died in the same second
+// (minidump 11:15:21Z, `--user-data-dir` = the agents' profile). The switch
+// threw before the relaunch recorded the mode it was asked for, so the next
+// command started the dead browser's mode — headed, 11:16:23Z: a window on a
+// human's screen, from the rule that exists to take windows away.
+describe("a quit that fails on a browser that died anyway", () => {
+  it("still relaunches in the mode that was asked for", async () => {
+    let quitFailed = false;
+    const { mode, calls } = headedFor(0, {
+      quit: async () => {
+        quitFailed = true;
+        throw new Error("could not reach the browser");
+      },
+      running: async () => !quitFailed,
+    });
+    await expect(mode.hide()).resolves.toMatch(/headless again/);
+    expect(calls).toContain("relaunch headless");
+  });
+
+  it("keeps the error when the browser is still there", async () => {
+    const { mode, calls } = headedFor(0, {
+      quit: async () => {
+        throw new Error("could not reach the browser");
+      },
+      running: async () => true,
+      goneTimeoutMs: 50,
+    });
+    await expect(mode.hide()).rejects.toThrow("could not reach the browser");
+    expect(calls.filter((call) => call.startsWith("relaunch"))).toEqual([]);
+  });
+});

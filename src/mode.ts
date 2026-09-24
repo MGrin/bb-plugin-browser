@@ -11,6 +11,7 @@
 // one visible consequence worth being honest about: in-page state does not
 // survive the switch. A half-typed form is lost; the page it was on is not,
 // and neither is the login, because the profile directory is untouched.
+import { GONE_TIMEOUT_MS } from "./connect.js";
 import type { BrowserMode } from "./launch.js";
 
 /**
@@ -94,6 +95,11 @@ export interface ModeDeps {
   quit(): Promise<boolean>;
   /** Start in this mode and reconnect. */
   relaunch(mode: BrowserMode): Promise<void>;
+  /**
+   * How long a browser whose quit failed may take to stop answering. Tests
+   * only; the plugin uses the wedge path's figure.
+   */
+  goneTimeoutMs?: number;
   /** Take a page the browser restored as this thread's tab. */
   adopt(sessionKey: string, targetId: string): Promise<void>;
   /** Put a thread back on a url after the relaunch, when nothing was restored. */
@@ -120,6 +126,15 @@ export interface ModeSwitch {
 const worthRestoring = (url: string) => /^https?:\/\//.test(url);
 
 export function createModeSwitch(deps: ModeDeps): ModeSwitch {
+  async function untilGone(goneMs: number): Promise<boolean> {
+    const deadline = Date.now() + goneMs;
+    while (Date.now() < deadline) {
+      if (!(await deps.running())) return true;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(200, goneMs)));
+    }
+    return !(await deps.running());
+  }
+
   async function switchTo(mode: BrowserMode): Promise<string> {
     const running = await deps.currentMode();
     if (running === mode) {
@@ -139,7 +154,18 @@ export function createModeSwitch(deps: ModeDeps): ModeSwitch {
     const foreign = before.filter((tab) => !tab.ours).map((tab) => tab.url);
     deps.log(`switching the browser to ${mode}; ${open.length} tab(s) to restore`);
 
-    await deps.quit();
+    try {
+      await deps.quit();
+    } catch (error) {
+      // MX-1205, 09-21 11:15:20Z: auto-hide's quit failed ("could not reach
+      // the browser") and Brave died in the same second (minidump 11:15:21Z).
+      // Throwing here left the relaunch unrun, so nothing recorded the mode it
+      // was asked for, and the next command started the dead browser's mode —
+      // headed, an uninvited window. A browser that is gone is as closed as one
+      // this plugin closed; one still answering keeps the error, as before.
+      if (!(await untilGone(deps.goneTimeoutMs ?? GONE_TIMEOUT_MS))) throw error;
+      deps.log(`the browser died while being closed (${String(error)}); relaunching ${mode} as asked`);
+    }
     await deps.relaunch(mode);
 
     // WHAT THE BROWSER ALREADY DID (MX-306). Chromium session-restores the
