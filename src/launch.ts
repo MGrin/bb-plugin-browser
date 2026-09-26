@@ -18,6 +18,14 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  appBundleOf,
+  appDirFor,
+  ensureAgentsApp,
+  keychainMode,
+  migrating,
+  MIGRATING_FILE,
+} from "./agents-app.js";
 import { resolveBrowser } from "./browsers.js";
 
 /**
@@ -106,16 +114,7 @@ export async function answersOn(port: number): Promise<boolean> {
 
 /**
  * The browser agents share: found if it is already running, started if not.
- *
- * Launch flags, each for a reason:
- *   --remote-debugging-port=0   let the OS pick; read it back from the profile
- *   --user-data-dir             the dedicated profile, never the human's
- *   --no-first-run              no welcome tour on a fresh profile
- *   --no-default-browser-check  never ask to become the default browser
- *   --disable-blink-features=AutomationControlled
- *                               navigator.webdriver stays false. This one is
- *                               not hygiene: an X account was locked in August
- *                               because a browser without it was detected.
+ * The flags it launches with are `launchArgs`, below.
  */
 export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndpoint> {
   const wanted: BrowserMode = options.mode ?? "headless";
@@ -137,38 +136,44 @@ export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndp
   // to a browser that is already running must not depend on being able to find
   // a binary. Otherwise a machine whose browser moved — an upgrade, a rename —
   // would lose its running session to an error about how to start a new one.
-  const { name, path: binary } = resolveBrowser(options.binary);
+  if (migrating(options.profileDir)) {
+    throw new Error(
+      `the agents' profile is being migrated to its own keychain (${join(options.profileDir, MIGRATING_FILE)} exists) — ` +
+        "try again in a minute. A browser started now would write data under the key being retired.",
+    );
+  }
+  const { name, path: installed } = resolveBrowser(options.binary);
+
+  // On macOS, a profile on the mock keychain runs from the agents' own copy of
+  // the app, so it never shares an app identity with the human's (MX-1293).
+  // See src/agents-app.ts for why the keychain decides it.
+  let binary = installed;
+  let mockKeychain = false;
+  if (appBundleOf(installed)) {
+    if ((await keychainMode(options.profileDir)) === "mock") {
+      mockKeychain = true;
+      try {
+        binary = await ensureAgentsApp(installed, appDirFor(options.profileDir));
+      } catch (error) {
+        options.log(
+          `could not prepare the agents' own copy of ${name}, so launching the installed app, ` +
+            `which shares its identity with yours: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    } else {
+      options.log(
+        "this profile still uses the system keychain, so the agents' browser shares its app identity " +
+          "with yours; scripts/migrate-keychain.mjs moves it to its own",
+      );
+    }
+  }
 
   // Detached, and stdio ignored: this browser is meant to outlive the plugin
   // load that started it. Keeping a pipe open would tie its lifetime to ours,
   // which is exactly the coupling that made a plugin reload destroy every page.
   const child = spawn(
     binary,
-    [
-      "--remote-debugging-port=0",
-      `--user-data-dir=${options.profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-blink-features=AutomationControlled",
-      // Chromium's modern headless: the same renderer as headed, so a page
-      // does not render differently depending on whether anyone is looking.
-      ...(wanted === "headless" ? ["--headless=new"] : []),
-      // A start page, so a freshly launched browser has something to attach
-      // to rather than presenting zero targets.
-      //
-      // NOT load-bearing, though it looks as if it should be: measured
-      // 2026-08-12, a `--headless=new` browser stays alive and answering with
-      // every one of its tabs closed, so the reaper clearing the last agent
-      // tab does not take the browser with it. Do not add a keep-alive tab on
-      // that theory. (Headed on macOS behaves the same way by platform
-      // convention — an app outlives its last window — but that was not
-      // measured here.)
-      //
-      // This tab is never bound to a thread and never owned, so the reaper
-      // never touches it and it lingers. `bb browser tabs` therefore names it
-      // as the browser's own, rather than implying a human opened it.
-      "about:blank",
-    ],
+    launchArgs(options.profileDir, wanted, mockKeychain),
     { detached: true, stdio: "ignore" },
   );
   child.unref();
@@ -263,4 +268,40 @@ export async function currentMode(profileDir: string): Promise<BrowserMode> {
   } catch {
     return "headless";
   }
+}
+
+/**
+ * Launch flags, each for a reason:
+ *   --remote-debugging-port=0   let the OS pick; read it back from the profile
+ *   --user-data-dir             the dedicated profile, never the human's
+ *   --no-first-run              no welcome tour on a fresh profile
+ *   --no-default-browser-check  never ask to become the default browser
+ *   --disable-blink-features=AutomationControlled
+ *                               navigator.webdriver stays false. This one is
+ *                               not hygiene: an X account was locked in August
+ *                               because a browser without it was detected.
+ *   --use-mock-keychain         only for a profile off the system keychain;
+ *                               see src/agents-app.ts
+ *   --headless=new              Chromium's modern headless: the same renderer
+ *                               as headed, so a page does not render
+ *                               differently depending on whether anyone looks
+ *
+ * The trailing `about:blank` is a start page, so a freshly launched browser has
+ * something to attach to. NOT load-bearing, though it looks as if it should be:
+ * measured 2026-08-12, a `--headless=new` browser stays alive with every tab
+ * closed, so do not add a keep-alive tab on that theory. It is never bound to a
+ * thread, so the reaper never touches it and `bb browser tabs` names it as the
+ * browser's own.
+ */
+export function launchArgs(profileDir: string, mode: BrowserMode, mockKeychain: boolean): string[] {
+  return [
+    "--remote-debugging-port=0",
+    `--user-data-dir=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-blink-features=AutomationControlled",
+    ...(mockKeychain ? ["--use-mock-keychain"] : []),
+    ...(mode === "headless" ? ["--headless=new"] : []),
+    "about:blank",
+  ];
 }
