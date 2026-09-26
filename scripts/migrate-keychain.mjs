@@ -142,39 +142,93 @@ if (process.argv.includes("--count")) {
 if (existsSync(join(profile, MARKER)) && readFileSync(join(profile, MARKER), "utf8").trim() === "mock") {
   die("this profile is already on the mock keychain; nothing to do");
 }
-const browserHolds = () => existsSync(join(profile, "SingletonLock"));
-const QUIT = "close it with `bb plugin run browser quit` first";
-if (browserHolds()) die(`a browser holds this profile (SingletonLock exists) — ${QUIT}`);
-
-// The keychain read comes BEFORE the lock, and that order is the point. The
-// read waits on a human answering a prompt; a run killed while it waits (a
-// timeout wrapper, ^C) never reaches its cleanup, because the wait is a
-// blocking call no signal handler can interrupt. With the lock taken first,
-// such a kill left the lock behind and the plugin refusing to launch at all
-// (measured 2026-09-26, MX-1293). Read first, and a kill here leaves nothing.
-let oldKey;
-try {
-  const service = arg("--service") ?? "Brave Safe Storage";
-  // TEST ONLY: the suite supplies a synthetic key so it never touches a real
-  // keychain. Nothing in normal use sets it.
-  const password =
-    process.env.MIGRATE_KEYCHAIN_TEST_PASSWORD ??
-    // stdout is captured into memory and never echoed; stderr stays visible.
-    execFileSync("security", ["find-generic-password", "-w", "-s", service], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "inherit"],
-    }).trimEnd();
-  oldKey = keyFrom(password);
-} catch {
-  die("could not read the keychain key (was the prompt denied?) — nothing was changed");
+/**
+ * Whether a browser is on this profile: its lock, or a DevTools port that
+ * answers. The lock alone is not enough — measured 2026-09-26, a freshly
+ * launched browser already answers on its port before SingletonLock appears.
+ */
+async function browserHolds() {
+  if (existsSync(join(profile, "SingletonLock"))) return true;
+  try {
+    const port = readFileSync(join(profile, "DevToolsActivePort"), "utf8").split("\n")[0].trim();
+    const r = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) });
+    return r.ok;
+  } catch {
+    return false;
+  }
 }
 
-// A browser may have started while the prompt was up: check again, under the lock.
-writeFileSync(join(profile, LOCK), `${process.pid}\n`, { flag: "wx" });
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+/** Ask the agents' browser to close, over its own DevTools port. */
+async function closeBrowser() {
+  let port;
+  try {
+    port = readFileSync(join(profile, "DevToolsActivePort"), "utf8").split("\n")[0].trim();
+  } catch {
+    return;
+  }
+  try {
+    const version = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(2000) });
+    const socket = new WebSocket((await version.json()).webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+    socket.close();
+  } catch {
+    // not answering: nothing to close
+  }
+}
+
+// THE LOCK COMES FIRST, and names this process. While it is held the plugin
+// refuses to launch the agents' browser — including its own minute-by-minute
+// sweep, which is what relaunched it mid-migration twice on 2026-09-26
+// (MX-1293). A run killed while it waits on the keychain prompt cannot clean
+// up (the wait is a blocking call), so the plugin treats a lock whose process
+// is gone as stale and removes it: a dead migration never blocks the browser.
+const lockFile = join(profile, LOCK);
+try {
+  writeFileSync(lockFile, `${process.pid}\n`, { flag: "wx" });
+} catch {
+  const holder = Number(readFileSync(lockFile, "utf8").trim());
+  if (Number.isInteger(holder) && holder > 0 && alive(holder)) die(`another migration (pid ${holder}) holds this profile`);
+  writeFileSync(lockFile, `${process.pid}\n`);
+}
 const staging = `${profile}.migrating`;
 let swapped = false;
 try {
-  if (browserHolds()) throw new Refusal(`a browser started on this profile during the prompt — ${QUIT}, then run this again`);
+  let oldKey;
+  try {
+    const service = arg("--service") ?? "Brave Safe Storage";
+    // TEST ONLY: the suite supplies a synthetic key so it never touches a real
+    // keychain. Nothing in normal use sets it.
+    const password =
+      process.env.MIGRATE_KEYCHAIN_TEST_PASSWORD ??
+      // stdout is captured into memory and never echoed; stderr stays visible.
+      execFileSync("security", ["find-generic-password", "-w", "-s", service], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "inherit"],
+      }).trimEnd();
+    oldKey = keyFrom(password);
+  } catch {
+    throw new Refusal("could not read the keychain key (was the prompt denied?) — nothing was changed");
+  }
+
+  // Close the agents' browser HERE, under the lock, so nothing can start it
+  // again between the close and the copy. Then refuse unless it is gone: a
+  // copy taken under a live browser is a copy of files being rewritten.
+  await closeBrowser();
+  for (let i = 0; i < 60 && (await browserHolds()); i++) await new Promise((r) => setTimeout(r, 500));
+  if (await browserHolds()) throw new Refusal("the agents' browser is still running on this profile (SingletonLock) — nothing was changed");
   const mockKey = keyFrom(MOCK_PASSWORD);
 
   const before = readableCookies(profile, oldKey);
