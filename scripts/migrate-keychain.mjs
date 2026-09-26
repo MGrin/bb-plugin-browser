@@ -10,7 +10,7 @@
 // re-encrypts every such value, then writes the `bb-keychain` marker that
 // switches the plugin over. Without the marker the plugin launches as before.
 //
-// Usage (the agents' browser must be closed: `bb browser quit`):
+// Usage (the agents' browser must be closed: `bb plugin run browser quit`):
 //   node scripts/migrate-keychain.mjs --profile <dir> [--service "Brave Safe Storage"]
 //   node scripts/migrate-keychain.mjs --profile <dir> --count     # no keychain read
 //
@@ -142,32 +142,39 @@ if (process.argv.includes("--count")) {
 if (existsSync(join(profile, MARKER)) && readFileSync(join(profile, MARKER), "utf8").trim() === "mock") {
   die("this profile is already on the mock keychain; nothing to do");
 }
-if (existsSync(join(profile, "SingletonLock"))) {
-  die("a browser holds this profile (SingletonLock exists) — close it with `bb browser quit` first");
+const browserHolds = () => existsSync(join(profile, "SingletonLock"));
+const QUIT = "close it with `bb plugin run browser quit` first";
+if (browserHolds()) die(`a browser holds this profile (SingletonLock exists) — ${QUIT}`);
+
+// The keychain read comes BEFORE the lock, and that order is the point. The
+// read waits on a human answering a prompt; a run killed while it waits (a
+// timeout wrapper, ^C) never reaches its cleanup, because the wait is a
+// blocking call no signal handler can interrupt. With the lock taken first,
+// such a kill left the lock behind and the plugin refusing to launch at all
+// (measured 2026-09-26, MX-1293). Read first, and a kill here leaves nothing.
+let oldKey;
+try {
+  const service = arg("--service") ?? "Brave Safe Storage";
+  // TEST ONLY: the suite supplies a synthetic key so it never touches a real
+  // keychain. Nothing in normal use sets it.
+  const password =
+    process.env.MIGRATE_KEYCHAIN_TEST_PASSWORD ??
+    // stdout is captured into memory and never echoed; stderr stays visible.
+    execFileSync("security", ["find-generic-password", "-w", "-s", service], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+    }).trimEnd();
+  oldKey = keyFrom(password);
+} catch {
+  die("could not read the keychain key (was the prompt denied?) — nothing was changed");
 }
 
-// Taken before the keychain read, so no browser can start while the user is
-// looking at the prompt.
+// A browser may have started while the prompt was up: check again, under the lock.
 writeFileSync(join(profile, LOCK), `${process.pid}\n`, { flag: "wx" });
 const staging = `${profile}.migrating`;
 let swapped = false;
 try {
-  let oldKey;
-  try {
-    const service = arg("--service") ?? "Brave Safe Storage";
-    // TEST ONLY: the suite supplies a synthetic key so it never touches a real
-    // keychain. Nothing in normal use sets it.
-    const password =
-      process.env.MIGRATE_KEYCHAIN_TEST_PASSWORD ??
-      // stdout is captured into memory and never echoed; stderr stays visible.
-      execFileSync("security", ["find-generic-password", "-w", "-s", service], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "inherit"],
-      }).trimEnd();
-    oldKey = keyFrom(password);
-  } catch {
-    throw new Refusal("could not read the keychain key (was the prompt denied?) — nothing was changed");
-  }
+  if (browserHolds()) throw new Refusal(`a browser started on this profile during the prompt — ${QUIT}, then run this again`);
   const mockKey = keyFrom(MOCK_PASSWORD);
 
   const before = readableCookies(profile, oldKey);

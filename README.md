@@ -87,7 +87,7 @@ this holds logins encrypted with the keychain key, and keeps launching the old
 way until you migrate it once:
 
 ```sh
-bb browser quit
+bb plugin run browser quit
 node scripts/migrate-keychain.mjs --profile ~/.bb/plugins/browser/<profile-dir>
 ```
 
