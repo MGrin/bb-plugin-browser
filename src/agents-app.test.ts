@@ -129,11 +129,29 @@ describe("keychainMode", () => {
 });
 
 describe("migrating", () => {
-  it("is true only while the migration's lock file exists", async () => {
+  it("is false with no lock", async () => {
+    expect(migrating(await scratch())).toBe(false);
+  });
+
+  it("is true while the process named in the lock is alive", async () => {
     const profile = await scratch();
-    expect(migrating(profile)).toBe(false);
-    await writeFile(join(profile, MIGRATING_FILE), "");
+    await writeFile(join(profile, MIGRATING_FILE), `${process.pid}\n`);
     expect(migrating(profile)).toBe(true);
+    expect(existsSync(join(profile, MIGRATING_FILE))).toBe(true);
+  });
+
+  it("treats a lock whose process is gone as stale, and removes it", async () => {
+    // A run killed at the keychain prompt leaves exactly this behind.
+    const profile = await scratch();
+    await writeFile(join(profile, MIGRATING_FILE), "424242\n");
+    expect(migrating(profile, () => false)).toBe(false);
+    expect(existsSync(join(profile, MIGRATING_FILE))).toBe(false);
+  });
+
+  it("treats an unreadable pid as stale rather than locking forever", async () => {
+    const profile = await scratch();
+    await writeFile(join(profile, MIGRATING_FILE), "");
+    expect(migrating(profile)).toBe(false);
   });
 });
 

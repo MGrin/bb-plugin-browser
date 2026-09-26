@@ -25,7 +25,7 @@
 // (`scripts/migrate-keychain.mjs`) before it switches. Until it is, it keeps
 // launching exactly as before.
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { platform } from "node:os";
@@ -80,8 +80,33 @@ export async function keychainMode(profileDir: string): Promise<KeychainMode> {
   return "mock";
 }
 
-export function migrating(profileDir: string): boolean {
-  return existsSync(join(profileDir, MIGRATING_FILE));
+/**
+ * Whether a migration holds this profile. The lock names the migrating
+ * process; a lock whose process is gone is stale — a run killed while it
+ * waited on the keychain prompt — and is removed here, so a dead migration
+ * can never keep the browser from launching.
+ */
+export function migrating(profileDir: string, alive = processAlive): boolean {
+  const lock = join(profileDir, MIGRATING_FILE);
+  let pid: number;
+  try {
+    pid = Number(readFileSync(lock, "utf8").trim());
+  } catch {
+    return false;
+  }
+  if (Number.isInteger(pid) && pid > 0 && alive(pid)) return true;
+  rmSync(lock, { force: true });
+  return false;
+}
+
+/** Signal 0 tests for a process without touching it; EPERM still means alive. */
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /** The `.app` bundle a macOS binary lives in, or null when it is not in one. */

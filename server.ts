@@ -144,7 +144,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   const reaper = createReaper2({
     idleMs: async () => idleMsFrom((await settings.get()).idleMinutes),
-    listTabs: () => tabs.listTabs(),
+    // ATTACH-ONLY. Listing tabs connects, and connecting launches a browser
+    // when none is running — so a sweep every minute restarted a browser that
+    // had been quit on purpose, within a minute of the quit. Measured
+    // 2026-09-26 (MX-1293): it relaunched mid-migration twice. With nothing
+    // running there are no tabs to reap.
+    listTabs: async () =>
+      (await runningPort(await profileDir())) === null ? [] : tabs.listTabs(),
     closeTarget: (targetId) => tabs.closeTarget(targetId),
     log: (message) => bb.log.info(message),
     warn: (message) => bb.log.warn(message),
