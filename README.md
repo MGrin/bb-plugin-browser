@@ -70,6 +70,31 @@ and it persists for every thread, across reloads and restarts.
 **Your tabs are yours.** The idle reaper only ever closes tabs the plugin
 opened. A tab you open in that window is left alone however long it sits there.
 
+## On macOS, the agents' browser is its own app
+
+Launched straight from `/Applications`, the agents' headless browser is the same
+app as yours to macOS. When yours is not running, clicking it in the Dock
+activates the headless one, which has no window, and nothing seems to happen.
+
+So on macOS the plugin runs a private copy of the app, kept beside its profile
+(`agents-app/`, an APFS clone that costs almost no disk), with its own bundle
+identifier (`<original>.bb-agents`) and name (`<App> (agents)`). It is re-made
+whenever the installed app updates.
+
+The copy cannot read your login keychain without asking, so it runs with
+`--use-mock-keychain`. A NEW profile starts that way. A profile created before
+this holds logins encrypted with the keychain key, and keeps launching the old
+way until you migrate it once:
+
+```sh
+bb browser quit
+node scripts/migrate-keychain.mjs --profile ~/.bb/plugins/browser/<profile-dir>
+```
+
+macOS asks once for the key; **Allow** is enough. The script migrates a clone of
+the profile, checks every login still reads, and only then swaps it in; the
+original is kept as `<profile-dir>.pre-mock-<time>`.
+
 ## Headless and headed share one profile
 
 A Chromium profile directory can be held by exactly **one process**, so the two
