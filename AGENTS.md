@@ -28,8 +28,8 @@ Both measured 2026-09-09 against the installed plugin, sandboxed and unsandboxed
   `net::ERR_NAME_NOT_RESOLVED` reaching `example.com` — the machine's egress, not the
   plugin — and disabling the Bash sandbox does not change it, so it is not a sandbox
   denial either. Do not "fix" the plugin for this.
-- **`all 8 agent tools are registered` FAILS because the plugin now registers 10**
-  (`browser_click|close|eval|open|read|screenshot|show|snapshot|type|upload`). The
+- **`all 8 agent tools are registered` FAILS because the plugin now registers 11**
+  (`browser_click|close|eval|goto|open|read|screenshot|show|snapshot|type|upload`). The
   assertion in `scripts/verify` is stale, not the plugin.
 
 ## Layout

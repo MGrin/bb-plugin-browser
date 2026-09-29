@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { ALLOWED_SCHEMES, assertOpenableUrl, type Actions } from "./actions.js";
 import type { SessionKeyResolver } from "./session-key.js";
+import { goto, runMx, type Runner } from "./goto.js";
 
 /** The schema's view of the same rule Actions enforces by throwing. */
 function isOpenableUrl(value: string): boolean {
@@ -28,6 +29,7 @@ export const TOOL_NAMES = [
   "browser_read",
   "browser_snapshot",
   "browser_click",
+  "browser_goto",
   "browser_type",
   "browser_upload",
   "browser_eval",
@@ -40,6 +42,7 @@ export function registerTools(
   operations: Actions,
   resolveSessionKey: SessionKeyResolver,
   mode: { show(): Promise<string> },
+  runner: Runner = runMx,
 ): void {
   // The one tool that is not about a page. An agent cannot pass a login wall,
   // solve a CAPTCHA, or decide whether a design looks right — this is how it
@@ -112,6 +115,31 @@ export function registerTools(
     z.object({ selector: z.string().min(1) }),
     (params, key) => operations.click(key, params.selector),
   );
+
+  // Registered directly rather than through `tool`: it hands `mx` the raw thread id as
+  // BB_THREAD_ID, not a session key, because `mx` reaches the page through `bb plugin run
+  // browser`, which resolves the tab from the thread itself (MX-1346).
+  bb.agents.registerTool({
+    name: "browser_goto",
+    description:
+      "Reach a page by describing it instead of clicking step by step: opens the http or " +
+      "https url in this thread's tab, then Jev picks and clicks the links or buttons that " +
+      "lead to the goal (e.g. \"open the latest invoice\"), up to 6 clicks and 5 minutes. " +
+      "It is for click-through navigation, not for filling in or submitting forms. Returns " +
+      "the status, the evidence and each step; " +
+      "the tab is closed when it returns. " +
+      UNTRUSTED,
+    parameters: z.object({
+      goal: z.string().trim().min(1),
+      url: z
+        .url()
+        .refine(
+          (value) => isOpenableUrl(value),
+          `only ${ALLOWED_SCHEMES.join(" and ")} urls can be opened`,
+        ),
+    }),
+    execute: async (params, ctx) => goto(runner, ctx.threadId, params.goal, params.url),
+  });
 
   tool(
     "browser_type",
