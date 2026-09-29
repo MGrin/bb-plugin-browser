@@ -41,9 +41,11 @@ setting at either produces a browser that starts and then never answers.
 
 ## For agents
 
-Eight page tools — `browser_open`, `browser_read`, `browser_snapshot`,
-`browser_click`, `browser_type`, `browser_eval`, `browser_screenshot`,
-`browser_close` — plus `browser_show`, which is how an agent asks for a human:
+Page tools — `browser_open`, `browser_read`, `browser_snapshot`,
+`browser_click`, `browser_type`, `browser_upload`, `browser_eval`,
+`browser_screenshot`, `browser_close` — plus `browser_goto`, which reaches a page by
+goal through `mx jev browser run` on the maintainer's machine, and `browser_show`,
+which is how an agent asks for a human:
 a login wall, a CAPTCHA, a confirmation it should not click, or anything you
 should look at.
 

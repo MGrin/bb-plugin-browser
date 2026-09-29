@@ -37,6 +37,15 @@ passing. If you had a page, it is still there.
 - `browser_screenshot` — the actual image, for when the *layout* is the
   question. A page that reads fine and looks broken is exactly what it is for.
 
+## Reaching a page by goal
+
+`browser_goto` takes a goal and a starting url ("open the latest invoice",
+`https://…/billing`). It opens the url in your tab, then clicks the links and
+buttons that lead to the goal, up to 6 clicks and 5 minutes, and returns the
+status, the evidence and each step. It is for click-through navigation, not for
+filling in or submitting forms. **It closes your tab when it returns**; open the
+page again with `browser_open` if you need to read it afterwards.
+
 ## When you need the human
 
 `browser_show` brings the browser on screen. Use it the moment you hit

@@ -3,6 +3,7 @@ import type { z } from "zod";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Actions } from "./actions.js";
 import { registerTools, TOOL_NAMES } from "./tools.js";
+import type { Runner } from "./goto.js";
 
 interface Registered {
   name: string;
@@ -45,11 +46,18 @@ function register(
     resolve(threadId),
   );
 
+  // A fake `mx`: no test here may launch the real one, which would drive a real browser.
+  const runner = vi.fn<Runner>(async () => ({
+    code: 0,
+    stdout: JSON.stringify({ rc: 0, status: "done", evidence: null, history: [] }),
+    stderr: "",
+  }));
   registerTools(
     bb,
     operations as unknown as Actions,
     resolveSessionKey,
     { show: async () => "shown" },
+    runner,
   );
   const byName = (name: string) => {
     const tool = tools.find((candidate) => candidate.name === name);
@@ -61,7 +69,7 @@ function register(
     projectId: "prj_1",
     signal: new AbortController().signal,
   });
-  return { tools, byName, ctx, operations, resolveSessionKey };
+  return { tools, byName, ctx, operations, resolveSessionKey, runner };
 }
 
 /** Every key a tool's parameter schema advertises to the model. */
@@ -94,6 +102,7 @@ describe("registerTools", () => {
     expect(schemaKeys(byName("browser_read"))).toEqual([]);
     expect(schemaKeys(byName("browser_snapshot"))).toEqual(["interactive"]);
     expect(schemaKeys(byName("browser_click"))).toEqual(["selector"]);
+    expect(schemaKeys(byName("browser_goto"))).toEqual(["goal", "url"]);
     expect(schemaKeys(byName("browser_type"))).toEqual(["selector", "text", "submit"]);
     expect(schemaKeys(byName("browser_eval"))).toEqual(["expression"]);
     expect(schemaKeys(byName("browser_close"))).toEqual([]);
@@ -105,6 +114,9 @@ describe("registerTools", () => {
   // Every OTHER tool must derive one — that is the boundary that stops a
   // thread reaching another thread's tab.
   const PAGELESS_TOOLS = ["browser_show"];
+  // browser_goto drives the page through `mx`, which resolves the tab from the thread id
+  // itself; its own arm below pins that it gets the CALLER's id and no other.
+  const MX_TOOLS = ["browser_goto"];
 
   it("derives the session key from ctx.threadId, for every page tool", async () => {
     const { tools, byName, ctx, operations, resolveSessionKey } = register();
@@ -116,7 +128,7 @@ describe("registerTools", () => {
       browser_snapshot: { interactive: true },
     };
     for (const tool of tools) {
-      if (PAGELESS_TOOLS.includes(tool.name)) continue;
+      if (PAGELESS_TOOLS.includes(tool.name) || MX_TOOLS.includes(tool.name)) continue;
       await tool.execute(params[tool.name] ?? {}, ctx("thr_a"));
     }
     expect(resolveSessionKey).toHaveBeenCalledWith("thr_a");
@@ -125,11 +137,24 @@ describe("registerTools", () => {
     const everyCall = Object.values(operations).flatMap(
       (fn) => fn.mock.calls as unknown as unknown[][],
     );
-    expect(everyCall.length).toBe(tools.length - PAGELESS_TOOLS.length);
+    expect(everyCall.length).toBe(tools.length - PAGELESS_TOOLS.length - MX_TOOLS.length);
     for (const call of everyCall) {
       expect(call[0]).toBe("key-for-thr_a");
     }
     expect(byName("browser_read")).toBeDefined();
+  });
+
+  it("runs browser_goto on the calling thread's own tab, and no other", async () => {
+    const { byName, ctx, runner } = register();
+    await byName("browser_goto").execute(
+      { goal: "open the latest invoice", url: "https://example.com/" },
+      ctx("thr_a"),
+    );
+    await byName("browser_goto").execute(
+      { goal: "open the latest invoice", url: "https://example.com/" },
+      ctx("thr_b"),
+    );
+    expect(runner.mock.calls.map((call) => call[1].BB_THREAD_ID)).toEqual(["thr_a", "thr_b"]);
   });
 
   it("gives two threads two different session keys", async () => {
@@ -219,6 +244,24 @@ describe("browser_open's url schema", () => {
   });
 });
 
+describe("browser_goto's url schema", () => {
+  const parse = (url: string) => {
+    const { byName } = register();
+    return byName("browser_goto").parameters.safeParse({ goal: "find the page", url });
+  };
+
+  it.each(["file:///etc/passwd", "javascript:alert(1)", "data:text/html,x", "about:blank"])(
+    "rejects %s before mx is launched",
+    (url) => {
+      expect(parse(url).success).toBe(false);
+    },
+  );
+
+  it("accepts an https url", () => {
+    expect(parse("https://example.com/").success).toBe(true);
+  });
+});
+
 // Schema defaults are a safety surface, not a convenience.
 //
 // A mutation sweep flipped each of these with the whole suite still green.
@@ -268,6 +311,7 @@ describe("tool schema required arguments", () => {
     ["browser_click", { selector: "" }],
     ["browser_type", { selector: "", text: "hi" }],
     ["browser_eval", { expression: "" }],
+    ["browser_goto", { goal: "  ", url: "https://example.com/" }],
   ])("%s rejects an empty required string", (name, params) => {
     const { byName } = register();
     expect(byName(name).parameters.safeParse(params).success).toBe(false);
