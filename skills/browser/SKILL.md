@@ -43,8 +43,11 @@ passing. If you had a page, it is still there.
 `https://…/billing`). It opens the url in your tab, then clicks the links and
 buttons that lead to the goal, up to 6 clicks and 5 minutes, and returns the
 status, the evidence and each step. It is for click-through navigation, not for
-filling in or submitting forms. **It closes your tab when it returns**; open the
-page again with `browser_open` if you need to read it afterwards.
+filling in or submitting forms. **Your tab stays open on the page it reached**, and the
+result names the final url: read or click it next with `browser_read`,
+`browser_snapshot` or `browser_click`, with no `browser_open` in between. Both
+arguments are required; to only load a url, use `browser_open`. A run that failed
+before its first step closes the tab and says so.
 
 ## When you need the human
 
