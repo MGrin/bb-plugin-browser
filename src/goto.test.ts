@@ -9,7 +9,7 @@ function fake(stdout: string, code: number | null = 0, stderr = "") {
 }
 
 describe("goto", () => {
-  it("launches exactly `mx jev browser run --goal --url --json`, by absolute path", async () => {
+  it("launches exactly `mx jev browser run --goal --url --keep-tab --json`, by absolute path", async () => {
     const run = fake(report({}));
     await goto(run, "thr_a", "-starts with a dash", "https://example.com/", { HOME: "/h" });
     const [argv, , timeout] = run.mock.calls[0];
@@ -22,6 +22,7 @@ describe("goto", () => {
       "-starts with a dash",
       "--url",
       "https://example.com/",
+      "--keep-tab",
       "--json",
     ]);
     expect(argv[0]).toMatch(/\/\.local\/bin\/mx$/);
@@ -113,5 +114,46 @@ describe("goto", () => {
     const run = fake("", null, "");
     const out = await goto(run, "thr_a", "g", "https://example.com/");
     expect(out).toContain("exit killed");
+  });
+
+  // MX-1346. The control for each arm is the one beside it: the same report without
+  // `tab: "kept"` must still say the tab was closed, and never claim a url.
+  describe("the tab line", () => {
+    const probe = () => vi.fn(async () => "https://example.com/invoices/42");
+
+    it("names the url the kept tab is on, read from the tab, and says not to re-open", async () => {
+      const currentUrl = probe();
+      const out = await goto(
+        fake(report({ tab: "kept" })), "thr_a", "g", "https://example.com/", {}, currentUrl,
+      );
+      expect(out).toContain("final url: https://example.com/invoices/42");
+      expect(out).toContain("still open");
+      expect(out).toContain("do not browser_open it again");
+      expect(out).not.toContain("closed its tab");
+      expect(currentUrl).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["closed by the run", { tab: "closed" }],
+      ["a report that names no tab (pre-loop failure, or an older mx)", {}],
+    ])("says the tab was closed and never reads a url: %s", async (_name, fields) => {
+      const currentUrl = probe();
+      const out = await goto(
+        fake(report(fields)), "thr_a", "g", "https://example.com/", {}, currentUrl,
+      );
+      expect(out).toContain("The run closed its tab when it ended.");
+      expect(out).not.toContain("final url");
+      expect(currentUrl).not.toHaveBeenCalled();
+    });
+
+    it("says the tab is open but unread when the url cannot be read, rather than throwing", async () => {
+      const out = await goto(
+        fake(report({ tab: "kept" })), "thr_a", "g", "https://example.com/", {},
+        async () => { throw new Error("page crashed"); },
+      );
+      expect(out).toContain("left this thread's tab open");
+      expect(out).toContain("page crashed");
+      expect(out).not.toContain("final url");
+    });
   });
 });

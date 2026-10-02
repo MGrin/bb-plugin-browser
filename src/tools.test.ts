@@ -157,6 +157,27 @@ describe("registerTools", () => {
     expect(runner.mock.calls.map((call) => call[1].BB_THREAD_ID)).toEqual(["thr_a", "thr_b"]);
   });
 
+  it("reads the final url from the calling thread's own tab when the run kept it", async () => {
+    const { byName, ctx, runner, operations } = register();
+    const kept = { code: 0, stderr: "", stdout: JSON.stringify({ rc: 0, status: "done", evidence: null, tab: "kept" }) };
+    runner.mockResolvedValueOnce(kept);
+    const out = await byName("browser_goto").execute(
+      { goal: "open the latest invoice", url: "https://example.com/" },
+      ctx("thr_b"),
+    );
+    expect(operations.evaluate).toHaveBeenCalledWith("key-for-thr_b", "location.href");
+    expect(out).toContain("final url: 42");
+  });
+
+  it("touches no tab when the run closed its own", async () => {
+    const { byName, ctx, operations } = register();
+    await byName("browser_goto").execute(
+      { goal: "open the latest invoice", url: "https://example.com/" },
+      ctx("thr_b"),
+    );
+    expect(operations.evaluate).not.toHaveBeenCalled();
+  });
+
   it("gives two threads two different session keys", async () => {
     const { byName, ctx, operations } = register();
     await byName("browser_read").execute({}, ctx("thr_a"));
@@ -315,5 +336,25 @@ describe("tool schema required arguments", () => {
   ])("%s rejects an empty required string", (name, params) => {
     const { byName } = register();
     expect(byName(name).parameters.safeParse(params).success).toBe(false);
+  });
+});
+
+// MX-1346: half of the first four agent calls were url-only. They still refuse, and the
+// refusal now names browser_open. The control is a call WITH a goal, which must parse.
+describe("browser_goto without a goal", () => {
+  it.each([
+    ["no goal at all", { url: "https://example.com/" }],
+    ["a blank goal", { goal: "  ", url: "https://example.com/" }],
+  ])("refuses and points at browser_open: %s", (_name, params) => {
+    const { byName } = register();
+    const parsed = byName("browser_goto").parameters.safeParse(params);
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues)).toContain("call browser_open instead");
+  });
+
+  it("accepts a call that has one", () => {
+    const { byName } = register();
+    const params = { goal: "open the latest invoice", url: "https://example.com/" };
+    expect(byName("browser_goto").parameters.safeParse(params).success).toBe(true);
   });
 });

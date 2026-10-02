@@ -27,8 +27,8 @@ export type Runner = (
 ) => Promise<RunResult>;
 
 /**
- * Past `mx jev browser run`'s own wall clock (300 s) plus the 20 s it keeps to close the
- * tab, so the run always ends itself, closing its tab, before this kills it.
+ * Past `mx jev browser run`'s own wall clock (300 s) plus the 20 s grace it keeps for its
+ * last call, so the run always ends itself and reports before this kills it.
  */
 export const GOTO_TIMEOUT_MS = 340_000;
 
@@ -62,6 +62,8 @@ export const runMx: Runner = (argv, env, timeoutMs) =>
 interface Report {
   rc: number;
   status: string;
+  /** `kept` when the run left its tab open (`--keep-tab`), `closed` when it closed it. */
+  tab?: string;
   evidence: unknown;
   history?: string[];
   attribution?: {
@@ -85,8 +87,16 @@ function lastReport(stdout: string): Report | null {
   return null;
 }
 
+/** Reads the url the caller's tab is on now. It may throw: the tab can be gone. */
+export type UrlProbe = () => Promise<string>;
+
 /**
  * Run one goal on this thread's tab and describe what happened.
+ *
+ * THE TAB STAYS OPEN (MX-1346). The run is asked to keep it, and the report ends with the
+ * url the tab is on, read from the tab itself after the run rather than from the run's last
+ * snapshot. The first version closed it: the one agent that reached its goal re-opened the
+ * same url five seconds later and went to the target by hand, so a done run saved nothing.
  *
  * `threadId` goes to `mx` as BB_THREAD_ID, which is how the `bb plugin run browser` calls it
  * makes land on the CALLER's tab and no other thread's. Every outcome, including a failure
@@ -99,8 +109,11 @@ export async function goto(
   goal: string,
   url: string,
   env: NodeJS.ProcessEnv = process.env,
+  currentUrl?: UrlProbe,
 ): Promise<string> {
-  const argv = [mxBin(env), "jev", "browser", "run", "--goal", goal, "--url", url, "--json"];
+  const argv = [
+    mxBin(env), "jev", "browser", "run", "--goal", goal, "--url", url, "--keep-tab", "--json",
+  ];
   const childEnv: NodeJS.ProcessEnv = { ...env };
   if (threadId) childEnv.BB_THREAD_ID = threadId;
   const result = await run(argv, childEnv, GOTO_TIMEOUT_MS);
@@ -132,6 +145,25 @@ export async function goto(
   lines.push(
     `clicks: ${attempted} attempted, ${confirmed} confirmed${typedNote}, under the shared signed-in browser profile.`,
   );
-  lines.push("The run closed its tab when it ended.");
+  lines.push(await tabLine(report, currentUrl));
   return lines.join("\n");
+}
+
+/**
+ * What became of the tab, in words the agent can act on. `kept` is the run's own word; a
+ * report without it (a failure before the loop, or an `mx` older than `--keep-tab`) closed
+ * the tab, and saying "open" there would send the next read to a page that is not there.
+ */
+async function tabLine(report: Report, currentUrl?: UrlProbe): Promise<string> {
+  if (report.tab !== "kept") return "The run closed its tab when it ended.";
+  const use =
+    "browser_read, browser_snapshot, browser_click and browser_type act on it as it is: " +
+    "do not browser_open it again.";
+  if (!currentUrl) return `tab: this thread's tab is still open on the page the run ended on. ${use}`;
+  try {
+    return `final url: ${await currentUrl()}\ntab: this thread's tab is still open on that page. ${use}`;
+  } catch (error) {
+    const why = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+    return `tab: the run left this thread's tab open, but its url could not be read (${why}). browser_read will say what it is on.`;
+  }
 }
