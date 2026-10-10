@@ -15,7 +15,7 @@
 import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import type { Page } from "playwright-core";
-import type { Tabs } from "./tabs.js";
+import { withDeadline, type Tabs } from "./tabs.js";
 
 /** The only schemes a page may be opened with. */
 export const ALLOWED_SCHEMES = ["http:", "https:"] as const;
@@ -43,6 +43,18 @@ export const MAX_SCREENSHOT_BYTES = 3_500_000;
 
 /** How long any single page action may take before it gives up. */
 const ACTION_TIMEOUT_MS = 20_000;
+
+/**
+ * How long `eval` may run.
+ *
+ * `page.evaluate()` and `page.title()` go out with NO timeout of their own
+ * (playwright-core sends both with `kNoTimeout`), so `setDefaultTimeout` above
+ * never reached them and a promise that never settled was a call that never
+ * returned (MX-1440). Generous on purpose: agents' scripts poll for up to 30 s
+ * and one took 60 s. It only has to answer before the caller's own 120 s tool
+ * timeout does, so the caller reads an error instead of nothing.
+ */
+export const EVALUATE_TIMEOUT_MS = 90_000;
 
 export interface Actions {
   open(sessionKey: string, url: string): Promise<string>;
@@ -180,7 +192,12 @@ export function createActions(deps: ActionsDeps): Actions {
         await page.goto(url, { waitUntil: "domcontentloaded" });
         // The title is the page's own text, so it is capped like any other
         // page-controlled output.
-        return capped(`${await page.title()}\n${page.url()}`);
+        const title = await withDeadline(
+          page.title(),
+          ACTION_TIMEOUT_MS,
+          `the page (page.title, after loading ${url})`,
+        );
+        return capped(`${title}\n${page.url()}`);
       });
     },
 
@@ -233,7 +250,11 @@ export function createActions(deps: ActionsDeps): Actions {
 
     async evaluate(sessionKey, expression) {
       return onPage(sessionKey, async (page) => {
-        const result = await page.evaluate(expression);
+        const result = await withDeadline(
+          page.evaluate(expression),
+          EVALUATE_TIMEOUT_MS,
+          "the page (page.evaluate)",
+        );
         return capped(typeof result === "string" ? result : JSON.stringify(result) ?? "undefined");
       });
     },

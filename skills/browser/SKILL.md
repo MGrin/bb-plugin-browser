@@ -90,21 +90,38 @@ The browser is signed in, so a wrong click is a real action on a real account.
 
 ## The same thing from a shell
 
-```sh
-bb browser open <url>          bb browser snapshot [--full]
-bb browser read                bb browser click <selector>
-bb browser eval <expression>   bb browser type <selector> <text> [--submit]
-bb browser screenshot [path]   bb browser close
+Prefer the `browser_*` tools. From a shell the command is `bb plugin run
+browser …`: bb's core owns `bb browser`, a different browser.
 
-bb browser show                # bring it on screen for the user
-bb browser hide                # back to headless
-bb browser status              # mode, and how many tabs are open
-bb browser tabs                # every tab; yours is marked, others are not
-bb browser quit                # close the shared browser entirely
+```sh
+B="bb plugin run browser"
+$B open <url>          $B snapshot [--full]
+$B read                $B click <selector>
+$B eval <expression>   $B type <selector> <text> [--submit]
+$B screenshot [path]   $B close
+
+$B show                # bring it on screen for the user
+$B hide                # back to headless
+$B status              # mode, and how many tabs are open
+$B tabs                # every tab; yours is marked, others are not
+$B quit                # close the shared browser entirely
 ```
 
 Run inside a bb thread these drive that thread's tab; run outside one they
 drive the shared `scratch` tab.
+
+## If a call prints nothing
+
+Every plugin call ends: it returns, or it fails with text naming what it
+waited on (`… did not answer within 15000ms`). So silence is never the
+browser.
+
+A shell command that prints nothing never reached the plugin. On macOS, a
+`bb` command run inside an agent's Bash sandbox can block at startup, in
+Node's DNS setup, before it sends anything (MX-1440). Wrap shell calls in
+`timeout 60`. On `rc=124` with no output, use the matching `browser_*` tool,
+or re-run the command outside the sandbox. Do not quit or relaunch the
+browser for it.
 
 ## If every browser call times out
 
