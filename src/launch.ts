@@ -38,6 +38,9 @@ const PORT_FILE = "DevToolsActivePort";
 /** How long to wait for a freshly launched Brave to publish its port. */
 const LAUNCH_TIMEOUT_MS = 20_000;
 
+/** How long `quit` waits for the browser's DevTools socket to open. */
+export const QUIT_SOCKET_TIMEOUT_MS = 5_000;
+
 /**
  * Which mode the running browser was launched in.
  *
@@ -208,7 +211,10 @@ export async function startOrAttach(options: LaunchOptions): Promise<BrowserEndp
  * Returns false when there was nothing running to close, so a caller can say
  * "already closed" rather than implying it did something.
  */
-export async function quit(profileDir: string): Promise<boolean> {
+export async function quit(
+  profileDir: string,
+  socketTimeoutMs = QUIT_SOCKET_TIMEOUT_MS,
+): Promise<boolean> {
   const port = await runningPort(profileDir);
   if (!port) return false;
   const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
@@ -216,12 +222,26 @@ export async function quit(profileDir: string): Promise<boolean> {
   });
   const { webSocketDebuggerUrl } = (await response.json()) as { webSocketDebuggerUrl: string };
   const socket = new WebSocket(webSocketDebuggerUrl);
+  // Bounded (MX-1440): a browser that takes the connection and never finishes
+  // the upgrade sent neither event, and `bb plugin run browser quit` waited
+  // forever with no output.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   await new Promise<void>((resolve, reject) => {
+    timer = setTimeout(() => {
+      // Rejected BEFORE the close: closing a socket still connecting fires its
+      // `error` event at once, and that generic text would win the race.
+      reject(
+        new Error(
+          `the browser's DevTools socket (${webSocketDebuggerUrl}) did not open within ${socketTimeoutMs}ms`,
+        ),
+      );
+      socket.close();
+    }, socketTimeoutMs);
     socket.addEventListener("open", () => resolve(), { once: true });
     socket.addEventListener("error", () => reject(new Error("could not reach the browser")), {
       once: true,
     });
-  });
+  }).finally(() => clearTimeout(timer));
   socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
   socket.close();
   return true;

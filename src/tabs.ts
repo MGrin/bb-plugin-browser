@@ -97,6 +97,19 @@ async function readTargetId(page: Page): Promise<string> {
 export const TARGET_ID_TIMEOUT_MS = 5_000;
 
 /**
+ * How long the browser gets to open a new tab.
+ *
+ * `context.newPage()` goes out with NO timeout of its own (playwright-core
+ * sends it with `kNoTimeout`, and `setDefaultTimeout` does not reach it), so a
+ * browser that never answers it hung the caller forever with no output
+ * (MX-1440). A healthy one answers in well under a second.
+ */
+export const NEW_PAGE_TIMEOUT_MS = 15_000;
+
+/** How long closing a tab may take. `page.close()` has no timeout of its own either. */
+export const CLOSE_TIMEOUT_MS = 5_000;
+
+/**
  * Reject if `work` outlives `ms`.
  *
  * The losing promise keeps running; there is no way to cancel a CDP send. That
@@ -225,8 +238,31 @@ export function createTabs(deps: TabsDeps): Tabs {
     return { page: found.page, targetId };
   }
 
+  /** A close that fails is already closed; one that never answers is an error. */
+  async function closePage(page: Page, why: string): Promise<void> {
+    await withDeadline(
+      page.close().catch(() => {}),
+      CLOSE_TIMEOUT_MS,
+      `the browser (page.close, ${why})`,
+    );
+  }
+
   async function create(sessionKey: string): Promise<ThreadTab> {
-    const page = await (await context()).newPage();
+    const opening = (await context()).newPage();
+    let page: Page;
+    try {
+      page = await withDeadline(
+        opening,
+        NEW_PAGE_TIMEOUT_MS,
+        `the browser (context.newPage, opening a tab for ${sessionKey})`,
+      );
+    } catch (error) {
+      // A tab that arrives after we gave up is one this plugin opened and
+      // nothing holds or records as ours, so the reaper could never prove it
+      // may close it. Closing it when it lands is the only chance.
+      opening.then((late) => void late.close().catch(() => {}), () => {});
+      throw error;
+    }
     const targetId = await targetIdOf(page);
     await deps.kv.set(tabKey(sessionKey), targetId);
     // Recorded separately from the binding and OUTLIVING it: a thread's tab
@@ -280,7 +316,7 @@ export function createTabs(deps: TabsDeps): Tabs {
       // The ownership record goes with the tab, not with the binding: keeping
       // it would leak a row per closed tab forever.
       await deps.kv.delete(ownedKey(targetId));
-      if (found) await found.page.close().catch(() => {});
+      if (found) await closePage(found.page, `closing the tab for ${sessionKey}`);
     },
 
     async closeTarget(targetId) {
@@ -288,7 +324,7 @@ export function createTabs(deps: TabsDeps): Tabs {
         (candidate) => candidate.targetId === targetId,
       );
       await deps.kv.delete(ownedKey(targetId));
-      if (found) await found.page.close().catch(() => {});
+      if (found) await closePage(found.page, `closing tab ${targetId}`);
     },
 
     async listTabs() {
